@@ -99,10 +99,30 @@ def run_from_json(items, decisions):
     return updates
 
 
+def run_default_recommendations(items):
+    """
+    Apply default pass-2 decisions without prompting.
+    Heuristic:
+      - high severity -> CONFIRM
+      - low severity  -> DOWNGRADE
+    Final amendment text defaults to the proposed amendment text.
+    """
+    updates = {}
+    for it in items:
+        sev = (it.get("severity") or "").strip().lower()
+        decision = "CONFIRM" if sev == "high" else "DOWNGRADE"
+        updates[it["point"]] = {
+            "decision": decision,
+            "final": it.get("proposed", "").strip(),
+        }
+    return updates
+
+
 def main():
     ap = argparse.ArgumentParser(description="Step 2 Pass-2 loop over hybrid approval pack")
     ap.add_argument("--pack", required=True, help="Path to hybrid-approval-pack-*.md")
     ap.add_argument("--decisions-json", help='Optional JSON file: [{"point":"1","decision":"CONFIRM|DOWNGRADE|DROP","final":"..."}]')
+    ap.add_argument("--mode", choices=["interactive", "defaults"], default="interactive", help="interactive=review one-by-one, defaults=apply recommended defaults automatically")
     ap.add_argument("--out", help="Output pack path (default overwrite input)")
     ap.add_argument("--export-json", help="Write applied decisions to JSON")
     args = ap.parse_args()
@@ -116,6 +136,8 @@ def main():
     if args.decisions_json:
         decisions = json.loads(Path(args.decisions_json).read_text())
         updates = run_from_json(items, decisions)
+    elif args.mode == "defaults":
+        updates = run_default_recommendations(items)
     else:
         updates = run_interactive(items)
 

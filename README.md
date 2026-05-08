@@ -47,16 +47,24 @@ This runs deterministic review, hybrid pack, step3 redline instructions, and ste
 If input is `.docx`, it also prepares step4 tracked-redline package.
 
 
-## Step 2 interactive pass (cycle through concerns)
+## Step 2 pass (choose one-by-one or defaults)
 
 ```bash
-# Interactive loop over each concern in the hybrid pack
-./step2_pass2_review.py --pack output/reviews/hybrid-approval-pack-*.md
+# A) Interactive loop (one-by-one)
+./step2_pass2_review.py --pack output/reviews/hybrid-approval-pack-*.md --mode interactive
 
-# Or apply from JSON decisions
+# B) Apply recommended defaults automatically
+./step2_pass2_review.py --pack output/reviews/hybrid-approval-pack-*.md --mode defaults \
+  --export-json applied-defaults.json
+
+# C) Apply from explicit JSON decisions
 ./step2_pass2_review.py --pack output/reviews/hybrid-approval-pack-*.md \
   --decisions-json decisions.json --export-json applied.json
 ```
 
 `step2_pass2_review.py` writes `Pass 2 decision` + `Final amendment text` for each point,
 so Step 3 only includes confirmed/downgraded items.
+
+Default heuristic (`--mode defaults`):
+- `high` severity → `CONFIRM`
+- `low` severity → `DOWNGRADE`
