@@ -114,6 +114,26 @@ def extract_sentences(text):
     return re.split(r"(?<=[.!?])\s+", text)
 
 
+def extract_clause_snippet(text, keywords, window=240):
+    for kw in keywords:
+        m = re.search(kw, text, re.I)
+        if m:
+            start = max(0, m.start() - window)
+            end = min(len(text), m.end() + window)
+            snippet = text[start:end].strip()
+            snippet = re.sub(r"\s+", " ", snippet)
+            return snippet
+    return ""
+
+
+def derive_context_and_recommendation(clause, snippet, preferred_position):
+    context = f"Clause '{clause}' was detected in the agreement text and should be reviewed against Medicus preferred position."
+    if snippet:
+        context = f"Detected clause text indicates '{clause}' is present. Validate whether this exact wording aligns with Medicus standards."
+    recommendation = f"Align this clause with Medicus position: {preferred_position}"
+    return context, recommendation
+
+
 def build_playbook(messages, drive_items):
     clause_counts = Counter()
     evidence = defaultdict(list)
@@ -192,7 +212,8 @@ def review_text(text, playbook):
 
     for rule in playbook.get("policy", []):
         clause = rule["clause"]
-        hit = any(re.search(k, ltxt, re.I) for k in rule.get("keywords", []))
+        keywords = rule.get("keywords", [])
+        hit = any(re.search(k, ltxt, re.I) for k in keywords)
         if not hit:
             continue
 
@@ -204,11 +225,21 @@ def review_text(text, playbook):
         else:
             risk_score += 1
 
+        snippet = extract_clause_snippet(text, keywords)
+        context, recommendation = derive_context_and_recommendation(
+            clause,
+            snippet,
+            rule.get("preferred_position", "")
+        )
+
         findings.append({
             "clause": clause,
             "severity": severity,
             "preferred_position": rule.get("preferred_position"),
             "red_flags": rule.get("red_flags"),
+            "clause_snippet": snippet,
+            "context": context,
+            "recommendation": recommendation,
             "recommended_amendment": f"Amend clause '{clause}' to align with: {rule.get('preferred_position','')}",
         })
 
@@ -228,6 +259,9 @@ def review_text(text, playbook):
                 "clause": f.get("clause"),
                 "severity": f.get("severity"),
                 "concern": ", ".join(f.get("red_flags") or []) or "Clause deviates from preferred Medicus position.",
+                "clause_snippet": f.get("clause_snippet", ""),
+                "context": f.get("context", ""),
+                "recommendation": f.get("recommendation", ""),
                 "recommended_amendment": f.get("recommended_amendment"),
             }
             for i, f in enumerate(findings)
@@ -316,6 +350,12 @@ def cmd_review(args):
             lines.append(f"### {f.get('clause','unknown')}")
             lines.append(f"- Severity: {f.get('severity','unknown')}")
             lines.append(f"- Preferred position: {f.get('preferred_position','')}")
+            if f.get("clause_snippet"):
+                lines.append(f"- Exact clause snippet: \"{f.get('clause_snippet')}\"")
+            if f.get("context"):
+                lines.append(f"- Context: {f.get('context')}")
+            if f.get("recommendation"):
+                lines.append(f"- Recommendation: {f.get('recommendation')}")
             if f.get("red_flags"):
                 lines.append("- Red flags:")
                 lines.extend([f"  - {r}" for r in f["red_flags"]])
@@ -325,7 +365,13 @@ def cmd_review(args):
         for c in result.get("concerns_summary", []):
             lines.append(f"### {c.get('point')}. {c.get('clause')}")
             lines.append(f"- Severity: {c.get('severity')}")
+            if c.get("clause_snippet"):
+                lines.append(f"- Exact clause snippet: \"{c.get('clause_snippet')}\"")
+            if c.get("context"):
+                lines.append(f"- Context: {c.get('context')}")
             lines.append(f"- Concern: {c.get('concern')}")
+            if c.get("recommendation"):
+                lines.append(f"- Recommendation: {c.get('recommendation')}")
             lines.append(f"- Recommended amendment: {c.get('recommended_amendment')}")
             lines.append("")
         out_md.write_text("\n".join(lines))
