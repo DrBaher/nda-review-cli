@@ -4,6 +4,7 @@ set -euo pipefail
 BASE="$(cd "$(dirname "$0")" && pwd)"
 SRC_TXT="${1:-}"
 REDLINE_MD="${2:-}"
+STRICT_ANCHORS="${STRICT_ANCHORS:-0}"
 
 if [[ -z "$SRC_TXT" || ! -f "$SRC_TXT" ]]; then
   echo "Usage: $0 /path/to/source.txt [/path/to/redline-instructions.md]"
@@ -21,11 +22,12 @@ fi
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT="$BASE/output/reviews/find-replace-pack-$STAMP.md"
 
-python3 - <<'PY' "$SRC_TXT" "$REDLINE_MD" "$OUT"
+python3 - <<'PY' "$SRC_TXT" "$REDLINE_MD" "$OUT" "$STRICT_ANCHORS"
 import re,sys,pathlib
-src_path,redline_path,out_path=sys.argv[1:4]
+src_path,redline_path,out_path,strict_anchors=sys.argv[1:5]
 src=pathlib.Path(src_path).read_text(errors='ignore')
 red=pathlib.Path(redline_path).read_text(errors='ignore')
+strict = str(strict_anchors).strip() in {'1','true','TRUE','yes','YES'}
 
 items=[]
 for m in re.finditer(r"##\s+\d+\.\s+([^\n]+)\n(?:.|\n)*?- Amendment to apply \(tracked\):\s*(.+)", red):
@@ -51,8 +53,10 @@ def find_anchor(clause,text):
         if m:
             s=max(0,m.start()-140)
             e=min(len(text),m.end()+220)
-            return text[s:e].replace('\n',' ').strip()
-    return ''
+            snippet=text[s:e].replace('\n',' ').strip()
+            cnt=len(re.findall(p,text,re.I))
+            return snippet,cnt,p
+    return '',0,''
 
 lines=[]
 lines.append('# Step 5 — Find/Replace Execution Pack')
@@ -63,11 +67,18 @@ lines.append('')
 lines.append('Use with Word Track Changes enabled. For each item, locate the anchor text, then apply the amendment.')
 lines.append('')
 for i,(clause,amend) in enumerate(items,1):
-    anchor=find_anchor(clause,src)
+    anchor,anchor_count,pat=find_anchor(clause,src)
     lines.append(f'## {i}. {clause}')
     lines.append(f'- Find anchor (in document): "{anchor}"' if anchor else '- Find anchor (in document): [manually locate clause]')
+    lines.append(f'- Anchor match count: {anchor_count}')
+    if pat:
+        lines.append(f'- Anchor pattern used: `{pat}`')
+    if anchor_count != 1:
+        lines.append('- Anchor safety: REVIEW REQUIRED (anchor is not unique)')
     lines.append(f'- Replace/insert with: {amend}')
     lines.append('')
+    if strict and anchor_count != 1:
+        raise SystemExit(f"Strict anchor mode failed for clause '{clause}': count={anchor_count}")
 
 pathlib.Path(out_path).parent.mkdir(parents=True,exist_ok=True)
 pathlib.Path(out_path).write_text('\n'.join(lines))

@@ -2,11 +2,13 @@
 import argparse
 import json
 import re
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import Counter, defaultdict
 import difflib
 from typing import Optional
+from rule_engine import clause_hit, red_flag_hits
 
 NDA_PAT = re.compile(r"\b(nda|non[-\s]?disclosure|confidentiality agreement|confidential disclosure agreement|cda|mutual nda|geheimhaltungsvereinbarung|vertraulich|vertrauliche informationen)\b", re.I)
 
@@ -252,6 +254,16 @@ def rule_hit_details(text, keywords):
     return hits
 
 
+def sha256_file(path: Path):
+    if not path.exists() or not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def suggest_posture(clause, profile):
     if not profile:
         return "Use Medicus default position."
@@ -345,11 +357,12 @@ def review_text(text, playbook, profile=None):
     for rule in playbook.get("policy", []):
         clause = rule["clause"]
         keywords = rule.get("keywords", [])
-        hit = any(re.search(k, ltxt, re.I) for k in keywords)
+        hit, keyword_hits = clause_hit(ltxt, keywords)
         if not hit:
             continue
 
-        rf_hits = [rf for rf in rule.get("red_flags", []) if re.search(re.escape(rf.split()[0]), ltxt, re.I)]
+        rf_trigger_hits = red_flag_hits(clause, ltxt)
+        rf_hits = [rf for rf in rule.get("red_flags", []) if rf_trigger_hits]
         severity = "low"
         if rf_hits:
             severity = "high"
@@ -381,8 +394,9 @@ def review_text(text, playbook, profile=None):
             "context": context,
             "recommendation": recommendation,
             "recommended_amendment": f"Amend clause '{clause}' to align with: {rule.get('preferred_position','')}",
-            "rule_hits": [k for k in keywords if re.search(k, ltxt, re.I)],
+            "rule_hits": keyword_hits,
             "rule_hit_details": hit_details,
+            "red_flag_trigger_hits": rf_trigger_hits,
             "risk_bucket": bucket,
             "score": weighted,
             "clause_heading": clause_heading,
@@ -414,6 +428,7 @@ def review_text(text, playbook, profile=None):
                 "recommended_amendment": f.get("recommended_amendment"),
                 "rule_hits": f.get("rule_hits", []),
                 "rule_hit_details": f.get("rule_hit_details", []),
+                "red_flag_trigger_hits": f.get("red_flag_trigger_hits", []),
                 "risk_bucket": f.get("risk_bucket", ""),
                 "score": f.get("score", 0),
                 "clause_heading": f.get("clause_heading", ""),
@@ -553,6 +568,34 @@ def cmd_quality_gate(args):
     print(json.dumps(payload, ensure_ascii=False))
     if problems:
         raise SystemExit(2)
+
+
+def cmd_create_manifest(args):
+    base = Path(args.base)
+    files = [Path(p) for p in args.files]
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    artifacts = []
+    for fp in files:
+        resolved = fp if fp.is_absolute() else (base / fp)
+        artifacts.append({
+            "path": str(fp),
+            "resolved_path": str(resolved),
+            "exists": resolved.exists(),
+            "sha256": sha256_file(resolved),
+        })
+
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "counterparty": args.counterparty,
+        "playbook": args.playbook,
+        "profile": args.profile,
+        "decisions_source": args.decisions_source,
+        "artifacts": artifacts,
+    }
+    out.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+    print(out)
 
 
 def cmd_build(args):
@@ -745,6 +788,16 @@ def main():
     p_gate.add_argument("--source-text")
     p_gate.add_argument("--out-json")
     p_gate.set_defaults(func=cmd_quality_gate)
+
+    p_manifest = sub.add_parser("create-manifest", help="Create audit trail manifest for a run")
+    p_manifest.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_manifest.add_argument("--counterparty", default="")
+    p_manifest.add_argument("--playbook", default="")
+    p_manifest.add_argument("--profile", default="")
+    p_manifest.add_argument("--decisions-source", default="")
+    p_manifest.add_argument("--files", nargs="+", required=True)
+    p_manifest.add_argument("--out", required=True)
+    p_manifest.set_defaults(func=cmd_create_manifest)
 
     args = parser.parse_args()
     args.func(args)

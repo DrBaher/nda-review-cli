@@ -32,6 +32,8 @@ LATEST_STEP3=$(ls -t "$BASE"/output/reviews/redline-instructions-*.md | head -n1
 # 4) step5 find/replace pack
 "$BASE/step5_find_replace_pack.sh" "$WORK_INPUT" "$LATEST_STEP3" >/tmp/nda_run_all_step5.out
 LATEST_STEP5=$(ls -t "$BASE"/output/reviews/find-replace-pack-*.md | head -n1)
+LATEST_REVIEW_JSON=$(ls -t "$BASE"/output/reviews/review-*.json | head -n1)
+LATEST_REVIEW_MD=$(ls -t "$BASE"/output/reviews/review-*.md | head -n1)
 
 # Optional: prepare step4 package only for docx input
 STEP4_DOCX=""
@@ -42,6 +44,32 @@ if [[ "$INPUT" == *.docx ]]; then
   STEP4_DOCX=$(dirname "$STEP4_RUNBOOK")/$(ls "$(dirname "$STEP4_RUNBOOK")" | grep -E '\.docx$' | head -n1)
 fi
 
+# 5) audit manifest
+STAMP="$(date +%Y%m%d-%H%M%S)"
+MANIFEST="$BASE/output/reviews/run-manifest-$STAMP.json"
+MANIFEST_FILES=(
+  "$WORK_INPUT"
+  "$LATEST_PACK"
+  "$LATEST_REVIEW_JSON"
+  "$LATEST_REVIEW_MD"
+  "$LATEST_STEP3"
+  "$LATEST_STEP5"
+)
+if [[ -n "$STEP4_RUNBOOK" ]]; then
+  MANIFEST_FILES+=("$STEP4_RUNBOOK")
+fi
+if [[ -n "$STEP4_DOCX" && -f "$STEP4_DOCX" ]]; then
+  MANIFEST_FILES+=("$STEP4_DOCX")
+fi
+
+"$BASE/nda_review_cli.py" create-manifest \
+  --base "$BASE" \
+  --counterparty "$COUNTERPARTY" \
+  --playbook "$BASE/output/medicus_nda_playbook.json" \
+  --decisions-source "$LATEST_PACK" \
+  --files "${MANIFEST_FILES[@]}" \
+  --out "$MANIFEST" >/tmp/nda_run_all_manifest.out
+
 echo "Run-all complete:"
 echo "- Hybrid approval pack: $LATEST_PACK"
 echo "- Step3 redline instructions: $LATEST_STEP3"
@@ -50,3 +78,4 @@ if [[ -n "$STEP4_RUNBOOK" ]]; then
   echo "- Step4 runbook: $STEP4_RUNBOOK"
   echo "- Step4 docx: $STEP4_DOCX"
 fi
+echo "- Audit manifest: $MANIFEST"

@@ -103,3 +103,20 @@ Default heuristic (`--mode defaults`):
 `step4_prepare_tracked_redline.sh` now checks:
 - Step 3 redline pack has actionable numbered items
 - Potential AI clause contradiction signals (allow + prohibit)
+
+## Tests & CI
+
+```bash
+python3 -m py_compile nda_review_cli.py step2_pass2_review.py generate_redline_instructions.py rule_engine.py
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+GitHub Actions runs the same checks on push/PR.
+
+## Anchor safety mode (Step 5)
+
+```bash
+STRICT_ANCHORS=1 ./step5_find_replace_pack.sh /path/to/source.txt /path/to/redline-instructions.md
+```
+
+In strict mode, Step 5 fails if any find-anchor is not unique.

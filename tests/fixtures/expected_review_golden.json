@@ -1,0 +1,11 @@
+{
+  "decision": "block",
+  "min_risk_score": 8,
+  "must_include_clauses": [
+    "definition_of_confidential_information",
+    "exceptions",
+    "term_and_survival",
+    "return_or_destroy",
+    "governing_law_jurisdiction"
+  ]
+}
