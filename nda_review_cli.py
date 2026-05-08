@@ -598,6 +598,168 @@ def cmd_create_manifest(args):
     print(out)
 
 
+def _prompt_with_default(label, default):
+    raw = input(f"{label} [{default}]: ").strip()
+    return raw or default
+
+
+def _prompt_choice(label, choices, default):
+    options = "/".join(choices)
+    while True:
+        raw = input(f"{label} ({options}) [{default}]: ").strip().lower()
+        val = raw or default
+        if val in choices:
+            return val
+        print(f"Invalid choice: {val}")
+
+
+def _parse_csv(raw):
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def cmd_init(args):
+    base = Path(args.base)
+    cfg_dir = base / "config"
+    prof_dir = base / "profiles"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    prof_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.interactive:
+        org_name = _prompt_with_default("Organization name", args.org_name or "Your Org")
+        posture = _prompt_choice("Risk posture", ["strict", "balanced", "commercial"], args.risk_posture)
+        jurisdiction = _prompt_with_default("Preferred jurisdictions (comma-separated)", args.preferred_jurisdictions)
+        survival_years = int(_prompt_with_default("Default confidentiality survival years", str(args.survival_years)))
+        ai_usage = _prompt_choice("AI policy", ["restricted", "guardrailed", "permissive"], args.ai_policy)
+        retention = _prompt_with_default("Default retention carve-out", args.retention_carveout)
+    else:
+        org_name = args.org_name or "Your Org"
+        posture = args.risk_posture
+        jurisdiction = args.preferred_jurisdictions
+        survival_years = args.survival_years
+        ai_usage = args.ai_policy
+        retention = args.retention_carveout
+
+    if posture == "strict":
+        weights = {"legal": 1.4, "commercial": 1.0, "operational": 1.2, "severity_high": 4, "severity_low": 1}
+    elif posture == "commercial":
+        weights = {"legal": 1.0, "commercial": 0.9, "operational": 1.0, "severity_high": 3, "severity_low": 1}
+    else:
+        weights = {"legal": 1.2, "commercial": 1.0, "operational": 1.0, "severity_high": 3, "severity_low": 1}
+
+    org_policy = {
+        "version": "0.2.0",
+        "org_name": org_name,
+        "risk_posture": posture,
+        "preferred_jurisdictions": _parse_csv(jurisdiction),
+        "defaults": {
+            "survival_years": survival_years,
+            "ai_policy": ai_usage,
+            "retention_carveout": retention,
+        },
+        "risk_weights": weights,
+    }
+
+    profile = {
+        "profile_name": "default",
+        "fallback_posture": f"{org_name} prefers {posture} posture.",
+        "risk_weights": weights,
+        "clause_preferences": {
+            "term_and_survival": f"Finite survival ({survival_years} years) unless trade secret/legal carve-out.",
+            "governing_law_jurisdiction": f"Prefer jurisdictions: {', '.join(_parse_csv(jurisdiction)) or 'neutral/favorable'}.",
+            "return_or_destroy": retention,
+        },
+    }
+
+    org_out = cfg_dir / "org-policy.json"
+    prof_out = prof_dir / "default.json"
+    org_out.write_text(json.dumps(org_policy, indent=2, ensure_ascii=False))
+    prof_out.write_text(json.dumps(profile, indent=2, ensure_ascii=False))
+    print(json.dumps({"ok": True, "org_policy": str(org_out), "default_profile": str(prof_out)}, ensure_ascii=False))
+
+
+def _read_any_text(path: Path):
+    if path.suffix.lower() == ".docx":
+        # lightweight fallback: rely on caller to provide txt when possible
+        return ""
+    return path.read_text(errors="ignore")
+
+
+def cmd_ingest(args):
+    base = Path(args.base)
+    kdir = base / "knowledge"
+    kdir.mkdir(parents=True, exist_ok=True)
+    proposed_dir = kdir / "proposed"
+    proposed_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = [Path(p) for p in args.files]
+    sources = []
+    aggregate = {k: {"hits": 0, "examples": []} for k in CLAUSE_RULES.keys()}
+
+    for p in paths:
+        rp = p if p.is_absolute() else (base / p)
+        if not rp.exists():
+            continue
+        text = _read_any_text(rp)
+        ltxt = text.lower()
+        matched = []
+        for clause, cfg in CLAUSE_RULES.items():
+            hit, pats = clause_hit(ltxt, cfg.get("keywords", []))
+            if not hit:
+                continue
+            matched.append(clause)
+            aggregate[clause]["hits"] += 1
+            if len(aggregate[clause]["examples"]) < 3:
+                aggregate[clause]["examples"].append(pats[0])
+        sources.append({"path": str(rp), "matched_clauses": matched, "sha256": sha256_file(rp)})
+
+    suggestions = []
+    for clause, data in aggregate.items():
+        if data["hits"] == 0:
+            continue
+        suggestions.append({
+            "clause": clause,
+            "proposed_preference": CLAUSE_RULES[clause]["preferred"],
+            "confidence": "high" if data["hits"] >= 3 else "medium",
+            "seen_count": data["hits"],
+            "evidence": data["examples"],
+            "status": "proposed",
+        })
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out = proposed_dir / f"ingest-suggestions-{ts}.json"
+    payload = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "sources": sources,
+        "suggestions": suggestions,
+        "note": "Proposed-only. Review before promotion to active policy/profile.",
+    }
+    out.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    print(json.dumps({"ok": True, "suggestions_file": str(out), "sources_ingested": len(sources)}, ensure_ascii=False))
+
+
+def cmd_setup(args):
+    # Combined flow: init + optional ingest.
+    class Obj:
+        pass
+
+    init_args = Obj()
+    init_args.base = args.base
+    init_args.interactive = args.interactive
+    init_args.org_name = args.org_name
+    init_args.risk_posture = args.risk_posture
+    init_args.preferred_jurisdictions = args.preferred_jurisdictions
+    init_args.survival_years = args.survival_years
+    init_args.ai_policy = args.ai_policy
+    init_args.retention_carveout = args.retention_carveout
+    cmd_init(init_args)
+
+    if args.ingest_files:
+        ingest_args = Obj()
+        ingest_args.base = args.base
+        ingest_args.files = args.ingest_files
+        cmd_ingest(ingest_args)
+
+
 def cmd_build(args):
     base = Path(args.base)
     gmail_paths = [
@@ -798,6 +960,34 @@ def main():
     p_manifest.add_argument("--files", nargs="+", required=True)
     p_manifest.add_argument("--out", required=True)
     p_manifest.set_defaults(func=cmd_create_manifest)
+
+    p_init = sub.add_parser("init", help="Onboarding wizard/questionnaire to generate org config + default profile")
+    p_init.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_init.add_argument("--interactive", action="store_true")
+    p_init.add_argument("--org-name")
+    p_init.add_argument("--risk-posture", default="balanced", choices=["strict", "balanced", "commercial"])
+    p_init.add_argument("--preferred-jurisdictions", default="Austria")
+    p_init.add_argument("--survival-years", type=int, default=5)
+    p_init.add_argument("--ai-policy", default="guardrailed", choices=["restricted", "guardrailed", "permissive"])
+    p_init.add_argument("--retention-carveout", default="Allow limited backup/legal retention under continuing confidentiality obligations.")
+    p_init.set_defaults(func=cmd_init)
+
+    p_ingest = sub.add_parser("ingest", help="Ingest existing contracts/playbooks and propose policy/profile updates")
+    p_ingest.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_ingest.add_argument("--files", nargs="+", required=True)
+    p_ingest.set_defaults(func=cmd_ingest)
+
+    p_setup = sub.add_parser("setup", help="Combined setup: init plus optional ingest")
+    p_setup.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_setup.add_argument("--interactive", action="store_true")
+    p_setup.add_argument("--org-name")
+    p_setup.add_argument("--risk-posture", default="balanced", choices=["strict", "balanced", "commercial"])
+    p_setup.add_argument("--preferred-jurisdictions", default="Austria")
+    p_setup.add_argument("--survival-years", type=int, default=5)
+    p_setup.add_argument("--ai-policy", default="guardrailed", choices=["restricted", "guardrailed", "permissive"])
+    p_setup.add_argument("--retention-carveout", default="Allow limited backup/legal retention under continuing confidentiality obligations.")
+    p_setup.add_argument("--ingest-files", nargs="+")
+    p_setup.set_defaults(func=cmd_setup)
 
     args = parser.parse_args()
     args.func(args)

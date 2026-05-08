@@ -25,6 +25,15 @@ cd /Users/bbot/.openclaw/workspace/projects/nda-review-cli-medicus
 
 # 4) Review inline text
 ./nda_review_cli.py review --text "Mutual NDA ..."
+
+# 5) Onboarding config wizard (non-interactive flags shown)
+./nda_review_cli.py init --org-name "Acme" --risk-posture balanced --preferred-jurisdictions "Austria,Germany"
+
+# 6) Ingest existing knowledge (contracts/redlines/playbooks)
+./nda_review_cli.py ingest --files /path/to/nda1.txt /path/to/redline_notes.txt
+
+# 7) Combined setup (init + optional ingest)
+./nda_review_cli.py setup --org-name "Acme" --ingest-files /path/to/nda1.txt
 ```
 
 ## Expected input files
