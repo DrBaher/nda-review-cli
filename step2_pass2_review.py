@@ -61,6 +61,9 @@ def run_interactive(items):
         print("\n" + "=" * 72)
         print(f"[{point}] {it['clause']}  (severity: {it['severity']})")
         print(f"Concern: {it['concern']}")
+        snippet = (it.get("snippet") or "").strip()
+        if snippet:
+            print(f"Snippet: {snippet[:240]}{'...' if len(snippet) > 240 else ''}")
         print(f"Proposed: {it['proposed']}")
         current_decision = normalize_decision(it.get("decision", "")) or "(unset)"
         current_final = it.get("final", "").strip() or "(empty)"
@@ -118,11 +121,32 @@ def run_default_recommendations(items):
     return updates
 
 
+def apply_exceptions(updates, exceptions_raw):
+    """
+    exceptions format: "2=DROP,5=CONFIRM"
+    """
+    if not exceptions_raw:
+        return updates
+    for part in [x.strip() for x in exceptions_raw.split(",") if x.strip()]:
+        if "=" not in part:
+            continue
+        point, decision = [x.strip() for x in part.split("=", 1)]
+        decision = normalize_decision(decision)
+        if point in updates and decision in {"CONFIRM", "DOWNGRADE", "DROP"}:
+            updates[point]["decision"] = decision
+            if decision == "DROP":
+                updates[point]["final"] = ""
+    return updates
+
+
 def main():
     ap = argparse.ArgumentParser(description="Step 2 Pass-2 loop over hybrid approval pack")
     ap.add_argument("--pack", required=True, help="Path to hybrid-approval-pack-*.md")
     ap.add_argument("--decisions-json", help='Optional JSON file: [{"point":"1","decision":"CONFIRM|DOWNGRADE|DROP","final":"..."}]')
     ap.add_argument("--mode", choices=["interactive", "defaults"], default="interactive", help="interactive=review one-by-one, defaults=apply recommended defaults automatically")
+    ap.add_argument("--only-high", action="store_true", help="Only process HIGH severity items")
+    ap.add_argument("--resume", action="store_true", help="Skip points where decision is already set")
+    ap.add_argument("--accept-defaults-except", help='Default mode override list, e.g. "2=DROP,5=CONFIRM"')
     ap.add_argument("--out", help="Output pack path (default overwrite input)")
     ap.add_argument("--export-json", help="Write applied decisions to JSON")
     args = ap.parse_args()
@@ -133,11 +157,26 @@ def main():
     if not items:
         raise SystemExit("No pass-2 items found in pack.")
 
+    # enrich parsed items with snippet if present in pack format
+    for it in items:
+        m = re.search(rf"###\s+{re.escape(it['point'])}\.\s+.*?(?:\n- Exact clause snippet:\s*\"([^\"]+)\")?", text, re.S)
+        it["snippet"] = (m.group(1).strip() if m and m.group(1) else "")
+
+    if args.only_high:
+        items = [it for it in items if (it.get("severity", "").strip().lower() == "high")]
+
+    if args.resume:
+        def is_set(x):
+            d = normalize_decision(x.get("decision", ""))
+            return d in {"CONFIRM", "DOWNGRADE", "DROP"}
+        items = [it for it in items if not is_set(it)]
+
     if args.decisions_json:
         decisions = json.loads(Path(args.decisions_json).read_text())
         updates = run_from_json(items, decisions)
     elif args.mode == "defaults":
         updates = run_default_recommendations(items)
+        updates = apply_exceptions(updates, args.accept_defaults_except)
     else:
         updates = run_interactive(items)
 

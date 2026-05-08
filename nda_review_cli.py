@@ -2,8 +2,11 @@
 import argparse
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from collections import Counter, defaultdict
+import difflib
+from typing import Optional
 
 NDA_PAT = re.compile(r"\b(nda|non[-\s]?disclosure|confidentiality agreement|confidential disclosure agreement|cda|mutual nda|geheimhaltungsvereinbarung|vertraulich|vertrauliche informationen)\b", re.I)
 
@@ -171,12 +174,94 @@ def extract_clause_snippet(text, keywords, window=260):
     return ""
 
 
+def locate_clause(text, keywords):
+    lines = text.splitlines()
+    heading = ""
+    para_idx = None
+    for i, ln in enumerate(lines):
+        line = ln.strip()
+        if not line:
+            continue
+        is_heading = (line.startswith("•") or line.isupper() or (len(line) < 80 and line.endswith(":")))
+        for kw in keywords:
+            if re.search(kw, line, re.I):
+                # find nearest heading above
+                j = i
+                while j >= 0:
+                    cand = lines[j].strip()
+                    if cand and (cand.startswith("•") or cand.isupper() or (len(cand) < 80 and cand.endswith(":"))):
+                        heading = cand
+                        break
+                    j -= 1
+                para_idx = i + 1
+                return heading, para_idx
+        if is_heading and not heading:
+            heading = line
+    return heading, para_idx
+
+
 def derive_context_and_recommendation(clause, snippet, preferred_position):
     context = f"Clause '{clause}' was detected in the agreement text and should be reviewed against Medicus preferred position."
     if snippet:
         context = f"Detected clause text indicates '{clause}' is present. Validate whether this exact wording aligns with Medicus standards."
     recommendation = f"Align this clause with Medicus position: {preferred_position}"
     return context, recommendation
+
+
+def load_counterparty_profile(base: Path, counterparty: Optional[str]):
+    if not counterparty:
+        return {}
+    p = base / "profiles" / f"{counterparty.lower().replace(' ', '_')}.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def risk_weights(profile: Optional[dict] = None):
+    w = {
+        "legal": 1.0,
+        "commercial": 1.0,
+        "operational": 1.0,
+        "severity_high": 3,
+        "severity_low": 1,
+    }
+    if profile and isinstance(profile.get("risk_weights"), dict):
+        w.update(profile["risk_weights"])
+    return w
+
+
+def classify_risk_bucket(clause):
+    if clause in {"liability_and_remedies", "exceptions", "term_and_survival", "definition_of_confidential_information"}:
+        return "legal"
+    if clause in {"governing_law_jurisdiction", "mutuality", "assignment_and_affiliates", "non_solicit_non_compete"}:
+        return "commercial"
+    return "operational"
+
+
+def rule_hit_details(text, keywords):
+    hits = []
+    for k in keywords:
+        m = re.search(k, text, re.I)
+        if not m:
+            continue
+        matched_text = text[m.start():m.end()]
+        hits.append({"pattern": k, "match": matched_text})
+    return hits
+
+
+def suggest_posture(clause, profile):
+    if not profile:
+        return "Use Medicus default position."
+    prefs = profile.get("clause_preferences", {})
+    if clause in prefs:
+        return f"Counterparty posture: {prefs[clause]}"
+    fallback = profile.get("fallback_posture")
+    if fallback:
+        return f"Counterparty fallback posture: {fallback}"
+    return "Use Medicus default position."
 
 
 def build_playbook(messages, drive_items):
@@ -250,9 +335,11 @@ def build_playbook(messages, drive_items):
     return playbook
 
 
-def review_text(text, playbook):
+def review_text(text, playbook, profile=None):
     findings = []
     risk_score = 0
+    breakdown = {"legal": 0.0, "commercial": 0.0, "operational": 0.0}
+    weights = risk_weights(profile)
     ltxt = text.lower()
 
     for rule in playbook.get("policy", []):
@@ -266,16 +353,24 @@ def review_text(text, playbook):
         severity = "low"
         if rf_hits:
             severity = "high"
-            risk_score += 3
+            score = weights["severity_high"]
         else:
-            risk_score += 1
+            score = weights["severity_low"]
+
+        bucket = classify_risk_bucket(clause)
+        weighted = score * float(weights.get(bucket, 1.0))
+        risk_score += weighted
+        breakdown[bucket] += weighted
 
         snippet = extract_clause_snippet(text, keywords)
+        clause_heading, paragraph_index = locate_clause(text, keywords)
         context, recommendation = derive_context_and_recommendation(
             clause,
             snippet,
             rule.get("preferred_position", "")
         )
+
+        hit_details = rule_hit_details(text, keywords)
 
         findings.append({
             "clause": clause,
@@ -286,6 +381,13 @@ def review_text(text, playbook):
             "context": context,
             "recommendation": recommendation,
             "recommended_amendment": f"Amend clause '{clause}' to align with: {rule.get('preferred_position','')}",
+            "rule_hits": [k for k in keywords if re.search(k, ltxt, re.I)],
+            "rule_hit_details": hit_details,
+            "risk_bucket": bucket,
+            "score": weighted,
+            "clause_heading": clause_heading,
+            "paragraph_index": paragraph_index,
+            "posture_suggestion": suggest_posture(clause, profile),
         })
 
     decision = "approve"
@@ -296,7 +398,9 @@ def review_text(text, playbook):
 
     return {
         "decision": decision,
-        "risk_score": risk_score,
+        "risk_score": round(risk_score, 2),
+        "risk_breakdown": {k: round(v, 2) for k, v in breakdown.items()},
+        "risk_weights": weights,
         "findings": findings,
         "concerns_summary": [
             {
@@ -308,10 +412,147 @@ def review_text(text, playbook):
                 "context": f.get("context", ""),
                 "recommendation": f.get("recommendation", ""),
                 "recommended_amendment": f.get("recommended_amendment"),
+                "rule_hits": f.get("rule_hits", []),
+                "rule_hit_details": f.get("rule_hit_details", []),
+                "risk_bucket": f.get("risk_bucket", ""),
+                "score": f.get("score", 0),
+                "clause_heading": f.get("clause_heading", ""),
+                "paragraph_index": f.get("paragraph_index"),
+                "posture_suggestion": f.get("posture_suggestion", ""),
             }
             for i, f in enumerate(findings)
         ],
     }
+
+
+def cmd_playbook_lock(args):
+    base = Path(args.base)
+    playbook = json.loads(Path(args.playbook).read_text())
+    counterparty = args.counterparty.strip()
+    lock_dir = base / "output" / "playbook_locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    safe = counterparty.lower().replace(" ", "_")
+    out = lock_dir / f"{safe}.json"
+    payload = {
+        "counterparty": counterparty,
+        "locked_at": datetime.now(timezone.utc).isoformat(),
+        "playbook": playbook,
+    }
+    out.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    print(out)
+
+
+def cmd_playbook_snapshot(args):
+    base = Path(args.base)
+    playbook = json.loads(Path(args.playbook).read_text())
+    snap_dir = base / "output" / "playbook_versions"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out = snap_dir / f"playbook-{ts}.json"
+    playbook["snapshot_created_at"] = datetime.now(timezone.utc).isoformat()
+    out.write_text(json.dumps(playbook, indent=2, ensure_ascii=False))
+    print(out)
+
+
+def cmd_playbook_diff(args):
+    a = json.loads(Path(args.a).read_text()).get("policy", [])
+    b = json.loads(Path(args.b).read_text()).get("policy", [])
+    ta = json.dumps(a, indent=2, ensure_ascii=False).splitlines()
+    tb = json.dumps(b, indent=2, ensure_ascii=False).splitlines()
+    diff = "\n".join(difflib.unified_diff(ta, tb, fromfile=args.a, tofile=args.b, lineterm=""))
+    if args.out:
+        Path(args.out).write_text(diff)
+    print(diff)
+
+
+def cmd_generate_redlines(args):
+    review = json.loads(Path(args.review_json).read_text())
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# Clause-ready Redline Draft", ""]
+    for c in review.get("concerns_summary", []):
+        decision = str(c.get("pass2_decision", "")).upper()
+        if decision and decision not in {"CONFIRM", "DOWNGRADE"}:
+            continue
+        lines.append(f"## {c.get('point')}. {c.get('clause')}")
+        lines.append(f"- Replace this snippet: \"{c.get('clause_snippet','')}\"")
+        lines.append(f"- Concern: {c.get('concern')}")
+        lines.append(f"- Recommendation: {c.get('recommendation')}")
+        lines.append(f"- Strict replacement: {c.get('recommended_amendment')}")
+        lines.append(f"- Moderate replacement: {c.get('recommended_amendment')}")
+        lines.append(f"- Soft fallback replacement: Consider adding a clarifying qualifier while preserving business intent.")
+        lines.append("")
+    out.write_text("\n".join(lines))
+    print(out)
+
+
+def cmd_generate_office_script(args):
+    pack = Path(args.find_replace_pack).read_text(errors="ignore")
+    entries = re.findall(r"##\s+\d+\.\s+([^\n]+)\n- Find anchor \(in document\):\s*\"?([^\n\"]*)\"?\n- Replace/insert with:\s*([^\n]+)", pack)
+    body = [
+        "' Auto-generated Word VBA macro skeleton from Step 5 pack",
+        "Sub ApplyNdaTrackedEdits()",
+        "    ' Enable Track Changes in Word before running",
+        "    If ActiveDocument Is Nothing Then Exit Sub",
+        "    ActiveDocument.TrackRevisions = True",
+        "",
+    ]
+    for i, (_, find, repl) in enumerate(entries, 1):
+        esc_find = find.replace('"', '""')
+        esc_repl = repl.replace('"', '""')
+        body.append(f"    ' {i}")
+        body.append("    With Selection.Find")
+        body.append(f"        .Text = \"{esc_find}\"")
+        body.append("        .Forward = True")
+        body.append("        .Wrap = wdFindStop")
+        body.append("    End With")
+        body.append("    If Selection.Find.Execute Then")
+        body.append(f"        Selection.TypeText Text:=\"{esc_repl}\"")
+        body.append("    End If")
+        body.append("")
+    body.append("End Sub")
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(body))
+    print(out)
+
+
+def cmd_quality_gate(args):
+    redline = Path(args.redline).read_text(errors="ignore")
+    problems = []
+
+    # Numbering continuity in redline instruction headings
+    points = [int(x) for x in re.findall(r"^##\s+(\d+)\.", redline, re.M)]
+    if points:
+        expected = list(range(1, len(points) + 1))
+        if points != expected:
+            problems.append(f"Numbering mismatch: got {points}, expected {expected}")
+
+    # Amendment text present
+    missing = re.findall(r"^##\s+\d+\..*?(?:\n(?!## ).*)*- Amendment to apply \(tracked\):\s*$", redline, re.M)
+    if missing:
+        problems.append("One or more redline points have empty amendment text.")
+
+    # Optional source checks
+    if args.source_text and Path(args.source_text).exists():
+        src = Path(args.source_text).read_text(errors="ignore")
+        src_lower = src.lower()
+        if re.search(r"allow|permit.*ai|training", src_lower, re.I) and re.search(r"prohibit|forbid|shall not.*ai", src_lower, re.I):
+            problems.append("Potential AI usage contradiction detected in source text.")
+        refs = re.findall(r"section\s+(\d+(?:\.\d+)*)", redline, re.I)
+        for r in refs[:10]:
+            if not re.search(rf"section\s+{re.escape(r)}\b", src, re.I):
+                problems.append(f"Cross-reference check: Section {r} referenced in redline but not found in source text.")
+
+    status = "ok" if not problems else "fail"
+    payload = {"status": status, "problems": problems}
+    if args.out_json:
+        p = Path(args.out_json)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    print(json.dumps(payload, ensure_ascii=False))
+    if problems:
+        raise SystemExit(2)
 
 
 def cmd_build(args):
@@ -366,13 +607,19 @@ def cmd_build(args):
 
 def cmd_review(args):
     playbook = json.loads(Path(args.playbook).read_text())
+    base = Path(args.base)
+    profile = load_counterparty_profile(base, args.counterparty)
     if args.file:
         text = Path(args.file).read_text(errors="ignore")
     else:
         text = args.text or ""
-    result = review_text(text, playbook)
+    result = review_text(text, playbook, profile=profile)
     if args.file:
         result["input_file"] = args.file
+    if args.counterparty:
+        result["counterparty"] = args.counterparty
+    if profile:
+        result["counterparty_profile_loaded"] = True
 
     if args.out_json:
         out_json = Path(args.out_json)
@@ -387,6 +634,7 @@ def cmd_review(args):
             "",
             f"- Decision: **{result.get('decision','unknown').upper()}**",
             f"- Risk score: **{result.get('risk_score',0)}**",
+            f"- Risk breakdown: legal={result.get('risk_breakdown',{}).get('legal',0)}, commercial={result.get('risk_breakdown',{}).get('commercial',0)}, operational={result.get('risk_breakdown',{}).get('operational',0)}",
         ]
         if result.get("input_file"):
             lines.append(f"- Input file: `{result['input_file']}`")
@@ -394,13 +642,28 @@ def cmd_review(args):
         for f in result.get("findings", []):
             lines.append(f"### {f.get('clause','unknown')}")
             lines.append(f"- Severity: {f.get('severity','unknown')}")
+            lines.append(f"- Risk bucket: {f.get('risk_bucket','')}")
+            lines.append(f"- Weighted score: {f.get('score',0)}")
             lines.append(f"- Preferred position: {f.get('preferred_position','')}")
             if f.get("clause_snippet"):
                 lines.append(f"- Exact clause snippet: \"{f.get('clause_snippet')}\"")
+            if f.get("clause_heading"):
+                lines.append(f"- Section heading: {f.get('clause_heading')}")
+            if f.get("paragraph_index") is not None:
+                lines.append(f"- Paragraph index: {f.get('paragraph_index')}")
             if f.get("context"):
                 lines.append(f"- Context: {f.get('context')}")
             if f.get("recommendation"):
                 lines.append(f"- Recommendation: {f.get('recommendation')}")
+            if f.get("posture_suggestion"):
+                lines.append(f"- Counterparty posture suggestion: {f.get('posture_suggestion')}")
+            if f.get("rule_hits"):
+                lines.append("- Why flagged (rule hits):")
+                lines.extend([f"  - {r}" for r in f.get("rule_hits", [])])
+            if f.get("rule_hit_details"):
+                lines.append("- Matched terms:")
+                for d in f.get("rule_hit_details", []):
+                    lines.append(f"  - pattern `{d.get('pattern')}` matched \"{d.get('match')}\"")
             if f.get("red_flags"):
                 lines.append("- Red flags:")
                 lines.extend([f"  - {r}" for r in f["red_flags"]])
@@ -412,11 +675,19 @@ def cmd_review(args):
             lines.append(f"- Severity: {c.get('severity')}")
             if c.get("clause_snippet"):
                 lines.append(f"- Exact clause snippet: \"{c.get('clause_snippet')}\"")
+            if c.get("clause_heading"):
+                lines.append(f"- Section heading: {c.get('clause_heading')}")
+            if c.get("paragraph_index") is not None:
+                lines.append(f"- Paragraph index: {c.get('paragraph_index')}")
             if c.get("context"):
                 lines.append(f"- Context: {c.get('context')}")
             lines.append(f"- Concern: {c.get('concern')}")
             if c.get("recommendation"):
                 lines.append(f"- Recommendation: {c.get('recommendation')}")
+            if c.get("posture_suggestion"):
+                lines.append(f"- Counterparty posture suggestion: {c.get('posture_suggestion')}")
+            if c.get("rule_hits"):
+                lines.append(f"- Why flagged: {', '.join(c.get('rule_hits', []))}")
             lines.append(f"- Recommended amendment: {c.get('recommended_amendment')}")
             lines.append("")
         out_md.write_text("\n".join(lines))
@@ -433,12 +704,47 @@ def main():
     p_build.set_defaults(func=cmd_build)
 
     p_review = sub.add_parser("review", help="Review NDA text against generated playbook")
+    p_review.add_argument("--base", default=str(Path(__file__).resolve().parent))
     p_review.add_argument("--playbook", default=str(Path(__file__).resolve().parent / "output/medicus_nda_playbook.json"))
+    p_review.add_argument("--counterparty", help="Counterparty profile name (loads profiles/<name>.json)")
     p_review.add_argument("--file")
     p_review.add_argument("--text")
     p_review.add_argument("--out-json")
     p_review.add_argument("--out-md")
     p_review.set_defaults(func=cmd_review)
+
+    p_snap = sub.add_parser("playbook-snapshot", help="Snapshot current playbook version")
+    p_snap.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_snap.add_argument("--playbook", default=str(Path(__file__).resolve().parent / "output/medicus_nda_playbook.json"))
+    p_snap.set_defaults(func=cmd_playbook_snapshot)
+
+    p_diff = sub.add_parser("playbook-diff", help="Diff two playbook snapshots")
+    p_diff.add_argument("--a", required=True)
+    p_diff.add_argument("--b", required=True)
+    p_diff.add_argument("--out")
+    p_diff.set_defaults(func=cmd_playbook_diff)
+
+    p_lock = sub.add_parser("playbook-lock", help="Lock current playbook for a specific counterparty")
+    p_lock.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_lock.add_argument("--playbook", default=str(Path(__file__).resolve().parent / "output/medicus_nda_playbook.json"))
+    p_lock.add_argument("--counterparty", required=True)
+    p_lock.set_defaults(func=cmd_playbook_lock)
+
+    p_red = sub.add_parser("generate-redlines", help="Generate clause-ready redline draft from review JSON")
+    p_red.add_argument("--review-json", required=True)
+    p_red.add_argument("--out", required=True)
+    p_red.set_defaults(func=cmd_generate_redlines)
+
+    p_office = sub.add_parser("generate-office-script", help="Generate Office Script bridge from step5 find/replace pack")
+    p_office.add_argument("--find-replace-pack", required=True)
+    p_office.add_argument("--out", required=True)
+    p_office.set_defaults(func=cmd_generate_office_script)
+
+    p_gate = sub.add_parser("quality-gate", help="Run pre-step4 quality checks")
+    p_gate.add_argument("--redline", required=True)
+    p_gate.add_argument("--source-text")
+    p_gate.add_argument("--out-json")
+    p_gate.set_defaults(func=cmd_quality_gate)
 
     args = parser.parse_args()
     args.func(args)

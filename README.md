@@ -20,6 +20,9 @@ cd /Users/bbot/.openclaw/workspace/projects/nda-review-cli-medicus
 # 3) Direct review command
 ./nda_review_cli.py review --file /path/to/nda.txt
 
+# Optional: counterparty profile-aware review (loads profiles/<name>.json)
+./nda_review_cli.py review --file /path/to/nda.txt --counterparty "Healthchecks360"
+
 # 4) Review inline text
 ./nda_review_cli.py review --text "Mutual NDA ..."
 ```
@@ -60,6 +63,14 @@ If input is `.docx`, it also prepares step4 tracked-redline package.
 # C) Apply from explicit JSON decisions
 ./step2_pass2_review.py --pack output/reviews/hybrid-approval-pack-*.md \
   --decisions-json decisions.json --export-json applied.json
+
+# D) Resume unfinished decisions only (and high severity only)
+./step2_pass2_review.py --pack output/reviews/hybrid-approval-pack-*.md \
+  --mode interactive --resume --only-high
+
+# E) Accept defaults except selected points
+./step2_pass2_review.py --pack output/reviews/hybrid-approval-pack-*.md \
+  --mode defaults --accept-defaults-except "2=DROP,5=CONFIRM"
 ```
 
 `step2_pass2_review.py` writes `Pass 2 decision` + `Final amendment text` for each point,
@@ -68,3 +79,27 @@ so Step 3 only includes confirmed/downgraded items.
 Default heuristic (`--mode defaults`):
 - `high` severity → `CONFIRM`
 - `low` severity → `DOWNGRADE`
+
+## Additional utilities
+
+```bash
+# Playbook versioning
+./nda_review_cli.py playbook-snapshot
+./nda_review_cli.py playbook-diff --a output/playbook_versions/playbook-A.json --b output/playbook_versions/playbook-B.json --out output/playbook_versions/diff.patch
+./nda_review_cli.py playbook-lock --counterparty "Healthchecks360"
+
+# Clause-ready redline draft from review JSON
+./nda_review_cli.py generate-redlines --review-json output/reviews/review-*.json --out output/reviews/clause-ready-redline.md
+
+# Office Script bridge from Step 5 pack
+./nda_review_cli.py generate-office-script --find-replace-pack output/reviews/find-replace-pack-*.md --out output/tracked-redline/office-script.ts
+
+# Quality gate before Step 4
+./nda_review_cli.py quality-gate --redline output/reviews/redline-instructions-*.md --source-text /path/to/nda.txt --out-json output/reviews/quality-gate.json
+```
+
+## Quality gates in Step 4
+
+`step4_prepare_tracked_redline.sh` now checks:
+- Step 3 redline pack has actionable numbered items
+- Potential AI clause contradiction signals (allow + prohibit)
