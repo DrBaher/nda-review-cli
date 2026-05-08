@@ -114,15 +114,60 @@ def extract_sentences(text):
     return re.split(r"(?<=[.!?])\s+", text)
 
 
-def extract_clause_snippet(text, keywords, window=240):
+def extract_clause_snippet(text, keywords, window=260):
+    """
+    Return a cleaner clause snippet anchored to sentence/paragraph boundaries
+    instead of raw character windows.
+    """
+
+    def clean(s):
+        s = s.replace("\u2028", " ").replace("\u2029", " ")
+        s = re.sub(r"\s+", " ", s)
+        return s.strip()
+
+    # Split by paragraph-ish blocks first to preserve legal structure.
+    blocks = [b for b in re.split(r"\n\s*\n", text) if b.strip()]
+
     for kw in keywords:
-        m = re.search(kw, text, re.I)
+        rx = re.compile(kw, re.I)
+
+        # 1) Prefer exact paragraph block containing keyword.
+        for block in blocks:
+            if rx.search(block):
+                snippet = clean(block)
+                if len(snippet) <= 700:
+                    return snippet
+
+                # 2) If block is huge, trim to sentence neighborhood.
+                m = rx.search(block)
+                if not m:
+                    continue
+                local = block
+                # sentence boundaries around keyword hit
+                left = max(local.rfind('.', 0, m.start()), local.rfind(';', 0, m.start()), local.rfind('\n', 0, m.start()))
+                right_candidates = [
+                    local.find('.', m.end()),
+                    local.find(';', m.end()),
+                    local.find('\n', m.end()),
+                ]
+                right_candidates = [c for c in right_candidates if c != -1]
+                right = min(right_candidates) if right_candidates else len(local)
+                start = max(0, (left + 1) if left != -1 else m.start() - window)
+                end = min(len(local), right + 1 if right != -1 else m.end() + window)
+                return clean(local[start:end])
+
+        # 3) Fallback to global sentence window
+        m = rx.search(text)
         if m:
             start = max(0, m.start() - window)
             end = min(len(text), m.end() + window)
-            snippet = text[start:end].strip()
-            snippet = re.sub(r"\s+", " ", snippet)
-            return snippet
+            raw = text[start:end]
+            # expand to nearest sentence delimiters in raw window
+            lcut = max(raw.find('. '), raw.find('\n'))
+            if lcut > 0:
+                raw = raw[lcut + 1:]
+            return clean(raw)
+
     return ""
 
 
