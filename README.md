@@ -45,3 +45,18 @@ cd /Users/bbot/.openclaw/workspace/projects/nda-review-cli-medicus
 
 This runs deterministic review, hybrid pack, step3 redline instructions, and step5 find/replace pack.
 If input is `.docx`, it also prepares step4 tracked-redline package.
+
+
+## Step 2 interactive pass (cycle through concerns)
+
+```bash
+# Interactive loop over each concern in the hybrid pack
+./step2_pass2_review.py --pack output/reviews/hybrid-approval-pack-*.md
+
+# Or apply from JSON decisions
+./step2_pass2_review.py --pack output/reviews/hybrid-approval-pack-*.md \
+  --decisions-json decisions.json --export-json applied.json
+```
+
+`step2_pass2_review.py` writes `Pass 2 decision` + `Final amendment text` for each point,
+so Step 3 only includes confirmed/downgraded items.
