@@ -35,3 +35,13 @@ cd /Users/bbot/.openclaw/workspace/projects/nda-review-cli-medicus
 
 - This is a rules-first MVP generated from corpus signals.
 - Use output playbook as a living policy file and refine clause positions over time.
+
+
+## One-command pipeline
+
+```bash
+./run_all.sh /path/to/nda.docx "Counterparty Name" "Reviewer Name"
+```
+
+This runs deterministic review, hybrid pack, step3 redline instructions, and step5 find/replace pack.
+If input is `.docx`, it also prepares step4 tracked-redline package.
