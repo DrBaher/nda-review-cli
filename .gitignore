@@ -1,0 +1,10 @@
+# Sensitive/source data
+data/
+output/reviews/
+output/tracked-redline/
+output/*.json
+output/*.txt
+
+# env/OS
+.DS_Store
+*.log
