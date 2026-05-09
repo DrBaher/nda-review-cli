@@ -1,86 +1,82 @@
 # NDA Review CLI
 
-Builds an NDA negotiation playbook from a user's extracted Gmail/Drive corpus, then reviews NDA text against that playbook.
+Review NDAs against your own house playbook — without sending them to a third-party service. The CLI ingests your past contracts, extracts your negotiation style, and applies it as a deterministic, explainable policy to every new NDA.
 
-## Commands
+## What it does
+
+- **Builds a playbook** from your historical Gmail/Drive corpus (or any folder of contracts).
+- **Reviews NDAs** clause-by-clause against that playbook with severity-scored findings and explainability evidence.
+- **Generates redlines** ready to drop into Word, plus tracked-changes packs and Office Script bridges.
+- **Learns counterparty profiles** deterministically so repeat parties get a consistent stance.
+
+Everything runs locally. No model calls, no data leaves the box.
+
+## Quick start (3 commands)
 
 ```bash
-cd /path/to/nda-review-cli
+# 1. Clone and enter the repo
+git clone <this-repo-url> nda-review-cli && cd nda-review-cli
 
-# 1) Build playbook from raw_strict dataset
-./nda_review_cli.py build-playbook
-
-# Outputs:
-# - output/nda_playbook.json
-# - output/nda_playbook.md
-
-# 2) One-command review for a new NDA (recommended)
-./review_nda.sh /path/to/nda.txt
-
-# 3) Direct review command
-./nda_review_cli.py review --file /path/to/nda.txt
-
-# Optional: counterparty profile-aware review (loads profiles/<name>.json)
-./nda_review_cli.py review --file /path/to/nda.txt --counterparty "Counterparty Name"
-
-# Review explainability mode with concise evidence
-./nda_review_cli.py review --file /path/to/nda.txt --why --out-json output/reviews/review.json --out-md output/reviews/review.md
-
-# Review + deterministic profile learning
-./nda_review_cli.py review --file /path/to/nda.txt --counterparty "Counterparty Name" --learn-profile --out-json output/reviews/review.json
-
-# 4) Review inline text
-./nda_review_cli.py review --text "Mutual NDA ..."
-
-# 5) Onboarding config wizard (non-interactive flags shown)
-./nda_review_cli.py init --org-name "Acme" --template saas --risk-posture balanced --preferred-jurisdictions "Austria,Germany"
-
-# 6) Ingest existing knowledge (contracts/redlines/playbooks)
-./nda_review_cli.py ingest --files /path/to/nda1.txt /path/to/redline_notes.txt
-
-# Approve autodiscovered onboarding files without prompting
-./nda_review_cli.py ingest --yes
-
-# 7) Combined setup (init + optional ingest)
-./nda_review_cli.py setup --org-name "Acme" --ingest-files /path/to/nda1.txt --build
-
-# Import connector shortcuts
-./nda_review_cli.py ingest --contracts-dir /path/to/contracts
-./nda_review_cli.py ingest --drive-export-dir /path/to/google-drive-export
-
-# 8) Fastest onboarding (zero required args)
+# 2. One-shot setup — creates config + profile, auto-discovers any contracts in the repo, builds the playbook
 ./nda_review_cli.py setup --quick --yes
 
-# 9) Guided wizard flow
-./nda_review_cli.py wizard --quick --yes --review-file /path/to/nda.txt --out-json output/reviews/wizard.json
+# 3. Review a sample NDA (bundled fixture) to see the full output
+./nda_review_cli.py review --file tests/fixtures/sample_nda.txt --why
+```
 
-# 10) Score calibration against a labeled validation set
-./nda_review_cli.py calibrate-scoring --validation-set tests/fixtures/scoring_validation_set.json --scoring-profile balanced --out-json output/calibration.json
+That's it — `output/nda_playbook.json` and a review JSON/markdown summary are now on disk. New here? See **[GETTING_STARTED.md](GETTING_STARTED.md)** for a guided walkthrough, or run `./nda_review_cli.py tutorial` for an interactive primer.
 
-# 11) Release notes helper
-./nda_review_cli.py release-helper --version 0.4.0 --out output/release-notes-0.4.0.md
+## Core concepts
 
-# 12) Validate policy files and first-run environment
-./nda_review_cli.py policy-validate --file config/default-policy.json
-./nda_review_cli.py doctor
+| Term | What it is | Where it lives |
+|---|---|---|
+| **Policy** | Your house rules: clause keywords, preferred language, red flags, risk weights. Edited by humans. | `config/default-policy.json` (seed) → `config/org-policy.json` (your overrides) |
+| **Profile** | Per-counterparty memory: their typical positions, what they've conceded, what triggered escalation. Updated automatically with `--learn-profile`. | `profiles/<name>.json` |
+| **Playbook** | A snapshot built from your corpus + policy: clause-by-clause guidance the review engine consults. Rebuilt on demand. | `output/nda_playbook.json` (+ `.md`) |
+
+Rule of thumb: **edit the policy, let the profile learn, regenerate the playbook.**
+
+## Common workflows
+
+```bash
+# Review a single NDA
+./review_nda.sh /path/to/nda.txt
+
+# Review with explainability evidence (triggered phrases, paragraph index, confidence)
+./nda_review_cli.py review --file /path/to/nda.txt --why \
+  --out-json output/reviews/review.json --out-md output/reviews/review.md
+
+# Counterparty-aware review that also updates their profile
+./nda_review_cli.py review --file /path/to/nda.txt \
+  --counterparty "Acme Corp" --learn-profile \
+  --out-json output/reviews/review.json
+
+# Generate a clause-ready redline draft from a saved review
+./nda_review_cli.py generate-redlines --mode v2 \
+  --review-json output/reviews/review.json \
+  --out output/reviews/clause-ready-redline.md
+
+# Full pipeline: review + hybrid pack + redline + find/replace pack
+./run_all.sh /path/to/nda.docx "Counterparty Name" "Reviewer Name"
 ```
 
 ## Onboarding shortcuts
 
-- `./nda_review_cli.py setup --quick --yes` → writes base config + profile using defaults, auto-discovers ingest files, and runs `build-playbook` by default.
-- `setup --quick` now defaults `build=true`; use `--no-build` to skip, or `--build` on non-quick setup to opt in.
-- `init` supports opinionated templates: `--template saas|healthcare|enterprise`.
-- `init`, `review`, `setup`, and `wizard` accept `--scoring-profile` plus optional `--scoring-profiles config/scoring-profiles.json`.
-- If you do not pass `--ingest-files`, `setup` and `ingest` auto-scan:
-  - `knowledge/inbox/`
-  - `knowledge/contracts/`
-  - `knowledge/redlines/`
-  - `inbox/`
-  - `input/`
-- `ingest --contracts-dir` recurses through a local contracts folder.
-- `ingest --drive-export-dir` recurses through a downloaded Google Drive export folder such as `My Drive/` or `Takeout/`.
-- When files are auto-discovered, the CLI shows the candidate list and asks for confirmation unless you pass `--yes` or `--no-prompt`.
-- If nothing is found and you are in an interactive terminal, the CLI asks once for file paths.
+- `./nda_review_cli.py tutorial` → interactive primer that explains the concepts and runs a sample review.
+- `./nda_review_cli.py setup --quick --yes` → defaults + auto-discovers ingest files + runs `build-playbook`.
+- `./nda_review_cli.py wizard --quick --yes --review-file <nda>` → setup → ingest → build → review in one go.
+- `./nda_review_cli.py init --template saas|healthcare|enterprise` → opinionated starting points.
+- `./nda_review_cli.py doctor` → diagnose first-run issues with actionable fixes.
+- `./nda_review_cli.py policy-validate --file config/default-policy.json` → schema/version check.
+
+If you do not pass `--ingest-files`, `setup` and `ingest` auto-scan:
+
+- `knowledge/inbox/`, `knowledge/contracts/`, `knowledge/redlines/`
+- `inbox/`, `input/`
+
+`ingest --contracts-dir <dir>` recurses a local contracts folder. `ingest --drive-export-dir <dir>` recurses a Google Drive Takeout/`My Drive` export.
+
+When files are auto-discovered, the CLI shows the candidate list and asks for confirmation unless you pass `--yes` or `--no-prompt`. If nothing is found and you are in an interactive terminal, the CLI asks once for file paths.
 
 ## Policy configuration
 
@@ -119,7 +115,8 @@ The CLI is generic by default:
 - You can also learn from an existing review file:
 
 ```bash
-./nda_review_cli.py profile-learn --counterparty "Counterparty Name" --review-json output/reviews/review.json
+./nda_review_cli.py profile-learn --counterparty "Counterparty Name" \
+  --review-json output/reviews/review.json
 ```
 
 ## Scoring profiles and calibration
@@ -276,3 +273,15 @@ STRICT_ANCHORS=1 ./step5_find_replace_pack.sh /path/to/source.txt /path/to/redli
 ```
 
 In strict mode, Step 5 fails if any find-anchor is not unique.
+
+## Troubleshooting
+
+| Symptom | Try |
+|---|---|
+| `No valid policy file found` from `doctor` | `./nda_review_cli.py init --base .` then re-run `doctor`. |
+| `Missing build-playbook input: data/raw_strict/...` | Use `setup --quick` (skips raw build) or supply real paths via `--gmail-paths`/`--drive-paths`. |
+| `Unreadable ingest candidate: foo.pdf` | Install `pdftotext` (`poppler-utils`) or convert the PDF to `.txt`/`.md`. |
+| Review finds nothing | Confirm the playbook exists at `output/nda_playbook.json` and rerun `build-playbook`. |
+| Want to start over | `rm -rf config/org-policy.json profiles/ output/ knowledge/proposed/` and re-run `setup --quick --yes`. |
+
+For more, run `./nda_review_cli.py doctor` — it prints actionable fixes for each detected issue.

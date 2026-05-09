@@ -1162,6 +1162,28 @@ def cmd_create_manifest(args):
     print(out)
 
 
+def _print_friendly(title, lines, next_steps=None):
+    """Write a human-readable summary to stderr.
+
+    Stdout stays machine-parseable (JSON). Suppressed when NDA_CLI_QUIET=1
+    or stderr is not a tty and NDA_CLI_FORCE_FRIENDLY is unset.
+    """
+    if os.environ.get("NDA_CLI_QUIET") == "1":
+        return
+    if not sys.stderr.isatty() and os.environ.get("NDA_CLI_FORCE_FRIENDLY") != "1":
+        return
+    bar = "─" * max(len(title) + 4, 32)
+    print(f"\n  {title}", file=sys.stderr)
+    print(f"  {bar}", file=sys.stderr)
+    for line in lines:
+        print(f"  {line}", file=sys.stderr)
+    if next_steps:
+        print(f"\n  Next steps:", file=sys.stderr)
+        for i, step in enumerate(next_steps, 1):
+            print(f"    {i}. {step}", file=sys.stderr)
+    print("", file=sys.stderr)
+
+
 def _prompt_with_default(label, default):
     raw = input(f"{label} [{default}]: ").strip()
     return raw or default
@@ -1249,6 +1271,21 @@ def cmd_init(args):
     org_out.write_text(json.dumps(org_policy, indent=2, ensure_ascii=False))
     prof_out.write_text(json.dumps(profile, indent=2, ensure_ascii=False))
     print(json.dumps({"ok": True, "org_policy": str(org_out), "default_profile": str(prof_out)}, ensure_ascii=False))
+    _print_friendly(
+        title=f"Initialized NDA Review CLI for {org_name}",
+        lines=[
+            f"Org policy:      {org_out}",
+            f"Default profile: {prof_out}",
+            f"Risk posture:    {posture}   |   Scoring profile: {scoring_profile['name']}",
+            f"Template:        {getattr(args, 'template', None) or '(none)'}",
+        ],
+        next_steps=[
+            "Edit `config/org-policy.json` to refine clause rules for your house style.",
+            "Run `./nda_review_cli.py ingest` to feed in past contracts (or use `--contracts-dir`).",
+            "Run `./nda_review_cli.py build-playbook` to compile your playbook.",
+            "Run `./nda_review_cli.py doctor` if anything seems off.",
+        ],
+    )
 
 
 def discover_ingest_files(base: Path):
@@ -1396,6 +1433,29 @@ def cmd_ingest(args):
         "skipped_for_approval": resolution["skipped_for_approval"],
         "connector_inputs": payload["connector_inputs"],
     }, ensure_ascii=False))
+    failed = [s for s in sources if s.get("extraction_status") == "failed"]
+    summary_lines = [
+        f"Sources ingested: {len(sources)}",
+        f"Clause suggestions emitted: {len(suggestions)}",
+        f"Suggestions file: {out}",
+    ]
+    if resolution["skipped_for_approval"]:
+        summary_lines.append("Some auto-discovered files were skipped pending approval (re-run with --yes to accept).")
+    if failed:
+        summary_lines.append(f"Extraction failed for {len(failed)} file(s) — install pdftotext or convert to .txt/.md.")
+    next_steps = ["Review suggestions in `knowledge/proposed/` before promoting them to active policy."]
+    if not sources:
+        next_steps = [
+            "Drop contracts into `knowledge/inbox/` or pass `--contracts-dir <dir>` and re-run ingest.",
+            "Or run `./nda_review_cli.py doctor` to see what was discovered.",
+        ]
+    else:
+        next_steps.append("Run `./nda_review_cli.py build-playbook` to compile a fresh playbook.")
+    _print_friendly(
+        title="Ingest complete",
+        lines=summary_lines,
+        next_steps=next_steps,
+    )
 
 
 def cmd_setup(args):
@@ -1480,6 +1540,30 @@ def cmd_setup(args):
         "build_ran": should_build,
         "playbook_json": build_output,
     }, ensure_ascii=False))
+    summary = [
+        f"Base directory:  {base}",
+        f"Org policy:      {base / 'config' / 'org-policy.json'}",
+        f"Default profile: {base / 'profiles' / 'default.json'}",
+        f"Ingest files:    {len(ingest_files)}",
+        f"Build ran:       {'yes — ' + str(build_output) if build_output else 'no (rerun with --build to compile)'}",
+    ]
+    next_steps = [
+        "Review a sample NDA: `./nda_review_cli.py review --file tests/fixtures/sample_nda.txt --why`",
+        "Customize defaults: edit `config/org-policy.json`",
+    ]
+    if not ingest_files:
+        next_steps.insert(
+            0,
+            "Add past contracts via `./nda_review_cli.py ingest --contracts-dir <dir>` for richer playbook signals.",
+        )
+    if not build_output:
+        next_steps.append("Run `./nda_review_cli.py build-playbook` once you have ingest data.")
+    next_steps.append("Run `./nda_review_cli.py doctor` to validate first-run readiness.")
+    _print_friendly(
+        title="Setup complete — you're ready to review",
+        lines=summary,
+        next_steps=next_steps,
+    )
 
 
 def cmd_policy_validate(args):
@@ -1581,6 +1665,28 @@ def cmd_doctor(args):
         "suggested_fixes": sorted(set(fixes)),
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
+    status_lines = []
+    for check in checks:
+        emoji = "ok" if check["status"] == "ok" else ("warn" if check["status"] == "warn" else "fail")
+        status_lines.append(f"[{emoji.upper():4}] {check['name']}")
+    if not hard_failures and not warnings:
+        status_lines.append("All onboarding checks passed.")
+    next_steps = []
+    if hard_failures:
+        next_steps.extend(payload["suggested_fixes"][:5])
+    elif warnings:
+        next_steps.extend(payload["suggested_fixes"][:3])
+        next_steps.append("Optional: drop contracts into `knowledge/inbox/` to enrich the playbook.")
+    else:
+        next_steps = [
+            "Run `./nda_review_cli.py review --file tests/fixtures/sample_nda.txt --why` to verify the review pipeline.",
+            "Run `./nda_review_cli.py build-playbook` whenever you change policy or ingest new contracts.",
+        ]
+    _print_friendly(
+        title="Doctor report" + ("" if not hard_failures else " (issues found)"),
+        lines=status_lines,
+        next_steps=next_steps if next_steps else None,
+    )
     if hard_failures:
         raise SystemExit(2)
 
@@ -1844,6 +1950,185 @@ def _prompt_yes_no(label, default=True):
     return raw in {"y", "yes"}
 
 
+TUTORIAL_STEPS = [
+    {
+        "title": "Welcome",
+        "body": [
+            "NDA Review CLI helps you review NDAs against your own house playbook.",
+            "Everything runs locally — no model calls, no data leaves the box.",
+            "",
+            "We'll walk through the three core artifacts and run a sample review.",
+        ],
+    },
+    {
+        "title": "Concept 1 — Policy",
+        "body": [
+            "The policy is your house rules: clause keywords, preferred language,",
+            "red flags, risk weights. It lives in:",
+            "  • config/default-policy.json   (committed seed, generic defaults)",
+            "  • config/org-policy.json       (your local override, gitignored)",
+            "",
+            "You edit the policy. The CLI never silently rewrites it.",
+        ],
+    },
+    {
+        "title": "Concept 2 — Profile",
+        "body": [
+            "A profile is per-counterparty memory under profiles/<name>.json.",
+            "It records typical positions, concessions, and escalation history.",
+            "",
+            "Pass `--counterparty \"Acme Corp\" --learn-profile` on review and the",
+            "CLI updates profiles/Acme Corp.json deterministically.",
+        ],
+    },
+    {
+        "title": "Concept 3 — Playbook",
+        "body": [
+            "The playbook is the compiled artifact at output/nda_playbook.json.",
+            "It's regenerated on demand from policy + corpus signals.",
+            "",
+            "Rule of thumb: edit the policy, let the profile learn,",
+            "regenerate the playbook.",
+        ],
+    },
+    {
+        "title": "Hands-on — Sample review",
+        "body": [
+            "We'll set up a fresh workspace under a temp directory and run a",
+            "review against the bundled sample NDA at:",
+            "  tests/fixtures/sample_nda.txt",
+            "",
+            "This won't touch your existing config/ or profiles/.",
+        ],
+    },
+]
+
+
+def cmd_tutorial(args):
+    repo = Path(__file__).resolve().parent
+    interactive = sys.stdin.isatty() and not args.no_prompt
+
+    def pause(prompt="Press Enter to continue, or Ctrl-C to quit. "):
+        if interactive:
+            try:
+                input(prompt)
+            except (EOFError, KeyboardInterrupt):
+                print("\nTutorial aborted.")
+                raise SystemExit(0)
+
+    for step in TUTORIAL_STEPS:
+        print()
+        print(f"  ━━ {step['title']} ━━")
+        for line in step["body"]:
+            print(f"  {line}")
+        pause()
+
+    if not args.run_sample and interactive:
+        try:
+            choice = input("\n  Run a sample setup + review now? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            choice = "n"
+        run_sample = choice in ("", "y", "yes")
+    else:
+        run_sample = args.run_sample
+
+    if not run_sample:
+        print("\n  Skipped sample run. When you're ready:")
+        print("    1. ./nda_review_cli.py setup --quick --yes")
+        print("    2. ./nda_review_cli.py review --file tests/fixtures/sample_nda.txt --why")
+        print("    3. ./nda_review_cli.py doctor")
+        return
+
+    import tempfile
+
+    workdir = Path(args.base) if args.base else Path(tempfile.mkdtemp(prefix="nda-tutorial-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    print(f"\n  Sandbox: {workdir}")
+    print("  Running: setup --quick --yes --no-prompt")
+
+    class Obj:
+        pass
+
+    setup_args = Obj()
+    setup_args.base = str(workdir)
+    setup_args.interactive = False
+    setup_args.org_name = "Tutorial Org"
+    setup_args.template = None
+    setup_args.risk_posture = "balanced"
+    setup_args.preferred_jurisdictions = "Austria"
+    setup_args.survival_years = 5
+    setup_args.ai_policy = "guardrailed"
+    setup_args.retention_carveout = "Allow limited backup/legal retention under continuing confidentiality obligations."
+    setup_args.default_policy = "config/default-policy.json"
+    setup_args.policy = None
+    setup_args.ingest_files = None
+    setup_args.contracts_dir = None
+    setup_args.drive_export_dir = None
+    setup_args.build = False
+    setup_args.no_build = True
+    setup_args.quick = True
+    setup_args.yes = True
+    setup_args.no_prompt = True
+    setup_args.scoring_profile = None
+    setup_args.scoring_profiles = None
+    cmd_setup(setup_args)
+
+    # Seed minimal corpus stubs so build-playbook produces a usable artifact.
+    raw = workdir / "data" / "raw_strict"
+    raw.mkdir(parents=True, exist_ok=True)
+    sample_gmail = [
+        {"id": "1", "subject": "NDA review (mutual)", "body": "Mutual NDA, return or destroy on termination, governing law Austria.", "from": "legal@example.com"},
+        {"id": "2", "subject": "Re: NDA accepted", "body": "Term 3 years, trade secret survival indefinite, looks good.", "from": "ops@example.com"},
+    ]
+    sample_drive = [{"id": "d1", "name": "NDA playbook notes", "body": "Use restrictions limited to evaluation purposes."}]
+    for name in ("gmail_primary.json", "gmail_secondary.json"):
+        (raw / name).write_text(json.dumps(sample_gmail))
+    for name in ("drive_primary.json", "drive_secondary.json"):
+        (raw / name).write_text(json.dumps(sample_drive))
+
+    print("\n  Building sample playbook from seeded corpus stubs...")
+    build_args = Obj()
+    build_args.base = str(workdir)
+    build_args.policy = None
+    build_args.gmail_paths = ["data/raw_strict/gmail_primary.json", "data/raw_strict/gmail_secondary.json"]
+    build_args.drive_paths = ["data/raw_strict/drive_primary.json", "data/raw_strict/drive_secondary.json"]
+    build_args.out_json = "output/nda_playbook.json"
+    build_args.out_md = "output/nda_playbook.md"
+    cmd_build(build_args)
+
+    sample = repo / "tests" / "fixtures" / "sample_nda.txt"
+    if not sample.exists():
+        print(f"\n  Sample fixture missing: {sample}")
+        return
+
+    print(f"\n  Reviewing: {sample}")
+    review_args = Obj()
+    review_args.base = str(workdir)
+    review_args.playbook = str(workdir / "output" / "nda_playbook.json")
+    review_args.counterparty = None
+    review_args.file = str(sample)
+    review_args.text = None
+    review_args.out_json = str(workdir / "output" / "reviews" / "tutorial-review.json")
+    review_args.out_md = str(workdir / "output" / "reviews" / "tutorial-review.md")
+    review_args.why = True
+    review_args.learn_profile = False
+    review_args.scoring_profile = None
+    review_args.scoring_profiles = None
+    Path(review_args.out_json).parent.mkdir(parents=True, exist_ok=True)
+    cmd_review(review_args)
+
+    print()
+    print("  ━━ Done ━━")
+    print(f"  Review JSON: {review_args.out_json}")
+    print(f"  Review MD:   {review_args.out_md}")
+    print()
+    print("  Next steps:")
+    print("    • Open the markdown summary in your editor.")
+    print("    • Run `./nda_review_cli.py doctor` against your real workspace.")
+    print("    • Read GETTING_STARTED.md for the full happy-path guide.")
+    print()
+
+
 def cmd_wizard(args):
     base = Path(args.base)
     interactive = not args.no_prompt and sys.stdin.isatty()
@@ -2072,6 +2357,12 @@ def main():
     p_release.add_argument("--version", required=True)
     p_release.add_argument("--out")
     p_release.set_defaults(func=cmd_release_helper)
+
+    p_tutorial = sub.add_parser("tutorial", help="Interactive primer that explains policy/profile/playbook and runs a sample review")
+    p_tutorial.add_argument("--base", help="Sandbox directory for the sample run (defaults to a fresh temp dir)")
+    p_tutorial.add_argument("--no-prompt", action="store_true", help="Skip pauses; useful for CI smoke tests")
+    p_tutorial.add_argument("--run-sample", action="store_true", help="Skip the run-sample question and run it automatically")
+    p_tutorial.set_defaults(func=cmd_tutorial)
 
     p_wizard = sub.add_parser("wizard", help="Guided setup -> ingest -> build -> review flow")
     p_wizard.add_argument("--base", default=str(Path(__file__).resolve().parent))
