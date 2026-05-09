@@ -299,6 +299,20 @@ class NegotiateStanceAndSignoffTests(unittest.TestCase):
         )
 
     def test_auto_conservative_counters_more_than_compromising(self):
+        # Make B's preferred clause text diverge from A's so there's something
+        # to actually counter. Without this, identical policies mean no party
+        # has anything to push back on regardless of stance.
+        b_policy = self.party_b / "config" / "org-policy.json"
+        ob = json.loads(b_policy.read_text())
+        ob["clause_rules"]["term_and_survival"]["preferred"] = (
+            "NDA term 5 years, confidentiality survival 10 years."
+        )
+        ob["clause_rules"]["return_or_destroy"]["preferred"] = (
+            "Destroy and certify destruction within 7 days."
+        )
+        ob["clause_rules"]["mutuality"]["preferred"] = "Unilateral receiving-party-bound NDA only."
+        b_policy.write_text(json.dumps(ob))
+
         self._init_round_one()
 
         # Conservative counter — counters every clause that differs from preferred

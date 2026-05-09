@@ -162,5 +162,116 @@ class StalemateDetectorTests(unittest.TestCase):
         self.assertIn("blocked", result.stderr.lower())
 
 
+class PriorityLogrollingTests(unittest.TestCase):
+    """Validate that clause_priorities reduces stalemate via logrolling."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workdir = Path(tempfile.mkdtemp(prefix="nda-prio-"))
+
+    def _setup_pair(self, with_priorities: bool):
+        a = self.workdir / ("with-prio-a" if with_priorities else "no-prio-a")
+        b = self.workdir / ("with-prio-b" if with_priorities else "no-prio-b")
+        quickstart(a, "Acme")
+        quickstart(b, "Beta")
+        make_party_b_divergent(b)
+        if with_priorities:
+            # Realistic non-overlapping: conflicting clauses fall into A's
+            # concession zone for two of them, B's for one of them. The
+            # remaining conflict (term_and_survival) is in both insistence
+            # zones — that one should still stalemate.
+            prio_a = [
+                "term_and_survival",  # A's #1 — A insists
+                "residuals",
+                "use_restrictions",
+                "non_solicit_non_compete",
+                "governing_law_jurisdiction",
+                "liability_and_remedies",
+                "definition_of_confidential_information",
+                "exceptions",
+                "mutuality",            # A's #9 — A concedes (B wins mutuality)
+                "return_or_destroy",    # A's #10 — A concedes (B wins return_or_destroy)
+                "assignment_and_affiliates",
+            ]
+            prio_b = [
+                "governing_law_jurisdiction",
+                "liability_and_remedies",
+                "definition_of_confidential_information",
+                "exceptions",
+                "mutuality",
+                "return_or_destroy",
+                "assignment_and_affiliates",
+                "term_and_survival",     # B's #8 — B still insists (in top 8)
+                "non_solicit_non_compete",
+                "residuals",             # B's #10 — B concedes (A wins residuals)
+                "use_restrictions",
+            ]
+            for base, prios in ((a, prio_a), (b, prio_b)):
+                p = base / "config" / "org-policy.json"
+                o = json.loads(p.read_text())
+                o["clause_priorities"] = prios
+                p.write_text(json.dumps(o))
+        return a, b
+
+    def test_logrolling_reduces_disputes_under_conservative_x_conservative(self):
+        a_no, b_no = self._setup_pair(with_priorities=False)
+        rep_no = run_simulation(a_no, b_no, "conservative", "conservative")
+        disputes_no = sum(1 for v in rep_no["final_clause_status"].values() if v == "disputed")
+
+        a_yes, b_yes = self._setup_pair(with_priorities=True)
+        rep_yes = run_simulation(a_yes, b_yes, "conservative", "conservative")
+        disputes_yes = sum(1 for v in rep_yes["final_clause_status"].values() if v == "disputed")
+
+        self.assertLess(
+            disputes_yes, disputes_no,
+            f"With priorities ({disputes_yes}) should resolve more clauses than without ({disputes_no})",
+        )
+
+    def test_winner_per_clause_reflects_logrolling(self):
+        a, b = self._setup_pair(with_priorities=True)
+        rep = run_simulation(a, b, "conservative", "conservative")
+        winners = rep["winner_per_clause"]
+        # mutuality and return_or_destroy: A's bottom-priority, both diverged → B wins
+        # residuals: B's bottom-priority, diverged → A wins
+        if "mutuality" in winners:
+            self.assertEqual(winners["mutuality"], "b", f"B should win mutuality (in A's concession zone)")
+        if "return_or_destroy" in winners:
+            self.assertEqual(winners["return_or_destroy"], "b", f"B should win return_or_destroy (in A's concession zone)")
+        if "residuals" in winners:
+            self.assertEqual(winners["residuals"], "a", f"A should win residuals (in B's concession zone)")
+
+
+class ConcessionZoneTests(unittest.TestCase):
+    """Direct unit tests of the concession-zone math."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Import the helpers directly for unit-level testing.
+        import sys as _sys
+        _sys.path.insert(0, str(REPO))
+        import nda_review_cli as _cli
+        cls.cli = _cli
+
+    def test_concession_zone_sizes_per_stance(self):
+        rules = {f"c{i}": {} for i in range(11)}
+        priorities = list(rules.keys())
+        zone_cons = self.cli._negotiate_concession_zone(rules, priorities, "conservative")
+        zone_mid = self.cli._negotiate_concession_zone(rules, priorities, "middleground")
+        zone_comp = self.cli._negotiate_concession_zone(rules, priorities, "compromising")
+        # 11 clauses: 30%=3, 60%=7, 85%=9
+        self.assertEqual(len(zone_cons), 3)
+        self.assertEqual(len(zone_mid), 7)
+        self.assertEqual(len(zone_comp), 9)
+        # Concession zone is the *bottom* of the priority list
+        self.assertEqual(zone_cons, {"c8", "c9", "c10"})
+
+    def test_unranked_clauses_default_to_bottom(self):
+        rules = {f"c{i}": {} for i in range(5)}
+        priorities = ["c0", "c1"]  # only 2 explicitly ranked; others go to bottom
+        zone_cons = self.cli._negotiate_concession_zone(rules, priorities, "conservative")
+        # 5 clauses * 30% = 1.5 → round = 2 → bottom 2 (the unranked ones, lowest)
+        self.assertIn("c4", zone_cons)
+
+
 if __name__ == "__main__":
     unittest.main()

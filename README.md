@@ -191,18 +191,45 @@ Stance flows into both modes:
 
 ### Game-theoretic predictions (validated by `negotiate simulate`)
 
-The deterministic `--auto` mode is a bargaining game. Each clause has a preferred text per party; each stance defines an acceptance threshold. The convergence rule is the equilibrium condition. We've validated the predicted outcomes empirically — see `tests/test_negotiate_simulate.py`.
+The deterministic `--auto` mode is a multi-issue bargaining game. Each clause has a preferred text per party; each stance defines how many clauses you insist on; **clause priorities** define which ones you concede on. The CLI implements **logrolling** — the classic resolution for multi-issue bargaining where parties trade concessions across issues they value differently.
+
+The convergence rule is the equilibrium condition; the stalemate detector bounds the worst case. We've validated the predicted outcomes empirically (see `tests/test_negotiate_simulate.py`):
 
 | Party A × Party B | Outcome | Rounds | Why |
 |---|---|---|---|
-| **conservative × conservative** | **blocked** | ~7 (stalemate) | Both sides counter every clause that differs from their preferred text → oscillating non-convergence → stalemate detector flips status to `blocked` after 4 rounds without progress |
+| **conservative × conservative** (default priorities) | blocked | ~7 (stalemate) | Symmetric strict preferences → no Nash equilibrium with mutual acceptance → oscillating non-convergence |
+| conservative × conservative (**non-overlapping priorities**) | converged or partial-convergence | 3–5 | Logrolling: A concedes its bottom-30% to B, B concedes its bottom-30% to A. Reduces disputes from 3 → 1 in our test fixtures |
 | conservative × middleground | converged | 2–3 | M concedes on non-red-flag clauses, A holds firm and wins the contested ones |
 | conservative × compromising | converged | 2–3 | C concedes everywhere; only A's red flags are negotiated |
 | middleground × middleground | converged | 2 | Both sides only push back on red flags; usually one round resolves them |
 | middleground × compromising | converged | 2 | C concedes; M just polices red flags |
 | compromising × compromising | converged | 2 | Both sides accept everything that doesn't fire a red flag |
 
-When two parties **both** insist on their own preferred language with no give, no rules-only mechanism can converge — that's the well-known result for symmetric strict-preference bargaining. The CLI surfaces this rather than looping forever: status flips to `blocked` with a diagnosis listing the stuck clauses. Try one side compromising, switch to `--agent --llm` (which can spot semantically-equivalent text), or escalate to humans.
+#### How logrolling works in practice
+
+Each party ranks the clauses 1..N during `quickstart` (1 = most important). Stance defines the **size** of your concession zone, priorities define **which clauses are in it**:
+
+| Stance | Concession zone | Insists on |
+|---|---|---|
+| Conservative | bottom **30%** | top 70% by priority |
+| Middleground | bottom **60%** | top 40% by priority |
+| Compromising | bottom **85%** | top 15% by priority |
+
+When the agent runs `--auto`, it accepts the current text for any clause in its concession zone (no matter how different from your preferred). It only counters on clauses outside its concession zone, applying the stance's red-flag/diff logic.
+
+**Why two conservatives with different priorities can converge** (and statistically will): with 11 clauses, there are 11! ≈ 40M possible orderings — the chance two real teams have identical priorities is essentially zero. As long as A's bottom-30% covers some of the clauses B insists on (and vice versa), those clauses converge through logrolling. The residual stalemate is bounded to clauses where **both** parties' top priorities overlap; if the overlap is too large, the stalemate detector still trips and the CLI prompts you to change strategy.
+
+Run the simulation yourself:
+
+```bash
+nda-review-cli negotiate simulate \
+  --party-a-base /path/to/party-a-workspace \
+  --party-b-base /path/to/party-b-workspace \
+  --stance-a conservative --stance-b conservative \
+  --mode auto --max-rounds 12
+```
+
+The report includes per-round trajectory (agreed/disputed/proposed counts), winner-per-clause for converged outcomes, and a `block_diagnosis` listing stuck clauses for blocked outcomes.
 
 Run the simulation yourself:
 

@@ -171,6 +171,15 @@ The `negotiate counter --auto` mode is a deterministic bargaining algorithm. Eac
    - Otherwise, B *counters* with `T_B`. The clause moves to `disputed`, `last_proposer` becomes B.
 3. Round 3+: Each party iterates the same logic on the current document state.
 
+**Logrolling via priority + stance:**
+
+The "give-no-quarter" stalemate under symmetric strict preferences is well-known in bargaining theory. The standard resolution is **logrolling** — parties trade concessions across issues they value differently. We implement this by combining two policy fields:
+
+- `negotiation_stance` defines the *size* of the concession zone: conservative concedes 30% of clauses, middleground 60%, compromising 85%.
+- `clause_priorities` (ordered list, top-down) defines *which* clauses are in the concession zone — the agent concedes its bottom-K by priority.
+
+For each clause, the agent applies the rule: **"If this clause is in my concession zone, accept current text. Otherwise apply stance's counter logic."** Logrolling resolves clauses where the parties' priorities don't overlap; the residual disputed set is bounded to clauses where both parties' top-zone preferences collide.
+
 **Equilibrium analysis:**
 
 | Stance pair | Equilibrium | Why |
@@ -178,9 +187,14 @@ The `negotiate counter --auto` mode is a deterministic bargaining algorithm. Eac
 | compromising × compromising | Pareto-acceptable convergence | Both accept any non-red-flag text; the first draft sticks. |
 | middleground × middleground | Convergence biased toward whoever drafted | Same as above except red-flag clauses get exactly one counter-round. |
 | conservative × {compromising, middleground} | Convergence; conservative's text wins | Asymmetric: the rigid party holds, the flexible one concedes. |
-| conservative × conservative | **No fixed point** | Both demand `T_p` rigidly; documents oscillate `T_A ↔ T_B` without ever reaching `agreed`. |
+| conservative × conservative (overlapping priorities) | **No fixed point on overlap region** | Both insist on the same top clauses → stalemate within the overlap. |
+| conservative × conservative (non-overlapping priorities) | **Convergence via logrolling** | A's bottom-30% covers B's top concerns and vice versa; clauses resolve by priority asymmetry. |
 
-The conservative × conservative case is the classic "give-no-quarter" bargaining game. There is no Nash equilibrium with mutual acceptance under symmetric strict preferences. The CLI handles this by detecting stalemate (no clause moves to `agreed` for 4 consecutive rounds) and flipping status to `blocked` with a diagnosis pointing at the stuck clauses. Resolution requires changing the game: one party concedes (switch to compromising), introduce a tiebreaker (LLM agent that detects functionally-equivalent text), or escalate to humans.
+The pathological case is **identical priority orderings + conservative stance** — both parties insist on the same top 70% with no concession overlap. With 11 clauses and 11! ≈ 40M possible orderings, the probability of identical real-world priority lists is vanishingly small, but the CLI still bounds this with the stalemate detector: no clause moves to `agreed` for 4 consecutive rounds → `status: blocked` + `block_diagnosis` listing stuck clauses → human/LLM agent intervention required.
+
+**Why the LLM agent helps but doesn't structurally solve it:**
+
+Even with `--agent --llm`, conservative × conservative with identical priorities remains structurally unstable. The LLM can occasionally accept the other side's text by recognising it as "functionally equivalent" — but you'd be relying on probabilistic model judgment to break a structural deadlock. Better to surface the stalemate explicitly and prompt the human to change stance or priorities.
 
 **Why the LLM agent helps but doesn't solve it:**
 

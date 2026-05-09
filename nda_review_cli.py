@@ -2305,6 +2305,7 @@ QUICKSTART_DEFAULTS = {
     "trade_secret_indefinite": True,
     "affiliate_disclosure": "advisors_only",
     "negotiation_stance": "middleground",
+    "clause_priorities": [],
 }
 
 QUICKSTART_ORG_TYPES = ["saas", "healthcare", "enterprise", "other"]
@@ -2424,7 +2425,7 @@ def cmd_quickstart(args):
             raise SystemExit(2)
 
     if interactive:
-        total = 15
+        total = 16
         def step(n, label):
             print(f"\n  ({n}/{total}) {label}", file=sys.stderr)
 
@@ -2472,7 +2473,31 @@ def cmd_quickstart(args):
         step(14, "Negotiation stance — shapes how your agent counters in `negotiate counter --agent` (and --auto deterministic mode).")
         ans["negotiation_stance"] = _prompt_choice("Negotiation stance", QUICKSTART_STANCES, ans["negotiation_stance"])
 
-        step(15, "Past contracts to ingest now? Enter a directory path or leave blank to skip. We can also run a sample review at the end.")
+        step(15, "Clause priorities — list clauses from most-important (top) to least-important (bottom). Drives logrolling in negotiation: your agent will concede on bottom-K clauses by priority based on your stance.")
+        # Default ordering: load default-policy.json clause keys.
+        from pathlib import Path as _P
+        seed = load_policy_config(base, args.default_policy)
+        default_clauses = list((seed.get("clause_rules") or {}).keys())
+        print(f"  Default order ({len(default_clauses)} clauses): " + ", ".join(default_clauses))
+        raw = _prompt_with_default(
+            "Priority order (comma-separated, top-down) or blank to keep default",
+            "",
+        )
+        if raw.strip():
+            user_order = [c.strip() for c in raw.split(",") if c.strip()]
+            # Validate every entry is a known clause; preserve user order; append any missing in default order.
+            unknown = [c for c in user_order if c not in default_clauses]
+            if unknown:
+                print(f"  Warning: unknown clause(s) {unknown}; ignoring those.")
+                user_order = [c for c in user_order if c in default_clauses]
+            for c in default_clauses:
+                if c not in user_order:
+                    user_order.append(c)
+            ans["clause_priorities"] = user_order
+        else:
+            ans["clause_priorities"] = default_clauses
+
+        step(16, "Past contracts to ingest now? Enter a directory path or leave blank to skip. We can also run a sample review at the end.")
         ans["contracts_dir"] = _prompt_with_default("Contracts dir (blank to skip)", ans.get("contracts_dir", "") or "").strip() or None
         ans["run_sample"] = _prompt_yes_no("Run a sample review on the bundled NDA fixture?", True)
     else:
@@ -2528,6 +2553,7 @@ def cmd_quickstart(args):
         },
         "risk_weights": weights,
         "clause_rules": augmented_rules,
+        "clause_priorities": ans["clause_priorities"] or list(augmented_rules.keys()),
         "negotiation_signal_patterns": seed["negotiation_signal_patterns"],
         "org_type": org_type_label,
         "template": template_used,
@@ -3153,21 +3179,29 @@ def _negotiate_auto_propose(state: dict, party: str, org_policy: dict, stance: s
     last_amendments = last_round.get("amendments") or []
     last_amendment_clauses = {a.get("clause") for a in last_amendments if a.get("clause")}
 
+    priorities = org_policy.get("clause_priorities") or list(rules.keys())
+    concession_zone = _negotiate_concession_zone(rules, priorities, stance)
+
     counter_amendments = []
     accept_clauses = []
     countered_clauses = set()
     rationale_prefix = f"[auto:{stance}] "
 
     # Pass 1: per-clause decision over the *current* text.
-    # Counter when stance demands; otherwise accept the current text as-is.
-    # This is the fix that enables convergence when the initial draft is
-    # acceptable to the counter-party (previously acceptance only triggered
-    # off the other side's amendments — which round 1 has zero of).
+    # If the clause is in this agent's concession zone (their bottom K% by
+    # priority), accept current text — this is the logrolling mechanism that
+    # breaks conservative × conservative deadlocks when priorities differ.
+    # Otherwise apply stance-driven counter logic.
     for clause, cfg in rules.items():
         current_block = _negotiate_extract_clause_text(text, clause)
         preferred = (cfg.get("preferred") or "").strip()
         if not current_block or not preferred:
             continue
+
+        if clause in concession_zone:
+            accept_clauses.append(clause)
+            continue
+
         red_flags_fired = bool(red_flag_hits(current_block.lower(), clause))
         differs = preferred not in current_block
 
@@ -3175,13 +3209,13 @@ def _negotiate_auto_propose(state: dict, party: str, org_policy: dict, stance: s
         rationale = ""
         if stance == "conservative" and differs:
             will_counter = True
-            rationale = "current text differs from your preferred position."
+            rationale = f"top-priority clause (rank {_negotiate_priority_rank(priorities, clause)}); text differs from preferred."
         elif stance == "middleground" and red_flags_fired:
             will_counter = True
             rationale = "red-flag pattern fired on this clause; replacing with preferred language."
         elif stance == "compromising" and red_flags_fired:
             will_counter = True
-            rationale = "dealbreaker red flag still present; pushing back even in compromising mode."
+            rationale = "dealbreaker red flag in top-priority clause."
 
         if will_counter:
             counter_amendments.append({
@@ -3300,6 +3334,43 @@ def _negotiate_recompute_clause_status(state: dict, rules: dict) -> dict:
 
 
 DEFAULT_STALEMATE_THRESHOLD = 4
+
+# Per-stance concession-zone size: fraction of clauses (by priority rank,
+# bottom-up) that the agent is willing to concede when not stance-required to
+# push back. Conservative still concedes its 30% lowest-priority clauses;
+# compromising concedes 85% and only insists on its 15% top priorities.
+NEGOTIATE_CONCESSION_PCT = {
+    "conservative": 0.30,
+    "middleground": 0.60,
+    "compromising": 0.85,
+}
+
+
+def _negotiate_priority_rank(priorities: list, clause: str) -> int:
+    """Return the 1-based rank of `clause` in the priority list. Clauses
+    not explicitly ranked are placed at the end (lowest priority)."""
+    if clause in priorities:
+        return priorities.index(clause) + 1
+    return len(priorities) + 1
+
+
+def _negotiate_concession_zone(rules: dict, priorities: list, stance: str) -> set:
+    """Return the set of clauses the agent should concede on (accept current
+    text rather than push back), based on the agent's own priority list and
+    stance. Concession zone = the bottom K clauses by priority where K is a
+    stance-driven percentage of |rules|."""
+    clauses = list(rules.keys())
+    if not clauses:
+        return set()
+    # Build ranking — explicit priorities first (in order), then any
+    # un-ranked policy clauses appended in their original order.
+    ranked = [c for c in priorities if c in rules]
+    for c in clauses:
+        if c not in ranked:
+            ranked.append(c)
+    pct = NEGOTIATE_CONCESSION_PCT.get(stance, NEGOTIATE_CONCESSION_PCT["middleground"])
+    n_concede = max(0, round(len(ranked) * pct))
+    return set(ranked[len(ranked) - n_concede:]) if n_concede else set()
 
 
 def _negotiate_agreed_count_at_round(state: dict, round_index: int, rules: dict) -> int:
