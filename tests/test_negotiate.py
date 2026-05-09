@@ -105,7 +105,15 @@ class NegotiateTests(unittest.TestCase):
         self.assertEqual(state["status"], "converged")
         self.assertEqual(state["clause_status"]["term_and_survival"]["status"], "agreed")
 
-        # 5. Finalize
+        # 5. Both parties sign off on key points
+        self._run("negotiate", "sign-off", "--base", str(self.party_a), "--state", str(self.state), "--as", "a", "--yes")
+        self._run("negotiate", "sign-off", "--base", str(self.party_b), "--state", str(self.state), "--as", "b", "--yes")
+        state = json.loads(self.state.read_text())
+        self.assertEqual(state["status"], "signed_off")
+        self.assertIn("a", state["signoffs"])
+        self.assertIn("b", state["signoffs"])
+
+        # 6. Finalize
         out_md = self.workdir / "final.md"
         out_docx = self.workdir / "final.docx"
         self._run(
@@ -218,6 +226,10 @@ class NegotiateTests(unittest.TestCase):
         state = json.loads(self.state.read_text())
         self.assertEqual(state["status"], "converged")
 
+        # Both parties sign off
+        self._run("negotiate", "sign-off", "--base", str(self.party_a), "--state", str(self.state), "--as", "a", "--yes")
+        self._run("negotiate", "sign-off", "--base", str(self.party_b), "--state", str(self.state), "--as", "b", "--yes")
+
         # Configure fake hooks that just `cp` the input to the output to simulate the chain
         integrations_path = self.party_a / "config" / "integrations.json"
         integrations_path.write_text(json.dumps({
@@ -245,6 +257,139 @@ class NegotiateTests(unittest.TestCase):
         self.assertEqual(len(state["finalized"]["hooks"]), 2)
         self.assertEqual(state["finalized"]["hooks"][0]["hook"], "docx2pdf")
         self.assertEqual(state["finalized"]["hooks"][1]["hook"], "sign_cli")
+
+
+class NegotiateStanceAndSignoffTests(unittest.TestCase):
+    """Stance-driven --auto counter + sign-off gate."""
+
+    def setUp(self):
+        self.workdir = Path(tempfile.mkdtemp(prefix="nda-stance-"))
+        self.party_a = self.workdir / "a"
+        self.party_b = self.workdir / "b"
+        quickstart(self.party_a, "Acme")
+        quickstart(self.party_b, "Beta")
+        self.state = self.workdir / "shared" / "state.json"
+        self.state.parent.mkdir(parents=True, exist_ok=True)
+
+    def _run(self, *args, expect_code: int = 0):
+        result = subprocess.run(
+            ["python3", str(CLI), *args],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, expect_code, msg=f"args={args} stderr={result.stderr}")
+        return result
+
+    def _set_stance(self, base: Path, stance: str):
+        p = base / "config" / "org-policy.json"
+        org = json.loads(p.read_text())
+        org.setdefault("defaults", {})["negotiation_stance"] = stance
+        p.write_text(json.dumps(org))
+
+    def _init_round_one(self):
+        self._run(
+            "negotiate", "init",
+            "--base", str(self.party_a),
+            "--template", "mutual",
+            "--party-a-name", "Acme", "--party-a-address", "1 Main",
+            "--party-b-name", "Beta", "--party-b-address", "2 Side",
+            "--purpose", "x", "--effective-date", "2026-05-09",
+            "--out", str(self.state),
+        )
+
+    def test_auto_conservative_counters_more_than_compromising(self):
+        self._init_round_one()
+
+        # Conservative counter — counters every clause that differs from preferred
+        state_path_cons = self.workdir / "cons-state.json"
+        import shutil as _sh
+        _sh.copy(self.state, state_path_cons)
+        self._set_stance(self.party_b, "conservative")
+        self._run(
+            "negotiate", "counter",
+            "--base", str(self.party_b),
+            "--state", str(state_path_cons),
+            "--auto",
+        )
+        cons = json.loads(state_path_cons.read_text())
+        cons_counters = len(cons["rounds"][1]["amendments"])
+
+        # Compromising counter — only counters red-flag-firing clauses
+        state_path_comp = self.workdir / "comp-state.json"
+        _sh.copy(self.state, state_path_comp)
+        self._set_stance(self.party_b, "compromising")
+        self._run(
+            "negotiate", "counter",
+            "--base", str(self.party_b),
+            "--state", str(state_path_comp),
+            "--auto",
+        )
+        comp = json.loads(state_path_comp.read_text())
+        comp_counters = len(comp["rounds"][1]["amendments"])
+
+        self.assertGreater(
+            cons_counters, comp_counters,
+            f"conservative ({cons_counters}) should counter more clauses than compromising ({comp_counters})",
+        )
+        self.assertEqual(cons["rounds"][1]["stance"], "conservative")
+        self.assertEqual(comp["rounds"][1]["stance"], "compromising")
+        self.assertTrue(cons["rounds"][1]["amendment_source"].startswith("auto:"))
+
+    def test_finalize_blocked_until_both_signoff(self):
+        self._init_round_one()
+        # B accepts to converge
+        self._run("negotiate", "accept", "--base", str(self.party_b), "--state", str(self.state), "--as", "b")
+        state = json.loads(self.state.read_text())
+        self.assertEqual(state["status"], "converged")
+
+        # Finalize without sign-offs → blocked
+        result = self._run(
+            "negotiate", "finalize",
+            "--base", str(self.party_a),
+            "--state", str(self.state),
+            "--out-md", str(self.workdir / "f.md"),
+            "--out-docx", str(self.workdir / "f.docx"),
+            expect_code=1,
+        )
+        self.assertIn("Sign-off missing", result.stderr)
+
+        # Only A signs off → still blocked
+        self._run("negotiate", "sign-off", "--base", str(self.party_a), "--state", str(self.state), "--as", "a", "--yes")
+        result = self._run(
+            "negotiate", "finalize",
+            "--base", str(self.party_a),
+            "--state", str(self.state),
+            "--out-md", str(self.workdir / "f.md"),
+            "--out-docx", str(self.workdir / "f.docx"),
+            expect_code=1,
+        )
+        self.assertIn("Sign-off missing", result.stderr)
+        self.assertIn("'b'", result.stderr)
+
+        # Both sign off → finalize works
+        self._run("negotiate", "sign-off", "--base", str(self.party_b), "--state", str(self.state), "--as", "b", "--yes")
+        self._run(
+            "negotiate", "finalize",
+            "--base", str(self.party_a),
+            "--state", str(self.state),
+            "--out-md", str(self.workdir / "f.md"),
+            "--out-docx", str(self.workdir / "f.docx"),
+        )
+        state = json.loads(self.state.read_text())
+        self.assertEqual(state["status"], "finalized")
+
+    def test_signoff_requires_converged_state(self):
+        self._init_round_one()
+        # Negotiation is in_progress — sign-off should refuse
+        result = self._run(
+            "negotiate", "sign-off",
+            "--base", str(self.party_a),
+            "--state", str(self.state),
+            "--as", "a", "--yes",
+            expect_code=1,
+        )
+        self.assertIn("converged", result.stderr)
 
 
 if __name__ == "__main__":

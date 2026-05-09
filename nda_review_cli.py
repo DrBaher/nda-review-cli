@@ -2304,6 +2304,7 @@ QUICKSTART_DEFAULTS = {
     "residual_knowledge": "reject",
     "trade_secret_indefinite": True,
     "affiliate_disclosure": "advisors_only",
+    "negotiation_stance": "middleground",
 }
 
 QUICKSTART_ORG_TYPES = ["saas", "healthcare", "enterprise", "other"]
@@ -2314,6 +2315,7 @@ QUICKSTART_AI = ["restricted", "guardrailed", "permissive"]
 QUICKSTART_RND = ["return", "destroy", "either", "either_with_certification"]
 QUICKSTART_RESIDUAL = ["accept", "reject"]
 QUICKSTART_AFFILIATE = ["advisors_only", "advisors_and_affiliates", "case_by_case"]
+QUICKSTART_STANCES = ["conservative", "middleground", "compromising"]
 
 
 def _apply_quickstart_to_clause_rules(clause_rules: dict, ans: dict) -> dict:
@@ -2400,6 +2402,7 @@ def _quickstart_summary_lines(ans: dict) -> list:
         f"Residual knowledge:      {ans['residual_knowledge']}",
         f"Trade-secret indefinite: {'yes' if ans['trade_secret_indefinite'] else 'no'}",
         f"Affiliate disclosure:    {ans['affiliate_disclosure']}",
+        f"Negotiation stance:      {ans['negotiation_stance']}",
     ]
 
 
@@ -2421,7 +2424,7 @@ def cmd_quickstart(args):
             raise SystemExit(2)
 
     if interactive:
-        total = 14
+        total = 15
         def step(n, label):
             print(f"\n  ({n}/{total}) {label}", file=sys.stderr)
 
@@ -2466,7 +2469,10 @@ def cmd_quickstart(args):
         step(13, "Affiliate/advisor disclosure scope — drives assignment_and_affiliates clause text + red flags.")
         ans["affiliate_disclosure"] = _prompt_choice("Affiliate disclosure", QUICKSTART_AFFILIATE, ans["affiliate_disclosure"])
 
-        step(14, "Past contracts to ingest now? Enter a directory path or leave blank to skip. We can also run a sample review at the end.")
+        step(14, "Negotiation stance — shapes how your agent counters in `negotiate counter --agent` (and --auto deterministic mode).")
+        ans["negotiation_stance"] = _prompt_choice("Negotiation stance", QUICKSTART_STANCES, ans["negotiation_stance"])
+
+        step(15, "Past contracts to ingest now? Enter a directory path or leave blank to skip. We can also run a sample review at the end.")
         ans["contracts_dir"] = _prompt_with_default("Contracts dir (blank to skip)", ans.get("contracts_dir", "") or "").strip() or None
         ans["run_sample"] = _prompt_yes_no("Run a sample review on the bundled NDA fixture?", True)
     else:
@@ -2518,6 +2524,7 @@ def cmd_quickstart(args):
             "residual_knowledge": ans["residual_knowledge"],
             "trade_secret_indefinite": bool(ans["trade_secret_indefinite"]),
             "affiliate_disclosure": ans["affiliate_disclosure"],
+            "negotiation_stance": ans["negotiation_stance"],
         },
         "risk_weights": weights,
         "clause_rules": augmented_rules,
@@ -3083,12 +3090,33 @@ def _negotiate_extract_clause_text(full_text: str, clause: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+NEGOTIATE_STANCE_DESCRIPTORS = {
+    "conservative": (
+        "STANCE: conservative. Hold firm to your party's preferred clause language. "
+        "Counter any amendment that materially differs from your preferred position. "
+        "Accept only when the other party's text is functionally equivalent to your preferred."
+    ),
+    "middleground": (
+        "STANCE: middleground. Compromise on low-severity items where the other party's text "
+        "is reasonable. Hold firm on high-severity items and clauses that trigger your red-flag "
+        "patterns (e.g. perpetual survival, broad residuals, uncapped liability)."
+    ),
+    "compromising": (
+        "STANCE: compromising. Accept most amendments unless they trigger one of your red-flag "
+        "patterns. Push back only on genuine dealbreakers (red flags, missing standard carve-outs, "
+        "broad residuals)."
+    ),
+}
+
+
 NEGOTIATE_LLM_AGENT_SYSTEM = (
     "You are an NDA negotiation agent representing one party. You receive: "
     "(1) the current full NDA text, (2) your party's house policy (clause-by-clause "
-    "preferred language and red flags), (3) the latest round of amendments proposed "
-    "by the other party. Your job is to propose your party's response: which other-party "
-    "amendments to accept, which to counter, and any new amendments your policy requires. "
+    "preferred language and red flags), (3) your party's negotiation stance, "
+    "(4) the latest round of amendments proposed by the other party. "
+    "Your job is to propose your party's response: which other-party amendments to "
+    "accept, which to counter, and any new amendments your policy requires. "
+    "Apply your party's stance literally — it is the most important behavioural input. "
     "Be concise and align language with your party's preferred clause text where possible. "
     "Reply ONLY with a JSON object matching this schema:\n"
     "{\n"
@@ -3100,7 +3128,107 @@ NEGOTIATE_LLM_AGENT_SYSTEM = (
 )
 
 
-def _negotiate_agent_propose(state: dict, party: str, org_policy: dict, llm_cfg: dict) -> dict:
+def _negotiate_auto_propose(state: dict, party: str, org_policy: dict, stance: str) -> dict:
+    """Deterministic stance-driven amendment generator. No LLM.
+
+    For each clause known to the policy:
+      - Compare the *clause's currently visible text* in the latest round to
+        the policy's preferred text.
+      - If red flags fire on the visible text, treat that clause as a dealbreaker.
+      - Per stance:
+          conservative — counter every clause where current != preferred.
+          middleground — counter only red-flag-firing clauses + accept other-party
+                         amendments that don't change preferred-aligned clauses.
+          compromising — counter only clauses where red flags currently fire.
+
+    Other-party amendments from the previous round:
+      conservative — reject all (do not list in accept_clauses).
+      middleground — accept amendments to clauses with no red-flag triggers
+                     in the new text.
+      compromising — accept everything that doesn't trigger a red flag.
+    """
+    rules = org_policy.get("clause_rules", {}) or {}
+    last_round = state["rounds"][-1]
+    text = last_round["text"]
+    last_amendments = last_round.get("amendments") or []
+    last_amendment_clauses = {a.get("clause") for a in last_amendments if a.get("clause")}
+
+    counter_amendments = []
+    accept_clauses = []
+    rationale_prefix = f"[auto:{stance}] "
+
+    # Counter-proposal logic over each policy clause.
+    for clause, cfg in rules.items():
+        current_block = _negotiate_extract_clause_text(text, clause)
+        preferred = (cfg.get("preferred") or "").strip()
+        if not current_block or not preferred:
+            continue
+        red_flags_fired = bool(red_flag_hits(current_block.lower(), clause))
+        differs = preferred not in current_block
+
+        if stance == "conservative":
+            if differs:
+                counter_amendments.append({
+                    "clause": clause,
+                    "old_text": current_block,
+                    "new_text": preferred,
+                    "rationale": rationale_prefix + "current text differs from your preferred position.",
+                })
+        elif stance == "middleground":
+            if red_flags_fired:
+                counter_amendments.append({
+                    "clause": clause,
+                    "old_text": current_block,
+                    "new_text": preferred,
+                    "rationale": rationale_prefix + f"red-flag pattern fired on this clause; replacing with preferred language.",
+                })
+        elif stance == "compromising":
+            if red_flags_fired:
+                counter_amendments.append({
+                    "clause": clause,
+                    "old_text": current_block,
+                    "new_text": preferred,
+                    "rationale": rationale_prefix + "dealbreaker red flag still present; pushing back even in compromising mode.",
+                })
+
+    # Acceptance logic over the other party's last-round amendments.
+    for am in last_amendments:
+        clause = am.get("clause")
+        if not clause:
+            continue
+        proposed = (am.get("new_text") or "")
+        proposed_red_flags = bool(red_flag_hits(proposed.lower(), clause)) if clause in rules else False
+        if stance == "conservative":
+            # Reject everything; rely on counter loop above to push back.
+            continue
+        if stance == "middleground":
+            if not proposed_red_flags and clause not in last_amendment_clauses_in_counters(counter_amendments):
+                accept_clauses.append(clause)
+        elif stance == "compromising":
+            if not proposed_red_flags:
+                accept_clauses.append(clause)
+
+    accept_clauses = sorted(set(accept_clauses))
+    return {
+        "accept_clauses": accept_clauses,
+        "counter_amendments": counter_amendments,
+        "summary": f"Deterministic auto-counter applied with stance={stance!r}. "
+                   f"{len(counter_amendments)} amendment(s) proposed, {len(accept_clauses)} clause(s) accepted.",
+    }
+
+
+def last_amendment_clauses_in_counters(counter_amendments: list) -> set:
+    return {a.get("clause") for a in counter_amendments if a.get("clause")}
+
+
+def _negotiate_resolve_stance(org_policy: dict, override: Optional[str]) -> str:
+    if override and override in NEGOTIATE_STANCE_DESCRIPTORS:
+        return override
+    stance = ((org_policy.get("defaults") or {}).get("negotiation_stance")) or org_policy.get("negotiation_stance") or "middleground"
+    return stance if stance in NEGOTIATE_STANCE_DESCRIPTORS else "middleground"
+
+
+def _negotiate_agent_propose(state: dict, party: str, org_policy: dict, llm_cfg: dict, stance: str) -> dict:
     """Run the LLM agent against the current state to propose the next round's amendments."""
     rules = org_policy.get("clause_rules", {}) or {}
     pref_lines = "\n".join(
@@ -3109,8 +3237,10 @@ def _negotiate_agent_propose(state: dict, party: str, org_policy: dict, llm_cfg:
     )
     last_round = state["rounds"][-1]
     last_amendments = last_round.get("amendments") or []
+    stance_text = NEGOTIATE_STANCE_DESCRIPTORS.get(stance, NEGOTIATE_STANCE_DESCRIPTORS["middleground"])
     user_prompt = (
         f"## Your party: {state['parties'][party]['name']} ({state['parties'][party].get('role','')})\n\n"
+        f"## {stance_text}\n\n"
         f"## Your house policy preferred language by clause\n\n{pref_lines}\n\n"
         f"## Current full NDA text\n\n{last_round['text']}\n\n"
         f"## Latest amendments proposed by the other party (round {last_round['round']})\n\n"
@@ -3346,8 +3476,14 @@ def cmd_negotiate_counter(args):
             "It's the other party's turn — wait for their counter, or use `negotiate accept` to converge on the current text."
         )
 
+    stance = _negotiate_resolve_stance(org_policy, getattr(args, "stance", None))
+
     if args.amendments_file:
         proposal = json.loads(Path(args.amendments_file).read_text())
+        proposal_source = "manual"
+    elif args.auto:
+        proposal = _negotiate_auto_propose(state, party, org_policy, stance)
+        proposal_source = f"auto:{stance}"
     elif args.agent:
         llm_cfg = load_llm_config(base, args)
         if not llm_cfg.get("provider") or not llm_cfg.get("model"):
@@ -3355,15 +3491,19 @@ def cmd_negotiate_counter(args):
         if not args.yes_llm_send and not (sys.stderr.isatty() and sys.stdin.isatty()):
             raise SystemExit("Refusing non-interactive LLM call without --yes-llm-send.")
         if not args.yes_llm_send:
-            print(f"\n  Agent will call provider={llm_cfg['provider']} model={llm_cfg['model']}.", file=sys.stderr)
+            print(f"\n  Agent ({stance}) will call provider={llm_cfg['provider']} model={llm_cfg['model']}.", file=sys.stderr)
             print("  Press Enter to continue, or Ctrl-C to abort.", file=sys.stderr)
             try:
                 input()
             except (EOFError, KeyboardInterrupt):
                 raise SystemExit("Aborted by user.")
-        proposal = _negotiate_agent_propose(state, party, org_policy, llm_cfg)
+        proposal = _negotiate_agent_propose(state, party, org_policy, llm_cfg, stance)
+        proposal_source = f"agent:{stance}"
     else:
-        raise SystemExit("Pass --amendments-file <path> for manual amendments, or --agent --llm for LLM-drafted amendments.")
+        raise SystemExit(
+            "Pass one of: --amendments-file <path> (manual), --auto (deterministic stance-driven), "
+            "or --agent --llm <provider> (LLM-driven)."
+        )
 
     accept_clauses = proposal.get("accept_clauses") or []
     counter_amendments = proposal.get("counter_amendments") or []
@@ -3379,7 +3519,8 @@ def cmd_negotiate_counter(args):
         "accept_clauses": accept_clauses,
         "summary": summary,
         "signature": {"signer": party, "signed_at": datetime.now(timezone.utc).isoformat(), "method": "json_flag"},
-        "amendment_source": "agent" if args.agent else "manual",
+        "amendment_source": proposal_source,
+        "stance": stance,
     }
     if proposal.get("parse_error"):
         new_round["agent_parse_error"] = proposal["parse_error"]
@@ -3490,13 +3631,148 @@ def _negotiate_run_hook(cmd_template: str, vars: dict) -> tuple:
         return 124, "", "hook timed out after 300s"
 
 
+def _negotiate_key_points(state: dict, org_policy: dict) -> list:
+    """Build the focused key-points list used by sign-off.
+
+    Includes:
+      - Clauses whose final text differs from round 1's text
+      - Clauses with active red-flag patterns in the final text
+      - Every amendment that was applied in the converged outcome
+        (especially `agent:` and `auto:` sourced ones)
+    """
+    rules = org_policy.get("clause_rules", {}) or {}
+    rounds = state["rounds"]
+    initial_text = rounds[0]["text"]
+    final_text = rounds[-1]["text"]
+    key_points = []
+
+    for clause in sorted(rules.keys()):
+        initial_block = _negotiate_extract_clause_text(initial_text, clause)
+        final_block = _negotiate_extract_clause_text(final_text, clause)
+        if not initial_block and not final_block:
+            continue
+        changed = (initial_block.strip() != final_block.strip()) and bool(initial_block) and bool(final_block)
+        red_flags = red_flag_hits(final_block.lower(), clause) if final_block else []
+        if changed or red_flags:
+            key_points.append({
+                "clause": clause,
+                "changed_from_initial": changed,
+                "red_flags_active": [r for r in red_flags] if red_flags else [],
+                "initial_text_excerpt": (initial_block[:200] + "...") if len(initial_block) > 200 else initial_block,
+                "final_text_excerpt": (final_block[:200] + "...") if len(final_block) > 200 else final_block,
+            })
+
+    applied_amendments = []
+    for r in rounds[1:]:
+        for am in r.get("amendments", []) or []:
+            applied_amendments.append({
+                "round": r["round"],
+                "proposed_by": r["proposer"],
+                "source": r.get("amendment_source", "?"),
+                "stance": r.get("stance"),
+                "clause": am.get("clause"),
+                "rationale": am.get("rationale", ""),
+                "new_text_excerpt": (am.get("new_text", "")[:200] + "...") if len(am.get("new_text", "")) > 200 else am.get("new_text", ""),
+            })
+
+    return [
+        {"kind": "clause_evolution", "items": key_points},
+        {"kind": "applied_amendments", "items": applied_amendments},
+    ]
+
+
+def cmd_negotiate_signoff(args):
+    base = Path(args.base)
+    state = _negotiate_load(Path(args.state))
+    if state.get("status") not in ("converged", "signed_off"):
+        raise SystemExit(
+            f"Negotiation status is {state.get('status')!r}. "
+            "Sign-off requires the negotiation to be `converged` first."
+        )
+    org_policy = _negotiate_load_org_policy(base)
+    party = _negotiate_resolve_party(state, args.as_party, base)
+    key_points = _negotiate_key_points(state, org_policy)
+
+    print(json.dumps({
+        "ok": True,
+        "negotiation_id": state["negotiation_id"],
+        "you_are": party,
+        "key_points": key_points,
+    }, indent=2, ensure_ascii=False))
+
+    # Friendly summary to stderr.
+    clause_changes = key_points[0]["items"]
+    amendments = key_points[1]["items"]
+    summary_lines = [
+        f"Clauses changed from initial draft: {sum(1 for c in clause_changes if c['changed_from_initial'])}",
+        f"Clauses with active red flags in final text: {sum(1 for c in clause_changes if c['red_flags_active'])}",
+        f"Total amendments applied across rounds: {len(amendments)}",
+        "",
+        "Sources:",
+    ]
+    src_counts = Counter(a["source"] for a in amendments)
+    for src, n in sorted(src_counts.items()):
+        summary_lines.append(f"  - {src}: {n}")
+
+    interactive = sys.stdin.isatty() and not args.yes
+    if interactive:
+        print("", file=sys.stderr)
+        print("  ━━ Sign-off review ━━", file=sys.stderr)
+        for line in summary_lines:
+            print(f"  {line}", file=sys.stderr)
+        if clause_changes:
+            print("\n  Key clause changes:", file=sys.stderr)
+            for c in clause_changes:
+                marker = "[red flags]" if c["red_flags_active"] else "[changed]"
+                print(f"    {marker} {c['clause']}", file=sys.stderr)
+                if c['red_flags_active']:
+                    print(f"        → {', '.join(c['red_flags_active'][:3])}", file=sys.stderr)
+        try:
+            ok = input("\n  Sign off all key points and approve final text? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("Aborted.")
+        if ok not in ("", "y", "yes"):
+            raise SystemExit("Sign-off declined. State unchanged.")
+
+    # Record sign-off.
+    state.setdefault("signoffs", {})
+    state["signoffs"][party] = {
+        "signed_at": datetime.now(timezone.utc).isoformat(),
+        "key_points_count": len(clause_changes) + len(amendments),
+        "method": "json_flag",
+    }
+    if all(p in state["signoffs"] for p in ("a", "b")):
+        state["status"] = "signed_off"
+
+    _negotiate_save(Path(args.state), state)
+
+    next_step = (
+        "Run `negotiate finalize` to emit the agreed .md/.docx (and optionally hand off to docx2pdf + sign-CLI)."
+        if state["status"] == "signed_off"
+        else f"Other party still needs to run `negotiate sign-off`."
+    )
+    _print_friendly(
+        title=f"Sign-off recorded (Party {party.upper()})",
+        lines=summary_lines,
+        next_steps=[next_step],
+    )
+
+
 def cmd_negotiate_finalize(args):
     base = Path(args.base)
     state = _negotiate_load(Path(args.state))
-    if state.get("status") != "converged":
+    if state.get("status") not in ("converged", "signed_off"):
         raise SystemExit(
-            f"Negotiation status is {state.get('status')!r}, not 'converged'. "
+            f"Negotiation status is {state.get('status')!r}, not 'converged' or 'signed_off'. "
             "Both parties must alternate-sign to a state with no disputed clauses."
+        )
+    signoffs = state.get("signoffs") or {}
+    missing = [p for p in ("a", "b") if p not in signoffs]
+    if missing and not args.skip_signoff:
+        raise SystemExit(
+            f"Sign-off missing from party/parties: {missing}. "
+            "Each party must run `negotiate sign-off` before finalize. "
+            "Pass --skip-signoff only for testing or non-binding finalizations."
         )
 
     last = state["rounds"][-1]
@@ -4033,6 +4309,8 @@ def main():
     p_nc.add_argument("--out", help="Where to write the updated state file (defaults to overwriting --state)")
     p_nc.add_argument("--as", dest="as_party", choices=["a", "b"])
     p_nc.add_argument("--amendments-file", help="Manual amendments JSON file: {accept_clauses, counter_amendments, summary}")
+    p_nc.add_argument("--auto", action="store_true", help="Deterministic stance-driven amendment generator (no LLM). Uses your policy + negotiation_stance.")
+    p_nc.add_argument("--stance", choices=sorted(NEGOTIATE_STANCE_DESCRIPTORS.keys()), help="Override negotiation_stance from policy for this round only")
     p_nc.add_argument("--agent", action="store_true", help="Use the configured LLM as a negotiation agent to draft amendments")
     p_nc.add_argument("--llm", choices=["auto", "anthropic", "openai", "ollama", "openai-compatible"], default="auto")
     p_nc.add_argument("--llm-model")
@@ -4051,13 +4329,21 @@ def main():
     p_ns.add_argument("--state", required=True)
     p_ns.set_defaults(func=cmd_negotiate_status)
 
-    p_nf = neg_sub.add_parser("finalize", help="Emit final .md + .docx; optionally hand off to docx2pdf + sign-CLI hooks")
+    p_nso = neg_sub.add_parser("sign-off", help="Review key points (changed clauses, applied amendments, red flags) and approve before finalize")
+    p_nso.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_nso.add_argument("--state", required=True)
+    p_nso.add_argument("--as", dest="as_party", choices=["a", "b"])
+    p_nso.add_argument("--yes", action="store_true", help="Skip the interactive batch confirmation prompt")
+    p_nso.set_defaults(func=cmd_negotiate_signoff)
+
+    p_nf = neg_sub.add_parser("finalize", help="Emit final .md + .docx; optionally hand off to docx2pdf + sign-CLI hooks. Requires both parties' sign-off.")
     p_nf.add_argument("--base", default=str(Path(__file__).resolve().parent))
     p_nf.add_argument("--state", required=True)
     p_nf.add_argument("--out-md", required=True)
     p_nf.add_argument("--out-docx", required=True)
     p_nf.add_argument("--to-pdf", action="store_true", help="Run config/integrations.json `docx2pdf_cmd` to convert docx → pdf")
     p_nf.add_argument("--sign", action="store_true", help="Run config/integrations.json `sign_cli_cmd` to sign the pdf (implies --to-pdf)")
+    p_nf.add_argument("--skip-signoff", action="store_true", help="Bypass the both-parties-signed-off requirement (testing/non-binding only)")
     p_nf.set_defaults(func=cmd_negotiate_finalize)
 
     p_tutorial = sub.add_parser("tutorial", help="Interactive primer that explains policy/profile/playbook and runs a sample review")

@@ -177,10 +177,24 @@ nda-review-cli negotiate finalize \
   --to-pdf --sign
 ```
 
+**Negotiation stance** lets you set how aggressively your agent negotiates without per-round eyeballing. Set in `config/org-policy.json` `defaults.negotiation_stance` (asked during `quickstart`) or override per-round with `--stance`:
+
+| Stance | Behaviour |
+|---|---|
+| `conservative` | Hold firm — counter every clause that materially differs from your preferred language. Reject other-party amendments by default. |
+| `middleground` (default) | Compromise on low-severity items. Hold firm on high-severity / red-flag clauses. |
+| `compromising` | Accept most amendments unless they trigger a red-flag pattern. Push back only on dealbreakers. |
+
+Stance flows into both modes:
+- **`negotiate counter --auto`** — fully deterministic, no LLM. Generates amendments from your policy + stance + the rule engine's red-flag detection.
+- **`negotiate counter --agent --llm <provider>`** — stance is injected into the LLM prompt as concrete instructions, alongside your clause-by-clause preferred language.
+
+**Sign-off before finalize** is a required human checkpoint. Once `status: converged`, both parties run `negotiate sign-off` to review the **key points** — clauses changed from the initial draft, amendments applied (with their source: manual / `auto:<stance>` / `agent:<stance>`), and any red-flag patterns still present in the final text. `negotiate finalize` is blocked until both sign-offs land. This is the gate that lets you trust agent-assisted rounds without losing the human review.
+
 **How it works:**
-- **State file** is a single JSON document with all rounds, each round's full text, a SHA-256 hash chain (each round's hash incorporates the previous round's hash → tamper evidence), and per-round signatures (currently a JSON flag).
-- **The agent** is `review --llm` repurposed: it sees your party's policy + the latest amendments and proposes which clauses to accept and which to counter. It never signs on your behalf.
-- **Convergence** happens when no clause is `disputed` and the latest two rounds were signed by alternating parties (one drafted/countered, the other accepted).
+- **State file** is a single JSON document with all rounds, each round's full text, a SHA-256 hash chain (each round's hash incorporates the previous round's hash → tamper evidence), per-round signatures, and a `signoffs` block once sign-off is complete.
+- **The agent** is `review --llm` repurposed: it sees your party's policy + your stance + the latest amendments and proposes which clauses to accept and which to counter. It never signs on your behalf.
+- **Convergence** happens when no clause is `disputed` and the latest two rounds were signed by alternating parties.
 - **Finalize hooks** (`config/integrations.json`, gitignored) let you delegate PDF conversion and signing to your own tools — for example a `docx2pdf` repo and a `sign-CLI` repo. The CLI passes `{input_docx}`, `{output_pdf}`, `{negotiation_id}`, `{party_a_name}`, `{party_b_name}` placeholders to your configured commands. See [`config/integrations.json.example`](config/integrations.json.example).
 
 **Safety rails:**

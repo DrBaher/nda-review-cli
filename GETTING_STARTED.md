@@ -306,10 +306,17 @@ Both parties have their own CLI install. They exchange a single state file by an
 # Send negotiation.json to Party B (email / Drive / Git)
 
 # === Party B's machine ===
-./nda_review_cli.py quickstart                              # set Beta's policy
+./nda_review_cli.py quickstart                              # set Beta's policy + stance
 ./nda_review_cli.py negotiate review --state negotiation.json
+# Three counter modes — pick one:
+#   a) Manual amendments (full human control)
+#      ./nda_review_cli.py negotiate counter --state negotiation.json --as b \
+#        --amendments-file my-edits.json
+#   b) Deterministic auto, stance-driven (no LLM, no API keys)
+#      ./nda_review_cli.py negotiate counter --state negotiation.json --as b --auto
+#   c) LLM agent, stance-driven
 ./nda_review_cli.py negotiate counter --state negotiation.json --as b \
-  --agent --llm ollama --yes-llm-send                       # local LLM agent drafts counter
+  --agent --llm ollama --yes-llm-send
 # Review the resulting amendments in `negotiate status` before sending back
 ./nda_review_cli.py negotiate status --state negotiation.json
 # Send updated negotiation.json back to Party A
@@ -317,13 +324,21 @@ Both parties have their own CLI install. They exchange a single state file by an
 # === Party A's machine ===
 ./nda_review_cli.py negotiate review --state negotiation.json
 ./nda_review_cli.py negotiate accept --state negotiation.json --as a
-# Status: converged → finalize
+# Status: converged → both parties sign off on key points
+./nda_review_cli.py negotiate sign-off --state negotiation.json --as a   # interactive batch confirm
+
+# === Party B's machine ===
+./nda_review_cli.py negotiate sign-off --state negotiation.json --as b   # interactive batch confirm
+
+# === Party A's machine (or either) ===
 ./nda_review_cli.py negotiate finalize \
   --state negotiation.json \
   --out-md output/agreed.md \
   --out-docx output/agreed.docx \
   --to-pdf --sign                                           # uses config/integrations.json hooks
 ```
+
+**Stance shapes the agent.** During `quickstart` you pick `conservative`, `middleground`, or `compromising`. The agent (LLM or `--auto` deterministic) applies it per round so most rounds need almost no human input. The mandatory human gate is the **sign-off step** before finalize, where each party reviews a focused list of key points (changed clauses, applied amendments, red flags still active) and confirms.
 
 Set up `config/integrations.json` (gitignored) once per machine to wire in your own `docx2pdf` and `sign-CLI` tools — see `config/integrations.json.example` for placeholders. Every round is signed and hash-chained; tampering is detected on load.
 
