@@ -34,7 +34,21 @@ cd /path/to/nda-review-cli
 
 # 7) Combined setup (init + optional ingest)
 ./nda_review_cli.py setup --org-name "Acme" --ingest-files /path/to/nda1.txt
+
+# 8) Fastest onboarding (zero required args)
+./nda_review_cli.py setup --quick
 ```
+
+## Onboarding shortcuts
+
+- `./nda_review_cli.py setup --quick` → writes base config + profile using defaults, then auto-discovers ingest files.
+- If you do not pass `--ingest-files`, `setup` and `ingest` auto-scan:
+  - `knowledge/inbox/`
+  - `knowledge/contracts/`
+  - `knowledge/redlines/`
+  - `inbox/`
+  - `input/`
+- If nothing is found and you are in an interactive terminal, the CLI asks once for file paths.
 
 ## Policy configuration
 

@@ -3,6 +3,7 @@ import argparse
 import json
 import re
 import hashlib
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import Counter, defaultdict
@@ -683,6 +684,35 @@ def _read_any_text(path: Path):
     return path.read_text(errors="ignore")
 
 
+def discover_ingest_files(base: Path):
+    roots = [
+        base / "knowledge" / "inbox",
+        base / "knowledge" / "contracts",
+        base / "knowledge" / "redlines",
+        base / "inbox",
+        base / "input",
+    ]
+    exts = {".txt", ".md", ".docx", ".pdf"}
+    found = []
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for p in root.rglob("*"):
+            if p.is_file() and p.suffix.lower() in exts and not p.name.startswith("."):
+                found.append(str(p if p.is_absolute() else (base / p)))
+    return sorted(set(found))
+
+
+def parse_paths_input(raw: str):
+    if not raw:
+        return []
+    if "," in raw:
+        items = [x.strip() for x in raw.split(",")]
+    else:
+        items = [x.strip() for x in raw.split()]
+    return [x for x in items if x]
+
+
 def cmd_ingest(args):
     base = Path(args.base)
     policy_cfg = load_policy_config(base, args.policy)
@@ -692,7 +722,14 @@ def cmd_ingest(args):
     proposed_dir = kdir / "proposed"
     proposed_dir.mkdir(parents=True, exist_ok=True)
 
-    paths = [Path(p) for p in args.files]
+    files = list(args.files or [])
+    if not files:
+        files = discover_ingest_files(base)
+    if not files and not getattr(args, "no_prompt", False) and sys.stdin.isatty():
+        raw = input("No ingest files found. Enter file paths (comma/space-separated), or press Enter to skip: ").strip()
+        files = parse_paths_input(raw)
+
+    paths = [Path(p) for p in files]
     sources = []
     aggregate = {k: {"hits": 0, "examples": []} for k in clause_rules.keys()}
 
@@ -731,12 +768,18 @@ def cmd_ingest(args):
     payload = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "policy_path": policy_cfg.get("path"),
+        "autodiscovered": not bool(args.files),
         "sources": sources,
         "suggestions": suggestions,
         "note": "Proposed-only. Review before promotion to active policy/profile.",
     }
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
-    print(json.dumps({"ok": True, "suggestions_file": str(out), "sources_ingested": len(sources)}, ensure_ascii=False))
+    print(json.dumps({
+        "ok": True,
+        "suggestions_file": str(out),
+        "sources_ingested": len(sources),
+        "autodiscovered": not bool(args.files),
+    }, ensure_ascii=False))
 
 
 def cmd_setup(args):
@@ -746,8 +789,8 @@ def cmd_setup(args):
 
     init_args = Obj()
     init_args.base = args.base
-    init_args.interactive = args.interactive
-    init_args.org_name = args.org_name
+    init_args.interactive = (args.interactive and not args.quick)
+    init_args.org_name = args.org_name or ("Your Org" if args.quick else args.org_name)
     init_args.risk_posture = args.risk_posture
     init_args.preferred_jurisdictions = args.preferred_jurisdictions
     init_args.survival_years = args.survival_years
@@ -756,12 +799,30 @@ def cmd_setup(args):
     init_args.default_policy = args.default_policy
     cmd_init(init_args)
 
-    if args.ingest_files:
+    ingest_files = list(args.ingest_files or [])
+    if not ingest_files:
+        ingest_files = discover_ingest_files(Path(args.base))
+    if not ingest_files and not args.no_prompt and sys.stdin.isatty():
+        raw = input("No onboarding files auto-found. Add files now? (paths comma/space-separated, Enter to skip): ").strip()
+        ingest_files = parse_paths_input(raw)
+
+    if ingest_files:
         ingest_args = Obj()
         ingest_args.base = args.base
-        ingest_args.files = args.ingest_files
+        ingest_args.files = ingest_files
         ingest_args.policy = args.policy
+        ingest_args.no_prompt = True
         cmd_ingest(ingest_args)
+
+    base = Path(args.base)
+    print(json.dumps({
+        "next_steps": [
+            f"Build playbook: {base / 'nda_review_cli.py'} build-playbook --base {base}",
+            f"Run review: {base / 'review_nda.sh'} /path/to/nda.txt",
+            "Optional local override: edit config/org-policy.json",
+        ],
+        "ingest_files_used": len(ingest_files),
+    }, ensure_ascii=False))
 
 
 def cmd_build(args):
@@ -986,7 +1047,8 @@ def main():
     p_ingest = sub.add_parser("ingest", help="Ingest existing contracts/playbooks and propose policy/profile updates")
     p_ingest.add_argument("--base", default=str(Path(__file__).resolve().parent))
     p_ingest.add_argument("--policy", help="Policy config path", default="config/org-policy.json")
-    p_ingest.add_argument("--files", nargs="+", required=True)
+    p_ingest.add_argument("--files", nargs="*", help="Optional files to ingest. If omitted, auto-discovers from knowledge/inbox, knowledge/contracts, knowledge/redlines, inbox, input")
+    p_ingest.add_argument("--no-prompt", action="store_true", help="Do not prompt when no files are found")
     p_ingest.set_defaults(func=cmd_ingest)
 
     p_setup = sub.add_parser("setup", help="Combined setup: init plus optional ingest")
@@ -1001,6 +1063,8 @@ def main():
     p_setup.add_argument("--default-policy", help="Default policy seed file path", default="config/default-policy.json")
     p_setup.add_argument("--policy", help="Policy config path for ingest", default="config/org-policy.json")
     p_setup.add_argument("--ingest-files", nargs="+")
+    p_setup.add_argument("--quick", action="store_true", help="Zero-friction onboarding: defaults + auto-ingest discovery")
+    p_setup.add_argument("--no-prompt", action="store_true", help="Do not prompt for file paths when none are found")
     p_setup.set_defaults(func=cmd_setup)
 
     args = parser.parse_args()
