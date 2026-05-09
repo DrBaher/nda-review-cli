@@ -27,27 +27,37 @@ cd /path/to/nda-review-cli
 ./nda_review_cli.py review --text "Mutual NDA ..."
 
 # 5) Onboarding config wizard (non-interactive flags shown)
-./nda_review_cli.py init --org-name "Acme" --risk-posture balanced --preferred-jurisdictions "Austria,Germany"
+./nda_review_cli.py init --org-name "Acme" --template saas --risk-posture balanced --preferred-jurisdictions "Austria,Germany"
 
 # 6) Ingest existing knowledge (contracts/redlines/playbooks)
 ./nda_review_cli.py ingest --files /path/to/nda1.txt /path/to/redline_notes.txt
 
+# Approve autodiscovered onboarding files without prompting
+./nda_review_cli.py ingest --yes
+
 # 7) Combined setup (init + optional ingest)
-./nda_review_cli.py setup --org-name "Acme" --ingest-files /path/to/nda1.txt
+./nda_review_cli.py setup --org-name "Acme" --ingest-files /path/to/nda1.txt --build
 
 # 8) Fastest onboarding (zero required args)
-./nda_review_cli.py setup --quick
+./nda_review_cli.py setup --quick --yes
+
+# 9) Validate policy files and first-run environment
+./nda_review_cli.py policy-validate --file config/default-policy.json
+./nda_review_cli.py doctor
 ```
 
 ## Onboarding shortcuts
 
-- `./nda_review_cli.py setup --quick` → writes base config + profile using defaults, then auto-discovers ingest files.
+- `./nda_review_cli.py setup --quick --yes` → writes base config + profile using defaults, auto-discovers ingest files, and runs `build-playbook` by default.
+- `setup --quick` now defaults `build=true`; use `--no-build` to skip, or `--build` on non-quick setup to opt in.
+- `init` supports opinionated templates: `--template saas|healthcare|enterprise`.
 - If you do not pass `--ingest-files`, `setup` and `ingest` auto-scan:
   - `knowledge/inbox/`
   - `knowledge/contracts/`
   - `knowledge/redlines/`
   - `inbox/`
   - `input/`
+- When files are auto-discovered, the CLI shows the candidate list and asks for confirmation unless you pass `--yes` or `--no-prompt`.
 - If nothing is found and you are in an interactive terminal, the CLI asks once for file paths.
 
 ## Policy configuration
@@ -63,7 +73,15 @@ The CLI is generic by default:
 1. `--policy`, if provided
 2. `config/org-policy.json`, if present
 3. `config/default-policy.json`
-4. minimal built-in fallback rules
+4. repo `config/default-policy.json`
+5. minimal built-in fallback rules
+
+`policy-validate` enforces:
+
+- semantic `version` with minimum supported version `0.2.0`
+- required top-level keys: `org_name`, `clause_rules`, `negotiation_signal_patterns`
+- required clause rule shape: `keywords`, `preferred`, `red_flags`
+- readable JSON/schema error output with exit code `2` on failure
 
 ## Expected input files
 
@@ -81,6 +99,14 @@ You can override these paths:
   --gmail-paths data/raw_strict/gmail_work.json data/raw_strict/gmail_personal.json \
   --drive-paths data/raw_strict/drive_work.json data/raw_strict/drive_personal.json
 ```
+
+`doctor` checks these paths, validates discovered policy files, and tests whether autodiscovered ingest candidates are actually readable.
+
+## Ingestion extraction
+
+- `.docx`: tries `word/document.xml` extraction from the zip payload first, then `textutil` fallback on macOS.
+- `.pdf`: tries `pdftotext` first, then `textutil` fallback.
+- Ingest output now records `extraction_status`, `extractors_tried`, and any extraction `error` per source.
 
 ## Notes
 

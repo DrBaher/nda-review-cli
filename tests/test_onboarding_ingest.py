@@ -19,6 +19,8 @@ class OnboardingIngestTests(unittest.TestCase):
                 str(td),
                 "--org-name",
                 "Acme Health",
+                "--template",
+                "healthcare",
                 "--risk-posture",
                 "strict",
                 "--preferred-jurisdictions",
@@ -49,6 +51,7 @@ class OnboardingIngestTests(unittest.TestCase):
         payload = json.loads(proposed[0].read_text())
         self.assertIn("suggestions", payload)
         self.assertGreaterEqual(len(payload["sources"]), 1)
+        self.assertIn("extraction_status", payload["sources"][0])
 
 
 if __name__ == "__main__":
