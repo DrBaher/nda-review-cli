@@ -44,6 +44,9 @@ If you ever feel lost, run `./nda_review_cli.py tutorial` — it explains the sa
 # A) Run the interactive primer (optional but recommended for first-timers)
 ./nda_review_cli.py tutorial
 
+# A2) Or, for a guided 14-question setup that wires your preferences into clause rules
+./nda_review_cli.py quickstart
+
 # B) Bootstrap config + profile + playbook with safe defaults
 ./nda_review_cli.py setup --quick --yes
 
@@ -155,6 +158,8 @@ You just want to review NDAs against a sensible default policy.
 ```
 
 You'll lean on `config/default-policy.json` (the committed seed). Edit `config/org-policy.json` whenever you want to override a clause rule. Skip ingest entirely.
+
+**Want to encode your stance up front?** Run `./nda_review_cli.py quickstart` instead of `setup --quick`. It asks 14 questions covering term length, return-vs-destroy, residual-knowledge stance, trade-secret carve-out, and affiliate-disclosure scope — each answer changes the clause rules and red-flag patterns the review engine uses. Saves a `config/quickstart-answers.json` you can replay non-interactively later.
 
 ### Scenario B — In-house legal, large contracts archive
 

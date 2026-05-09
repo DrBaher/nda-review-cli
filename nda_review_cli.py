@@ -1950,6 +1950,349 @@ def _prompt_yes_no(label, default=True):
     return raw in {"y", "yes"}
 
 
+QUICKSTART_DEFAULTS = {
+    "org_name": "Your Org",
+    "org_type": "other",
+    "org_type_label": "",
+    "role": "in-house",
+    "nda_direction": "mutual",
+    "risk_posture": "balanced",
+    "preferred_jurisdictions": "Austria",
+    "survival_years": 5,
+    "ai_policy": "guardrailed",
+    "nda_term_years": 2,
+    "return_or_destroy_pref": "either",
+    "residual_knowledge": "reject",
+    "trade_secret_indefinite": True,
+    "affiliate_disclosure": "advisors_only",
+}
+
+QUICKSTART_ORG_TYPES = ["saas", "healthcare", "enterprise", "other"]
+QUICKSTART_ROLES = ["in-house", "founder", "engineer", "ops", "external", "other"]
+QUICKSTART_DIRECTIONS = ["mutual", "disclosing", "receiving", "mixed"]
+QUICKSTART_POSTURES = ["strict", "balanced", "commercial"]
+QUICKSTART_AI = ["restricted", "guardrailed", "permissive"]
+QUICKSTART_RND = ["return", "destroy", "either", "either_with_certification"]
+QUICKSTART_RESIDUAL = ["accept", "reject"]
+QUICKSTART_AFFILIATE = ["advisors_only", "advisors_and_affiliates", "case_by_case"]
+
+
+def _apply_quickstart_to_clause_rules(clause_rules: dict, ans: dict) -> dict:
+    """Mutate a copy of clause_rules based on quickstart answers. Each branch
+    must change observable review output — no decorative metadata."""
+    out = json.loads(json.dumps(clause_rules))
+
+    # term_and_survival: term length + trade-secret indefinite carve-out
+    term_years = int(ans.get("nda_term_years", 2))
+    survival_years = int(ans.get("survival_years", 5))
+    trade_secret = bool(ans.get("trade_secret_indefinite", True))
+    if "term_and_survival" in out:
+        carve = " Trade-secret protection extends indefinitely." if trade_secret else " No indefinite carve-out for trade secrets."
+        out["term_and_survival"]["preferred"] = (
+            f"NDA term {term_years} year(s) with confidentiality survival of {survival_years} year(s)."
+            f"{carve}"
+        )
+        flags = list(out["term_and_survival"].get("red_flags", []))
+        if not trade_secret and "indefinite trade-secret protection" not in flags:
+            flags.append("indefinite trade-secret protection")
+        if "perpetual for all info" not in flags:
+            flags.append("perpetual for all info")
+        out["term_and_survival"]["red_flags"] = flags
+
+    # return_or_destroy: preference text drives review messaging
+    rnd = ans.get("return_or_destroy_pref", "either")
+    if "return_or_destroy" in out:
+        rnd_text = {
+            "return": "Prefer return of confidential materials on request, with limited backup/legal retention carve-out.",
+            "destroy": "Prefer destruction of confidential materials on request, with limited backup/legal retention carve-out.",
+            "either": "Allow return or destruction on request, with limited backup/legal retention carve-out.",
+            "either_with_certification": "Allow return or destruction on request, with written certification of destruction and limited backup/legal retention carve-out.",
+        }.get(rnd, out["return_or_destroy"]["preferred"])
+        out["return_or_destroy"]["preferred"] = rnd_text
+        flags = list(out["return_or_destroy"].get("red_flags", []))
+        if rnd == "either_with_certification" and "no destruction certification" not in flags:
+            flags.append("no destruction certification")
+        out["return_or_destroy"]["red_flags"] = flags
+
+    # residuals: stance flips red flags directly
+    residual = ans.get("residual_knowledge", "reject")
+    if "residuals" in out:
+        if residual == "reject":
+            out["residuals"]["preferred"] = "Reject residual-knowledge clauses; mental impressions used to compete still constitute a breach."
+            flags = list(out["residuals"].get("red_flags", []))
+            for trigger in ["residual knowledge", "retained in unaided memory", "residuals clause"]:
+                if trigger not in flags:
+                    flags.append(trigger)
+            out["residuals"]["red_flags"] = flags
+        else:
+            out["residuals"]["preferred"] = "Accept narrowly-scoped residual knowledge limited to information unintentionally retained in unaided memory."
+            out["residuals"]["red_flags"] = []
+
+    # assignment_and_affiliates: scope of permitted disclosure
+    affiliate = ans.get("affiliate_disclosure", "advisors_only")
+    if "assignment_and_affiliates" in out:
+        text = {
+            "advisors_only": "Permitted disclosure limited to advisors (legal, accounting, financial) bound by equivalent confidentiality.",
+            "advisors_and_affiliates": "Permitted disclosure to advisors and affiliates under equivalent confidentiality, with disclosing party remaining responsible.",
+            "case_by_case": "Permitted disclosure only with disclosing party's prior written consent on a case-by-case basis.",
+        }.get(affiliate, out["assignment_and_affiliates"]["preferred"])
+        out["assignment_and_affiliates"]["preferred"] = text
+        flags = list(out["assignment_and_affiliates"].get("red_flags", []))
+        if affiliate == "advisors_only" and "broad affiliate disclosure" not in flags:
+            flags.append("broad affiliate disclosure")
+        out["assignment_and_affiliates"]["red_flags"] = flags
+
+    return out
+
+
+def _quickstart_summary_lines(ans: dict) -> list:
+    org_label = ans["org_type"] if ans["org_type"] != "other" else f"other ({ans.get('org_type_label') or 'unspecified'})"
+    return [
+        f"Org name:                {ans['org_name']}",
+        f"Org type:                {org_label}",
+        f"Your role:               {ans['role']}",
+        f"NDA direction:           {ans['nda_direction']}",
+        f"Risk posture:            {ans['risk_posture']}",
+        f"Preferred jurisdictions: {ans['preferred_jurisdictions']}",
+        f"Confidentiality survival:{ans['survival_years']} year(s)",
+        f"AI/data stance:          {ans['ai_policy']}",
+        f"NDA term length:         {ans['nda_term_years']} year(s)",
+        f"Return-or-destroy pref:  {ans['return_or_destroy_pref']}",
+        f"Residual knowledge:      {ans['residual_knowledge']}",
+        f"Trade-secret indefinite: {'yes' if ans['trade_secret_indefinite'] else 'no'}",
+        f"Affiliate disclosure:    {ans['affiliate_disclosure']}",
+    ]
+
+
+def cmd_quickstart(args):
+    base = Path(args.base)
+    cfg_dir = base / "config"
+    prof_dir = base / "profiles"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    prof_dir.mkdir(parents=True, exist_ok=True)
+
+    interactive = sys.stdin.isatty() and not args.no_prompt
+
+    ans = dict(QUICKSTART_DEFAULTS)
+    if args.answers_file:
+        try:
+            ans.update(json.loads(Path(args.answers_file).read_text()))
+        except Exception as e:
+            print(f"Could not load answers file: {e}", file=sys.stderr)
+            raise SystemExit(2)
+
+    if interactive:
+        total = 14
+        def step(n, label):
+            print(f"\n  ({n}/{total}) {label}", file=sys.stderr)
+
+        step(1, "Organization name — appears in playbook + profile metadata.")
+        ans["org_name"] = _prompt_with_default("Org name", ans["org_name"])
+
+        step(2, "Org type — picks template clause_preferences (saas/healthcare/enterprise) or annotation only (other).")
+        ans["org_type"] = _prompt_choice("Org type", QUICKSTART_ORG_TYPES, ans["org_type"])
+        if ans["org_type"] == "other":
+            ans["org_type_label"] = _prompt_with_default("Describe your org type (free text, e.g. developer, agency)", ans.get("org_type_label", ""))
+
+        step(3, "Your role — surfaced in review headers so readers know the lens.")
+        ans["role"] = _prompt_choice("Role", QUICKSTART_ROLES, ans["role"])
+
+        step(4, "Typical NDA direction — review summary frames findings from your perspective.")
+        ans["nda_direction"] = _prompt_choice("NDA direction", QUICKSTART_DIRECTIONS, ans["nda_direction"])
+
+        step(5, "Risk posture — sets scoring profile + decision thresholds.")
+        ans["risk_posture"] = _prompt_choice("Risk posture", QUICKSTART_POSTURES, ans["risk_posture"])
+
+        step(6, "Preferred jurisdictions — comma-separated; review scores jurisdiction findings against this list.")
+        ans["preferred_jurisdictions"] = _prompt_with_default("Jurisdictions (comma-separated)", ans["preferred_jurisdictions"])
+
+        step(7, "Default confidentiality survival (years) — used in profile + term_and_survival preferred text.")
+        ans["survival_years"] = int(_prompt_with_default("Survival years", str(ans["survival_years"])))
+
+        step(8, "AI/data usage stance — weights AI-clause red flags during review.")
+        ans["ai_policy"] = _prompt_choice("AI policy", QUICKSTART_AI, ans["ai_policy"])
+
+        step(9, "NDA term length (years) — distinct from survival; how long the agreement itself runs.")
+        ans["nda_term_years"] = int(_prompt_with_default("NDA term years", str(ans["nda_term_years"])))
+
+        step(10, "Return vs destroy preference — drives return_or_destroy clause preferred text.")
+        ans["return_or_destroy_pref"] = _prompt_choice("Return/destroy", QUICKSTART_RND, ans["return_or_destroy_pref"])
+
+        step(11, "Residual knowledge stance — accept narrows the residuals clause; reject flips on red flags.")
+        ans["residual_knowledge"] = _prompt_choice("Residual knowledge", QUICKSTART_RESIDUAL, ans["residual_knowledge"])
+
+        step(12, "Trade-secret indefinite carve-out — adjusts term_and_survival preferred text.")
+        ans["trade_secret_indefinite"] = _prompt_yes_no("Indefinite carve-out for trade secrets?", ans["trade_secret_indefinite"])
+
+        step(13, "Affiliate/advisor disclosure scope — drives assignment_and_affiliates clause text + red flags.")
+        ans["affiliate_disclosure"] = _prompt_choice("Affiliate disclosure", QUICKSTART_AFFILIATE, ans["affiliate_disclosure"])
+
+        step(14, "Past contracts to ingest now? Enter a directory path or leave blank to skip. We can also run a sample review at the end.")
+        ans["contracts_dir"] = _prompt_with_default("Contracts dir (blank to skip)", ans.get("contracts_dir", "") or "").strip() or None
+        ans["run_sample"] = _prompt_yes_no("Run a sample review on the bundled NDA fixture?", True)
+    else:
+        ans.setdefault("contracts_dir", None)
+        ans.setdefault("run_sample", False)
+
+    print("\n  ━━ Summary ━━", file=sys.stderr)
+    for line in _quickstart_summary_lines(ans):
+        print(f"  {line}", file=sys.stderr)
+    if ans.get("contracts_dir"):
+        print(f"  Ingest from:             {ans['contracts_dir']}", file=sys.stderr)
+    if ans.get("run_sample"):
+        print(f"  Sample review:           yes (tests/fixtures/sample_nda.txt)", file=sys.stderr)
+
+    if interactive and not args.yes:
+        if not _prompt_yes_no("\n  Apply this configuration?", True):
+            print("Aborted. No files written.", file=sys.stderr)
+            raise SystemExit(0)
+
+    # Persist answers for reproducibility / CI replay.
+    ans_out = cfg_dir / "quickstart-answers.json"
+    ans_out.write_text(json.dumps(ans, indent=2, sort_keys=True, ensure_ascii=False))
+
+    # Build org-policy from seed clause rules + quickstart augmentations.
+    seed = load_policy_config(base, args.default_policy)
+    augmented_rules = _apply_quickstart_to_clause_rules(seed["clause_rules"], ans)
+
+    scoring_profiles_out = cfg_dir / "scoring-profiles.json"
+    if not scoring_profiles_out.exists():
+        scoring_profiles_out.write_text(json.dumps({"profiles": DEFAULT_SCORING_PROFILES}, indent=2, ensure_ascii=False))
+    scoring_profile = scoring_profile_details(base, ans["risk_posture"], None)
+    weights = scoring_profile["weights"]
+
+    template_used = ans["org_type"] if ans["org_type"] in SUPPORTED_TEMPLATES else None
+    org_type_label = ans.get("org_type_label") or ans["org_type"]
+
+    org_policy = {
+        "version": "0.2.0",
+        "org_name": ans["org_name"],
+        "risk_posture": ans["risk_posture"],
+        "scoring_profile": scoring_profile["name"],
+        "preferred_jurisdictions": _parse_csv(ans["preferred_jurisdictions"]),
+        "defaults": {
+            "survival_years": int(ans["survival_years"]),
+            "ai_policy": ans["ai_policy"],
+            "retention_carveout": "Allow limited backup/legal retention under continuing confidentiality obligations.",
+            "nda_term_years": int(ans["nda_term_years"]),
+            "return_or_destroy_pref": ans["return_or_destroy_pref"],
+            "residual_knowledge": ans["residual_knowledge"],
+            "trade_secret_indefinite": bool(ans["trade_secret_indefinite"]),
+            "affiliate_disclosure": ans["affiliate_disclosure"],
+        },
+        "risk_weights": weights,
+        "clause_rules": augmented_rules,
+        "negotiation_signal_patterns": seed["negotiation_signal_patterns"],
+        "org_type": org_type_label,
+        "template": template_used,
+    }
+
+    profile = {
+        "profile_name": "default",
+        "fallback_posture": f"{ans['org_name']} prefers {ans['risk_posture']} posture as {ans['nda_direction']} party.",
+        "role": ans["role"],
+        "nda_direction": ans["nda_direction"],
+        "org_type": org_type_label,
+        "risk_weights": weights,
+        "decision_thresholds": scoring_profile["decision_thresholds"],
+        "scoring_profile": scoring_profile["name"],
+        "clause_preferences": {
+            "term_and_survival": augmented_rules.get("term_and_survival", {}).get("preferred", ""),
+            "return_or_destroy": augmented_rules.get("return_or_destroy", {}).get("preferred", ""),
+            "residuals": augmented_rules.get("residuals", {}).get("preferred", ""),
+            "assignment_and_affiliates": augmented_rules.get("assignment_and_affiliates", {}).get("preferred", ""),
+            "governing_law_jurisdiction": f"Prefer jurisdictions: {', '.join(_parse_csv(ans['preferred_jurisdictions'])) or 'neutral/favorable'}.",
+        },
+    }
+    if template_used:
+        profile["template"] = template_used
+        profile["clause_preferences"].update(SUPPORTED_TEMPLATES[template_used]["clause_preferences"])
+
+    org_out = cfg_dir / "org-policy.json"
+    prof_out = prof_dir / "default.json"
+    org_out.write_text(json.dumps(org_policy, indent=2, ensure_ascii=False))
+    prof_out.write_text(json.dumps(profile, indent=2, ensure_ascii=False))
+
+    result = {
+        "ok": True,
+        "org_policy": str(org_out),
+        "default_profile": str(prof_out),
+        "answers_file": str(ans_out),
+        "ingest_ran": False,
+        "sample_review_ran": False,
+    }
+
+    # Optional ingest from a directory.
+    if ans.get("contracts_dir"):
+        class Obj:
+            pass
+        ingest_args = Obj()
+        ingest_args.base = str(base)
+        ingest_args.policy = "config/org-policy.json"
+        ingest_args.files = []
+        ingest_args.contracts_dir = ans["contracts_dir"]
+        ingest_args.drive_export_dir = None
+        ingest_args.no_prompt = True
+        ingest_args.yes = True
+        cmd_ingest(ingest_args)
+        result["ingest_ran"] = True
+
+    # Optional sample review.
+    if ans.get("run_sample"):
+        sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample_nda.txt"
+        if sample.exists():
+            # Need a playbook first. Build one from any seeded data; falls back
+            # to clause_rules-only behavior when corpus is absent.
+            class Obj:
+                pass
+            build_args = Obj()
+            build_args.base = str(base)
+            build_args.policy = None
+            build_args.gmail_paths = ["data/raw_strict/gmail_primary.json", "data/raw_strict/gmail_secondary.json"]
+            build_args.drive_paths = ["data/raw_strict/drive_primary.json", "data/raw_strict/drive_secondary.json"]
+            build_args.out_json = "output/nda_playbook.json"
+            build_args.out_md = "output/nda_playbook.md"
+            cmd_build(build_args)
+
+            review_out_json = base / "output" / "reviews" / "quickstart-review.json"
+            review_out_md = base / "output" / "reviews" / "quickstart-review.md"
+            review_out_json.parent.mkdir(parents=True, exist_ok=True)
+            review_args = Obj()
+            review_args.base = str(base)
+            review_args.playbook = str(base / "output" / "nda_playbook.json")
+            review_args.counterparty = None
+            review_args.file = str(sample)
+            review_args.text = None
+            review_args.out_json = str(review_out_json)
+            review_args.out_md = str(review_out_md)
+            review_args.why = True
+            review_args.learn_profile = False
+            review_args.scoring_profile = None
+            review_args.scoring_profiles = None
+            cmd_review(review_args)
+            result["sample_review_ran"] = True
+            result["sample_review_json"] = str(review_out_json)
+            result["sample_review_md"] = str(review_out_md)
+
+    print(json.dumps(result, ensure_ascii=False))
+    _print_friendly(
+        title=f"Quickstart complete for {ans['org_name']}",
+        lines=[
+            f"Org policy:      {org_out}",
+            f"Default profile: {prof_out}",
+            f"Answers replay:  {ans_out}",
+            f"Ingest ran:      {'yes' if result['ingest_ran'] else 'no'}",
+            f"Sample review:   {'yes — ' + str(result.get('sample_review_md', '')) if result['sample_review_ran'] else 'no'}",
+        ],
+        next_steps=[
+            "Open `config/org-policy.json` to fine-tune any clause rule.",
+            "Replay non-interactively: `./nda_review_cli.py quickstart --no-prompt --yes --answers-file config/quickstart-answers.json`",
+            "Run `./nda_review_cli.py review --file /path/to/nda.txt --why` on a real NDA.",
+            "Run `./nda_review_cli.py doctor` to validate readiness.",
+        ],
+    )
+
+
 TUTORIAL_STEPS = [
     {
         "title": "Welcome",
@@ -2357,6 +2700,14 @@ def main():
     p_release.add_argument("--version", required=True)
     p_release.add_argument("--out")
     p_release.set_defaults(func=cmd_release_helper)
+
+    p_quick = sub.add_parser("quickstart", help="Guided 14-question setup: collects org/risk/clause preferences, writes config + profile, optionally ingests + samples a review")
+    p_quick.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_quick.add_argument("--no-prompt", action="store_true", help="Skip prompts; use defaults (CI-friendly)")
+    p_quick.add_argument("--yes", action="store_true", help="Skip the final apply confirmation")
+    p_quick.add_argument("--answers-file", help="Replay from a previously-saved quickstart-answers.json")
+    p_quick.add_argument("--default-policy", default="config/default-policy.json", help="Seed policy used as the clause-rules base")
+    p_quick.set_defaults(func=cmd_quickstart)
 
     p_tutorial = sub.add_parser("tutorial", help="Interactive primer that explains policy/profile/playbook and runs a sample review")
     p_tutorial.add_argument("--base", help="Sandbox directory for the sample run (defaults to a fresh temp dir)")

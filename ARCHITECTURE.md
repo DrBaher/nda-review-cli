@@ -57,7 +57,7 @@ All subcommands live here. Roughly grouped:
 
 | Group | Commands | Purpose |
 |---|---|---|
-| Onboarding | `init`, `setup`, `wizard`, `tutorial`, `doctor` | First-run config + sanity checks |
+| Onboarding | `init`, `setup`, `wizard`, `quickstart`, `tutorial`, `doctor` | First-run config + sanity checks |
 | Knowledge | `ingest`, `build-playbook` | Turn raw contracts into a playbook |
 | Review | `review`, `profile-learn`, `calibrate-scoring` | Score NDAs against the playbook |
 | Output | `generate-redlines`, `generate-office-script`, `quality-gate` | Produce Word-ready amendments |

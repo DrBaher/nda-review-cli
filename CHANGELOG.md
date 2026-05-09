@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+- Added `quickstart` subcommand: 14-question guided setup that wires answers (NDA term length, return-vs-destroy preference, residual-knowledge stance, trade-secret indefinite carve-out, affiliate-disclosure scope) into clause-rule `preferred` text and `red_flags` lists. Writes a replayable `config/quickstart-answers.json`.
+- Added `tutorial` subcommand: interactive primer that explains policy/profile/playbook and runs a sandboxed sample review.
+- Added human-readable summaries to stderr for `init`, `setup`, `ingest`, and `doctor` (stdout JSON unchanged). Suppressible via `NDA_CLI_QUIET=1`.
+- Added top-level `LICENSE` (MIT), `CONTRIBUTING.md`, `SECURITY.md`, `ARCHITECTURE.md`, and a tiered onboarding doc (`GETTING_STARTED.md`).
+- Expanded CI matrix to Python 3.9–3.12 with pip caching, added a tutorial smoke job, and added a release-on-tag workflow.
+
 ## [0.4.0] - 2026-05-09
 
 - Added `review --why` explainability output with triggered phrases, rule patterns, clause location, and confidence scoring.

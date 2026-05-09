@@ -57,6 +57,14 @@ git clone <this-repo-url> nda-review-cli && cd nda-review-cli
 
 That's it — `output/nda_playbook.json` and a review JSON/markdown summary are now on disk. New here? See **[GETTING_STARTED.md](GETTING_STARTED.md)** for a guided walkthrough, or run `./nda_review_cli.py tutorial` for an interactive primer.
 
+Want a guided 14-question setup that wires your stance on term length, residual knowledge, trade-secret carve-out, and affiliate disclosure into the clause rules? Run:
+
+```bash
+./nda_review_cli.py quickstart
+```
+
+It writes a replayable `config/quickstart-answers.json` so you can re-run non-interactively in CI with `--no-prompt --yes --answers-file <path>`.
+
 ## Core concepts
 
 | Term | What it is | Where it lives |
@@ -93,6 +101,7 @@ Rule of thumb: **edit the policy, let the profile learn, regenerate the playbook
 
 ## Onboarding shortcuts
 
+- `./nda_review_cli.py quickstart` → 14-question guided setup; answers wire directly into clause rules + red flags. Replayable via `--answers-file`.
 - `./nda_review_cli.py tutorial` → interactive primer that explains the concepts and runs a sample review.
 - `./nda_review_cli.py setup --quick --yes` → defaults + auto-discovers ingest files + runs `build-playbook`.
 - `./nda_review_cli.py wizard --quick --yes --review-file <nda>` → setup → ingest → build → review in one go.
