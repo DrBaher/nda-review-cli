@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added `draft` subcommand: generate outgoing NDAs (mutual / one-way disclosing) using your house policy clause text. Outputs canonical `.md` plus optional `.docx` (stdlib-only zip-based writer; no `python-docx` dependency). Supports `--template-file` for custom templates with `{{placeholders}}`, `--review-after` to round-trip the draft through `review --why`, and `--no-disclaimer` to suppress the starting-point header. Two bundled templates under `templates/`.
 - Added `quickstart` subcommand: 14-question guided setup that wires answers (NDA term length, return-vs-destroy preference, residual-knowledge stance, trade-secret indefinite carve-out, affiliate-disclosure scope) into clause-rule `preferred` text and `red_flags` lists. Writes a replayable `config/quickstart-answers.json`.
 - Added `tutorial` subcommand: interactive primer that explains policy/profile/playbook and runs a sandboxed sample review.
 - Added human-readable summaries to stderr for `init`, `setup`, `ingest`, and `doctor` (stdout JSON unchanged). Suppressible via `NDA_CLI_QUIET=1`.

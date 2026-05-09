@@ -60,6 +60,7 @@ All subcommands live here. Roughly grouped:
 | Onboarding | `init`, `setup`, `wizard`, `quickstart`, `tutorial`, `doctor` | First-run config + sanity checks |
 | Knowledge | `ingest`, `build-playbook` | Turn raw contracts into a playbook |
 | Review | `review`, `profile-learn`, `calibrate-scoring` | Score NDAs against the playbook |
+| Authoring | `draft` | Generate outgoing NDAs (mutual / one-way-out) in `.md` + `.docx` |
 | Output | `generate-redlines`, `generate-office-script`, `quality-gate` | Produce Word-ready amendments |
 | Versioning | `playbook-snapshot`, `playbook-diff`, `playbook-lock` | Track playbook changes |
 | Meta | `policy-validate`, `release-helper`, `create-manifest` | Schema/version/release plumbing |
@@ -94,6 +95,13 @@ Parses a hybrid approval pack and produces clause-numbered redline instructions.
 - `default-policy.json` — committed seed policy (generic).
 - `scoring-profiles.json` — committed scoring profile presets (`balanced`, `strict`, `commercial`).
 - `org-policy.json` — gitignored. User overrides live here.
+
+### `templates/`
+
+- `mutual_nda.md` — bundled mutual NDA template used by `draft --template mutual`.
+- `one_way_out_nda.md` — bundled one-way disclosing NDA template used by `draft --template one-way-out`.
+
+Both templates use `{{placeholders}}`. Clause-text placeholders (`{{clause_term_and_survival}}`, `{{clause_residuals}}`, etc.) pull straight from `config/org-policy.json` `clause_rules[*].preferred`, so any change made via `quickstart` or hand-edit of policy flows into drafts without changing template files.
 
 ### `tests/`
 
@@ -137,6 +145,8 @@ Tweaking these is the cleanest way to retune output without rewriting rules.
 | Tweak severity / decision thresholds | `config/scoring-profiles.json` |
 | Change review output structure | `cmd_review` in `nda_review_cli.py` |
 | Change ingest discovery roots | `_build_ingest_roots` and `discover_ingest_files` |
+| Change drafted NDA boilerplate | `templates/mutual_nda.md` or `templates/one_way_out_nda.md` |
+| Change drafted clause language | The `preferred` field of the clause in `config/org-policy.json` |
 | Add a new subcommand | Define `cmd_<name>`, register a parser in `main()` |
 
 ## Determinism guarantees

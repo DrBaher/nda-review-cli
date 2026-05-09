@@ -19,6 +19,7 @@ Sending NDAs to a SaaS reviewer means leaking your counterparty list, your fallb
 
 - **Builds a playbook** from your historical Gmail/Drive corpus (or any folder of contracts).
 - **Reviews NDAs** clause-by-clause against that playbook with severity-scored findings and explainability evidence.
+- **Drafts NDAs to send out** using your house clause language — mutual or one-way disclosing — straight to `.md` + `.docx`.
 - **Generates redlines** ready to drop into Word, plus tracked-changes packs and Office Script bridges.
 - **Learns counterparty profiles** deterministically so repeat parties get a consistent stance.
 
@@ -74,6 +75,38 @@ It writes a replayable `config/quickstart-answers.json` so you can re-run non-in
 | **Playbook** | A snapshot built from your corpus + policy: clause-by-clause guidance the review engine consults. Rebuilt on demand. | `output/nda_playbook.json` (+ `.md`) |
 
 Rule of thumb: **edit the policy, let the profile learn, regenerate the playbook.**
+
+## Drafting an NDA to send out
+
+Draft a fresh NDA in your house language. Clause text is pulled directly from `config/org-policy.json` `clause_rules.preferred`, so anything you tuned via `quickstart` (term length, return-vs-destroy, residual-knowledge stance, trade-secret carve-out, affiliate disclosure) flows through automatically.
+
+```bash
+# Mutual NDA — both parties may disclose
+./nda_review_cli.py draft \
+  --template mutual \
+  --party-a "Acme Inc." --party-a-address "123 Main St, Vienna, AT" \
+  --party-b "Beta LLC"  --party-b-address "10 Market Way, Berlin, DE" \
+  --purpose "evaluating a strategic partnership" \
+  --out output/drafts/mutual.md \
+  --out-docx output/drafts/mutual.docx
+
+# One-way disclosing NDA — you share, the other side does not
+./nda_review_cli.py draft \
+  --template one-way-out \
+  --disclosing-party "Acme Inc." --disclosing-party-address "123 Main St" \
+  --receiving-party "Vendor Co"  --receiving-party-address "100 Lake Rd" \
+  --purpose "vendor onboarding diligence" \
+  --out output/drafts/oneway.md \
+  --out-docx output/drafts/oneway.docx \
+  --review-after
+```
+
+Notes:
+- `--out` writes the canonical markdown source; `--out-docx` writes a Word `.docx` (stdlib-only, no `python-docx` needed).
+- `--template` defaults to one suggested by your `profile.nda_direction` — `disclosing` → `one-way-out`, anything else → `mutual`.
+- `--template-file path/to/your-template.md` lets you bring your own template with `{{placeholders}}`. Missing placeholders fail loudly with exit code 2.
+- `--review-after` round-trips the generated draft through `review --why` so you see the same lens applied to your own outgoing language.
+- A "starting point, not legal advice" disclaimer header is prepended by default; pass `--no-disclaimer` to omit.
 
 ## Common workflows
 
