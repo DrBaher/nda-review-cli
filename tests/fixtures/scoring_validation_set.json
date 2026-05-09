@@ -1,0 +1,17 @@
+[
+  {
+    "id": "approve-empty",
+    "text": "",
+    "expected_decision": "approve"
+  },
+  {
+    "id": "escalate-mid-risk",
+    "text": "The confidentiality obligations survive indefinitely and the courts of a foreign venue have exclusive jurisdiction.",
+    "expected_decision": "escalate"
+  },
+  {
+    "id": "block-high-risk",
+    "text": "Residual rights apply to unaided memory, confidentiality is perpetual, and the NDA includes a non-compete with unlimited indemnity.",
+    "expected_decision": "block"
+  }
+]

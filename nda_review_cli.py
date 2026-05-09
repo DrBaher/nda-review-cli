@@ -2,6 +2,7 @@
 import argparse
 import html
 import json
+import os
 import re
 import hashlib
 import shutil
@@ -31,6 +32,20 @@ FALLBACK_SIGNAL_PATTERNS = {
 }
 
 MIN_POLICY_VERSION = "0.2.0"
+DEFAULT_SCORING_PROFILES = {
+    "balanced": {
+        "weights": {"legal": 1.2, "commercial": 1.0, "operational": 1.0, "severity_high": 3, "severity_low": 1},
+        "decision_thresholds": {"approve_max": 4.99, "escalate_max": 9.99},
+    },
+    "strict": {
+        "weights": {"legal": 1.4, "commercial": 1.1, "operational": 1.2, "severity_high": 4, "severity_low": 1},
+        "decision_thresholds": {"approve_max": 3.99, "escalate_max": 8.99},
+    },
+    "commercial": {
+        "weights": {"legal": 1.0, "commercial": 0.9, "operational": 0.9, "severity_high": 3, "severity_low": 1},
+        "decision_thresholds": {"approve_max": 5.99, "escalate_max": 10.99},
+    },
+}
 SUPPORTED_TEMPLATES = {
     "saas": {
         "risk_posture": "balanced",
@@ -525,7 +540,7 @@ def derive_context_and_recommendation(clause, snippet, preferred_position):
 def load_counterparty_profile(base: Path, counterparty: Optional[str]):
     if not counterparty:
         return {}
-    p = base / "profiles" / f"{counterparty.lower().replace(' ', '_')}.json"
+    p = base / "profiles" / f"{sanitize_slug(counterparty)}.json"
     if p.exists():
         try:
             return json.loads(p.read_text())
@@ -534,7 +549,52 @@ def load_counterparty_profile(base: Path, counterparty: Optional[str]):
     return {}
 
 
-def risk_weights(profile: Optional[dict] = None):
+def sanitize_slug(value: str):
+    return re.sub(r"[^a-z0-9_]+", "_", value.strip().lower()).strip("_")
+
+
+def scoring_profiles_path(base: Path, explicit: Optional[str] = None):
+    if explicit:
+        p = Path(explicit)
+        return p if p.is_absolute() else (base / p)
+    return base / "config" / "scoring-profiles.json"
+
+
+def load_scoring_profiles(base: Path, explicit: Optional[str] = None):
+    target = scoring_profiles_path(base, explicit)
+    profiles = DEFAULT_SCORING_PROFILES
+    if target.exists():
+        try:
+            data = json.loads(target.read_text())
+            raw_profiles = data.get("profiles") if isinstance(data, dict) else None
+            if isinstance(raw_profiles, dict) and raw_profiles:
+                profiles = raw_profiles
+        except Exception:
+            profiles = DEFAULT_SCORING_PROFILES
+    return {"path": str(target), "profiles": profiles}
+
+
+def scoring_profile_details(base: Path, profile_name: Optional[str], scoring_profiles_file: Optional[str] = None):
+    loaded = load_scoring_profiles(base, scoring_profiles_file)
+    profiles = loaded["profiles"]
+    chosen = profile_name or "balanced"
+    if chosen not in profiles:
+        chosen = "balanced"
+    data = profiles[chosen]
+    weights = {
+        "legal": 1.0,
+        "commercial": 1.0,
+        "operational": 1.0,
+        "severity_high": 3,
+        "severity_low": 1,
+    }
+    weights.update(data.get("weights", {}))
+    thresholds = {"approve_max": 4.99, "escalate_max": 9.99}
+    thresholds.update(data.get("decision_thresholds", {}))
+    return {"name": chosen, "weights": weights, "decision_thresholds": thresholds, "path": loaded["path"]}
+
+
+def risk_weights(profile: Optional[dict] = None, scoring_profile: Optional[dict] = None):
     w = {
         "legal": 1.0,
         "commercial": 1.0,
@@ -542,9 +602,20 @@ def risk_weights(profile: Optional[dict] = None):
         "severity_high": 3,
         "severity_low": 1,
     }
+    if scoring_profile and isinstance(scoring_profile.get("weights"), dict):
+        w.update(scoring_profile["weights"])
     if profile and isinstance(profile.get("risk_weights"), dict):
         w.update(profile["risk_weights"])
     return w
+
+
+def decision_thresholds(profile: Optional[dict] = None, scoring_profile: Optional[dict] = None):
+    thresholds = {"approve_max": 4.99, "escalate_max": 9.99}
+    if scoring_profile and isinstance(scoring_profile.get("decision_thresholds"), dict):
+        thresholds.update(scoring_profile["decision_thresholds"])
+    if profile and isinstance(profile.get("decision_thresholds"), dict):
+        thresholds.update(profile["decision_thresholds"])
+    return thresholds
 
 
 def classify_risk_bucket(clause):
@@ -564,6 +635,28 @@ def rule_hit_details(text, keywords):
         matched_text = text[m.start():m.end()]
         hits.append({"pattern": k, "match": matched_text})
     return hits
+
+
+def summarize_rule_patterns(keyword_hits, red_flag_trigger_hits):
+    patterns = []
+    for pat in keyword_hits:
+        patterns.append(pat)
+    for hit in red_flag_trigger_hits:
+        pat = hit.get("pattern")
+        if pat and pat not in patterns:
+            patterns.append(pat)
+    return patterns
+
+
+def confidence_score(keyword_hits, red_flag_trigger_hits, snippet):
+    score = 0.45
+    if keyword_hits:
+        score += min(0.25, 0.05 * len(keyword_hits))
+    if red_flag_trigger_hits:
+        score += min(0.2, 0.1 * len(red_flag_trigger_hits))
+    if snippet:
+        score += 0.1
+    return round(min(score, 0.99), 2)
 
 
 def sha256_file(path: Path):
@@ -586,6 +679,78 @@ def suggest_posture(clause, profile):
     if fallback:
         return f"Counterparty fallback posture: {fallback}"
     return "Use configured default position."
+
+
+def learning_fields_for_finding(finding):
+    return {
+        "severity": finding.get("severity"),
+        "preferred_position": finding.get("preferred_position"),
+        "recommendation": finding.get("recommendation"),
+        "confidence_score": finding.get("confidence_score"),
+        "last_clause_heading": finding.get("clause_heading"),
+        "last_paragraph_index": finding.get("paragraph_index"),
+    }
+
+
+def learn_profile_from_review(base: Path, counterparty: str, review_data: dict, source_review_file: str):
+    slug = sanitize_slug(counterparty)
+    profile_path = base / "profiles" / f"{slug}.json"
+    if profile_path.exists():
+        try:
+            profile = json.loads(profile_path.read_text())
+        except Exception:
+            profile = {}
+    else:
+        profile = {}
+
+    profile.setdefault("profile_name", counterparty)
+    profile.setdefault("fallback_posture", "Use configured default position.")
+    profile.setdefault("clause_preferences", {})
+    profile.setdefault("review_memory", {"total_reviews": 0, "decision_counts": {}, "clause_hit_counts": {}, "review_history": []})
+
+    changed_fields = []
+    review_memory = profile["review_memory"]
+    review_memory["total_reviews"] = int(review_memory.get("total_reviews", 0)) + 1
+    changed_fields.append("review_memory.total_reviews")
+
+    decision = review_data.get("decision", "unknown")
+    counts = review_memory.setdefault("decision_counts", {})
+    counts[decision] = int(counts.get(decision, 0)) + 1
+    changed_fields.append(f"review_memory.decision_counts.{decision}")
+
+    last_review = {
+        "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        "source_review_file": source_review_file,
+        "input_file": review_data.get("input_file"),
+        "decision": review_data.get("decision"),
+        "risk_score": review_data.get("risk_score"),
+        "changed_fields": [],
+    }
+
+    clause_counts = review_memory.setdefault("clause_hit_counts", {})
+    learned_positions = profile.setdefault("learned_clause_positions", {})
+    for finding in review_data.get("findings", []):
+        clause = finding.get("clause")
+        if not clause:
+            continue
+        clause_counts[clause] = int(clause_counts.get(clause, 0)) + 1
+        changed_fields.append(f"review_memory.clause_hit_counts.{clause}")
+        profile["clause_preferences"][clause] = finding.get("preferred_position") or profile["clause_preferences"].get(clause, "")
+        changed_fields.append(f"clause_preferences.{clause}")
+        learned_positions[clause] = learning_fields_for_finding(finding)
+        learned_positions[clause]["source_review_file"] = source_review_file
+        learned_positions[clause]["updated_at"] = last_review["reviewed_at"]
+        changed_fields.append(f"learned_clause_positions.{clause}")
+
+    unique_changes = sorted(set(changed_fields))
+    last_review["changed_fields"] = unique_changes
+    review_memory["last_review"] = last_review
+    review_memory["review_history"].append(last_review)
+    review_memory["review_history"] = review_memory["review_history"][-20:]
+
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(json.dumps(profile, indent=2, ensure_ascii=False))
+    return {"profile_path": str(profile_path), "changed_fields": unique_changes, "reviewed_at": last_review["reviewed_at"]}
 
 
 def build_playbook(messages, drive_items, clause_rules, signal_patterns, org_name="Generic Org"):
@@ -660,11 +825,12 @@ def build_playbook(messages, drive_items, clause_rules, signal_patterns, org_nam
     return playbook
 
 
-def review_text(text, playbook, profile=None):
+def review_text(text, playbook, profile=None, scoring_profile=None, explainability=False):
     findings = []
     risk_score = 0
     breakdown = {"legal": 0.0, "commercial": 0.0, "operational": 0.0}
-    weights = risk_weights(profile)
+    weights = risk_weights(profile, scoring_profile=scoring_profile)
+    thresholds = decision_thresholds(profile, scoring_profile=scoring_profile)
     ltxt = text.lower()
 
     for rule in playbook.get("policy", []):
@@ -697,6 +863,13 @@ def review_text(text, playbook, profile=None):
         )
 
         hit_details = rule_hit_details(text, keywords)
+        evidence = {
+            "triggered_phrases": [d.get("match") for d in hit_details if d.get("match")],
+            "paragraph_index": paragraph_index,
+            "heading": clause_heading,
+            "rule_patterns": summarize_rule_patterns(keyword_hits, rf_trigger_hits),
+            "confidence_score": confidence_score(keyword_hits, rf_trigger_hits, snippet),
+        }
 
         findings.append({
             "clause": clause,
@@ -714,20 +887,23 @@ def review_text(text, playbook, profile=None):
             "score": weighted,
             "clause_heading": clause_heading,
             "paragraph_index": paragraph_index,
+            "confidence_score": evidence["confidence_score"],
+            "evidence": evidence,
             "posture_suggestion": suggest_posture(clause, profile),
         })
 
     decision = "approve"
-    if risk_score >= 10:
+    if risk_score > float(thresholds.get("escalate_max", 9.99)):
         decision = "block"
-    elif risk_score >= 5:
+    elif risk_score > float(thresholds.get("approve_max", 4.99)):
         decision = "escalate"
 
-    return {
+    result = {
         "decision": decision,
         "risk_score": round(risk_score, 2),
         "risk_breakdown": {k: round(v, 2) for k, v in breakdown.items()},
         "risk_weights": weights,
+        "decision_thresholds": thresholds,
         "findings": findings,
         "concerns_summary": [
             {
@@ -746,11 +922,21 @@ def review_text(text, playbook, profile=None):
                 "score": f.get("score", 0),
                 "clause_heading": f.get("clause_heading", ""),
                 "paragraph_index": f.get("paragraph_index"),
+                "confidence_score": f.get("confidence_score"),
+                "evidence": f.get("evidence", {}),
                 "posture_suggestion": f.get("posture_suggestion", ""),
             }
             for i, f in enumerate(findings)
         ],
     }
+    if scoring_profile:
+        result["scoring_profile"] = {
+            "name": scoring_profile.get("name"),
+            "path": scoring_profile.get("path"),
+        }
+    if explainability:
+        result["explainability_mode"] = True
+    return result
 
 
 def cmd_playbook_lock(args):
@@ -793,10 +979,75 @@ def cmd_playbook_diff(args):
     print(diff)
 
 
+REDLINE_TEMPLATES = {
+    "term_and_survival": "Replace the survival language with a finite confidentiality term and limit any indefinite protection to trade secrets only.",
+    "exceptions": "Insert the standard confidentiality carve-outs for public information, prior knowledge, independent development, lawful third-party receipt, and legal compulsion.",
+    "liability_and_remedies": "Narrow remedies to targeted injunctive relief and remove any uncapped indemnity or liability expansion embedded in the NDA.",
+}
+
+
+def exact_replacement_suggestion(concern):
+    snippet = (concern.get("clause_snippet") or "").strip()
+    clause = concern.get("clause")
+    if snippet and len(snippet) <= 500:
+        return {
+            "replace_this": snippet,
+            "with_text": concern.get("recommended_amendment") or concern.get("recommendation") or "",
+        }
+    return {
+        "replace_this": "",
+        "with_text": REDLINE_TEMPLATES.get(clause, concern.get("recommended_amendment") or concern.get("recommendation") or ""),
+    }
+
+
+def redline_rationale(concern):
+    rationale = concern.get("concern") or "Clause deviates from the configured preferred position."
+    confidence = concern.get("confidence_score")
+    if confidence is not None:
+        return f"{rationale} Confidence {confidence}."
+    return rationale
+
+
+def build_redline_v2(review):
+    lines = ["# Clause-specific Redline Draft v2", ""]
+    items = review.get("concerns_summary", [])
+    for c in items:
+        decision = str(c.get("pass2_decision", "")).upper()
+        if decision and decision not in {"CONFIRM", "DOWNGRADE"}:
+            continue
+        replacement = exact_replacement_suggestion(c)
+        clause = c.get("clause")
+        template = REDLINE_TEMPLATES.get(clause, c.get("recommended_amendment") or c.get("recommendation") or "")
+        lines.append(f"## {c.get('point')}. {clause}")
+        lines.append(f"- Severity: {c.get('severity')}")
+        lines.append(f"- Rationale: {redline_rationale(c)}")
+        if c.get("clause_heading") or c.get("paragraph_index") is not None:
+            loc = []
+            if c.get("clause_heading"):
+                loc.append(f"heading={c.get('clause_heading')}")
+            if c.get("paragraph_index") is not None:
+                loc.append(f"paragraph={c.get('paragraph_index')}")
+            lines.append(f"- Location: {', '.join(loc)}")
+        if replacement.get("replace_this"):
+            lines.append(f"- Exact replacement target: \"{replacement['replace_this']}\"")
+        lines.append("- Suggested replacement text block:")
+        lines.append("")
+        lines.append(replacement["with_text"] or template or "Review clause manually and replace with the configured preferred position.")
+        lines.append("")
+        lines.append("- Reusable amendment template:")
+        lines.append(f"  {template or 'Align this clause with the configured preferred position and keep the edit clause-local.'}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def cmd_generate_redlines(args):
     review = json.loads(Path(args.review_json).read_text())
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    if args.mode == "v2":
+        out.write_text(build_redline_v2(review))
+        print(out)
+        return
     lines = ["# Clause-ready Redline Draft", ""]
     for c in review.get("concerns_summary", []):
         decision = str(c.get("pass2_decision", "")).upper()
@@ -954,18 +1205,18 @@ def cmd_init(args):
         retention = args.retention_carveout
 
     default_policy = load_policy_config(base, args.default_policy)
+    scoring_profiles_out = cfg_dir / "scoring-profiles.json"
+    if not scoring_profiles_out.exists():
+        scoring_profiles_out.write_text(json.dumps({"profiles": DEFAULT_SCORING_PROFILES}, indent=2, ensure_ascii=False))
 
-    if posture == "strict":
-        weights = {"legal": 1.4, "commercial": 1.0, "operational": 1.2, "severity_high": 4, "severity_low": 1}
-    elif posture == "commercial":
-        weights = {"legal": 1.0, "commercial": 0.9, "operational": 1.0, "severity_high": 3, "severity_low": 1}
-    else:
-        weights = {"legal": 1.2, "commercial": 1.0, "operational": 1.0, "severity_high": 3, "severity_low": 1}
+    scoring_profile = scoring_profile_details(base, args.scoring_profile or posture, args.scoring_profiles)
+    weights = scoring_profile["weights"]
 
     org_policy = {
         "version": "0.2.0",
         "org_name": org_name,
         "risk_posture": posture,
+        "scoring_profile": scoring_profile["name"],
         "preferred_jurisdictions": _parse_csv(jurisdiction),
         "defaults": {
             "survival_years": survival_years,
@@ -981,6 +1232,8 @@ def cmd_init(args):
         "profile_name": "default",
         "fallback_posture": f"{org_name} prefers {posture} posture.",
         "risk_weights": weights,
+        "decision_thresholds": scoring_profile["decision_thresholds"],
+        "scoring_profile": scoring_profile["name"],
         "clause_preferences": {
             "term_and_survival": f"Finite survival ({survival_years} years) unless trade secret/legal carve-out.",
             "governing_law_jurisdiction": f"Prefer jurisdictions: {', '.join(_parse_csv(jurisdiction)) or 'neutral/favorable'}.",
@@ -1011,6 +1264,27 @@ def discover_ingest_files(base: Path):
     return sorted(set(found))
 
 
+def discover_files_from_root(root: Path):
+    exts = {".txt", ".md", ".docx", ".pdf"}
+    found = []
+    if not root.exists() or not root.is_dir():
+        return found
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in exts and not p.name.startswith("."):
+            found.append(str(p))
+    return sorted(set(found))
+
+
+def discover_drive_export_files(root: Path):
+    candidates = []
+    for name in ["My Drive", "Shared drives", "Takeout", "Google Drive"]:
+        target = root / name
+        candidates.extend(discover_files_from_root(target if target.exists() else root))
+        if candidates:
+            break
+    return sorted(set(candidates))
+
+
 def parse_paths_input(raw: str):
     if not raw:
         return []
@@ -1030,9 +1304,15 @@ def cmd_ingest(args):
     proposed_dir = kdir / "proposed"
     proposed_dir.mkdir(parents=True, exist_ok=True)
 
+    files = list(args.files or [])
+    if args.contracts_dir:
+        files.extend(discover_files_from_root(Path(args.contracts_dir)))
+    if args.drive_export_dir:
+        files.extend(discover_drive_export_files(Path(args.drive_export_dir)))
+
     resolution = _resolve_ingest_files(
         base,
-        args.files,
+        files,
         yes=getattr(args, "yes", False),
         no_prompt=getattr(args, "no_prompt", False),
         prompt_label="Auto-discovered ingest candidates:",
@@ -1101,6 +1381,10 @@ def cmd_ingest(args):
         "skipped_for_approval": resolution["skipped_for_approval"],
         "sources": sources,
         "suggestions": suggestions,
+        "connector_inputs": {
+            "contracts_dir": args.contracts_dir,
+            "drive_export_dir": args.drive_export_dir,
+        },
         "note": "Proposed-only. Review before promotion to active policy/profile.",
     }
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -1110,6 +1394,7 @@ def cmd_ingest(args):
         "sources_ingested": len(sources),
         "autodiscovered": resolution["autodiscovered"],
         "skipped_for_approval": resolution["skipped_for_approval"],
+        "connector_inputs": payload["connector_inputs"],
     }, ensure_ascii=False))
 
 
@@ -1129,12 +1414,19 @@ def cmd_setup(args):
     init_args.retention_carveout = args.retention_carveout
     init_args.default_policy = args.default_policy
     init_args.template = args.template
+    init_args.scoring_profile = args.scoring_profile
+    init_args.scoring_profiles = args.scoring_profiles
     cmd_init(init_args)
 
     base = Path(args.base)
+    explicit_ingest = list(args.ingest_files or [])
+    if getattr(args, "contracts_dir", None):
+        explicit_ingest.extend(discover_files_from_root(Path(args.contracts_dir)))
+    if getattr(args, "drive_export_dir", None):
+        explicit_ingest.extend(discover_drive_export_files(Path(args.drive_export_dir)))
     resolution = _resolve_ingest_files(
         base,
-        args.ingest_files,
+        explicit_ingest,
         yes=args.yes,
         no_prompt=args.no_prompt,
         prompt_label="Auto-discovered onboarding files:",
@@ -1154,6 +1446,8 @@ def cmd_setup(args):
         ingest_args.autodiscovered = resolution["autodiscovered"]
         ingest_args.skipped_for_approval = resolution["skipped_for_approval"]
         ingest_args.approval_needed = resolution["approval_needed"]
+        ingest_args.contracts_dir = None
+        ingest_args.drive_export_dir = None
         cmd_ingest(ingest_args)
 
     should_build = args.build
@@ -1346,17 +1640,26 @@ def cmd_review(args):
     playbook = json.loads(Path(args.playbook).read_text())
     base = Path(args.base)
     profile = load_counterparty_profile(base, args.counterparty)
+    scoring_profile = scoring_profile_details(base, args.scoring_profile or (profile.get("scoring_profile") if profile else None), args.scoring_profiles)
     if args.file:
         text = Path(args.file).read_text(errors="ignore")
     else:
         text = args.text or ""
-    result = review_text(text, playbook, profile=profile)
+    result = review_text(text, playbook, profile=profile, scoring_profile=scoring_profile, explainability=args.why)
     if args.file:
         result["input_file"] = args.file
     if args.counterparty:
         result["counterparty"] = args.counterparty
     if profile:
         result["counterparty_profile_loaded"] = True
+
+    learning_result = None
+    if args.learn_profile:
+        if not args.counterparty:
+            raise SystemExit("--learn-profile requires --counterparty")
+        source_review_file = args.out_json or "(stdout-only-review)"
+        learning_result = learn_profile_from_review(base, args.counterparty, result, source_review_file)
+        result["profile_learning"] = learning_result
 
     if args.out_json:
         out_json = Path(args.out_json)
@@ -1381,6 +1684,7 @@ def cmd_review(args):
             lines.append(f"- Severity: {f.get('severity','unknown')}")
             lines.append(f"- Risk bucket: {f.get('risk_bucket','')}")
             lines.append(f"- Weighted score: {f.get('score',0)}")
+            lines.append(f"- Confidence: {f.get('confidence_score',0)}")
             lines.append(f"- Preferred position: {f.get('preferred_position','')}")
             if f.get("clause_snippet"):
                 lines.append(f"- Exact clause snippet: \"{f.get('clause_snippet')}\"")
@@ -1401,6 +1705,11 @@ def cmd_review(args):
                 lines.append("- Matched terms:")
                 for d in f.get("rule_hit_details", []):
                     lines.append(f"  - pattern `{d.get('pattern')}` matched \"{d.get('match')}\"")
+            if args.why and f.get("evidence"):
+                ev = f["evidence"]
+                triggers = ", ".join(ev.get("triggered_phrases", [])[:3]) or "n/a"
+                patterns = ", ".join(ev.get("rule_patterns", [])[:4]) or "n/a"
+                lines.append(f"- Evidence: triggers={triggers}; patterns={patterns}; heading={ev.get('heading') or 'n/a'}; paragraph={ev.get('paragraph_index')}; confidence={ev.get('confidence_score')}")
             if f.get("red_flags"):
                 lines.append("- Red flags:")
                 lines.extend([f"  - {r}" for r in f["red_flags"]])
@@ -1425,11 +1734,191 @@ def cmd_review(args):
                 lines.append(f"- Counterparty posture suggestion: {c.get('posture_suggestion')}")
             if c.get("rule_hits"):
                 lines.append(f"- Why flagged: {', '.join(c.get('rule_hits', []))}")
+            if args.why and c.get("evidence"):
+                ev = c["evidence"]
+                lines.append(f"- Evidence: phrases={', '.join(ev.get('triggered_phrases', [])[:3]) or 'n/a'}; patterns={', '.join(ev.get('rule_patterns', [])[:4]) or 'n/a'}; confidence={ev.get('confidence_score')}")
             lines.append(f"- Recommended amendment: {c.get('recommended_amendment')}")
             lines.append("")
+        if learning_result:
+            lines += ["", "## Profile Learning", "", f"- Profile updated: `{learning_result['profile_path']}`", f"- Changed fields: {', '.join(learning_result['changed_fields'])}"]
         out_md.write_text("\n".join(lines))
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def cmd_profile_learn(args):
+    base = Path(args.base)
+    review_data = json.loads(Path(args.review_json).read_text())
+    counterparty = args.counterparty or review_data.get("counterparty")
+    if not counterparty:
+        raise SystemExit("Counterparty required via --counterparty or embedded in review JSON.")
+    learning_result = learn_profile_from_review(base, counterparty, review_data, args.review_json)
+    print(json.dumps({"ok": True, **learning_result}, indent=2, ensure_ascii=False))
+
+
+def normalize_decision_bucket(value):
+    value = (value or "").strip().lower()
+    return value if value in {"approve", "escalate", "block"} else "unknown"
+
+
+def cmd_calibrate_scoring(args):
+    base = Path(args.base)
+    playbook = json.loads(Path(args.playbook).read_text())
+    scoring_profile = scoring_profile_details(base, args.scoring_profile, args.scoring_profiles)
+    cases = json.loads(Path(args.validation_set).read_text())
+    confusion = {actual: {"approve": 0, "escalate": 0, "block": 0, "unknown": 0} for actual in ["approve", "escalate", "block", "unknown"]}
+    predicted_counts = {"approve": 0, "escalate": 0, "block": 0, "unknown": 0}
+    actual_counts = {"approve": 0, "escalate": 0, "block": 0, "unknown": 0}
+    correct = 0
+    for case in cases:
+        if case.get("file"):
+            text = Path(case["file"]).read_text(errors="ignore")
+        else:
+            text = case.get("text", "")
+        actual = normalize_decision_bucket(case.get("expected_decision"))
+        result = review_text(text, playbook, scoring_profile=scoring_profile, explainability=False)
+        predicted = normalize_decision_bucket(result.get("decision"))
+        actual_counts[actual] += 1
+        predicted_counts[predicted] += 1
+        confusion[actual][predicted] += 1
+        if actual == predicted:
+            correct += 1
+
+    total = max(len(cases), 1)
+    precision = {}
+    recall = {}
+    for bucket in ["approve", "escalate", "block"]:
+        tp = confusion[bucket][bucket]
+        pred = predicted_counts[bucket]
+        act = actual_counts[bucket]
+        precision[bucket] = round(tp / pred, 3) if pred else None
+        recall[bucket] = round(tp / act, 3) if act else None
+
+    payload = {
+        "validation_set": args.validation_set,
+        "scoring_profile": scoring_profile["name"],
+        "scoring_profiles_path": scoring_profile["path"],
+        "cases": len(cases),
+        "accuracy": round(correct / total, 3),
+        "decision_precision": precision,
+        "decision_recall": recall,
+        "actual_counts": actual_counts,
+        "predicted_counts": predicted_counts,
+        "confusion_by_decision_bucket": confusion,
+    }
+    if args.out_json:
+        out = Path(args.out_json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def cmd_release_helper(args):
+    changelog = Path(args.changelog)
+    text = changelog.read_text() if changelog.exists() else ""
+    version = args.version.strip()
+    section = ""
+    if version:
+        m = re.search(rf"^##\s+\[{re.escape(version)}\].*?(?=^##\s+\[|\Z)", text, re.M | re.S)
+        if m:
+            section = m.group(0).strip()
+    if not section:
+        m = re.search(r"^##\s+\[[^\]]+\].*?(?=^##\s+\[|\Z)", text, re.M | re.S)
+        section = m.group(0).strip() if m else "No changelog section found."
+    payload = {
+        "version": version,
+        "changelog": str(changelog),
+        "release_notes": section,
+        "suggested_tag": f"git tag -a {version} -m \"Release {version}\"" if version else "",
+    }
+    if args.out:
+        Path(args.out).write_text(section + "\n")
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _prompt_yes_no(label, default=True):
+    marker = "Y/n" if default else "y/N"
+    raw = input(f"{label} [{marker}]: ").strip().lower()
+    if not raw:
+        return default
+    return raw in {"y", "yes"}
+
+
+def cmd_wizard(args):
+    base = Path(args.base)
+    interactive = not args.no_prompt and sys.stdin.isatty()
+
+    class Obj:
+        pass
+
+    setup_args = Obj()
+    setup_args.base = str(base)
+    setup_args.interactive = False
+    setup_args.org_name = args.org_name
+    setup_args.template = args.template
+    setup_args.risk_posture = args.risk_posture
+    setup_args.preferred_jurisdictions = args.preferred_jurisdictions
+    setup_args.survival_years = args.survival_years
+    setup_args.ai_policy = args.ai_policy
+    setup_args.retention_carveout = args.retention_carveout
+    setup_args.default_policy = args.default_policy
+    setup_args.policy = args.policy
+    setup_args.ingest_files = args.ingest_files
+    setup_args.build = args.build
+    setup_args.no_build = args.no_build
+    setup_args.quick = args.quick
+    setup_args.yes = args.yes
+    setup_args.no_prompt = args.no_prompt
+    setup_args.scoring_profile = args.scoring_profile
+    setup_args.scoring_profiles = args.scoring_profiles
+
+    if interactive:
+        if not setup_args.org_name:
+            setup_args.org_name = _prompt_with_default("Organization name", "Your Org")
+        if not setup_args.template:
+            setup_args.template = _prompt_with_default("Template (saas/healthcare/enterprise or blank)", "")
+            setup_args.template = setup_args.template or None
+        if not args.ingest_files and _prompt_yes_no("Run ingest after setup?", True):
+            source_mode = _prompt_with_default("Ingest source (files/contracts-dir/drive-export-dir/auto)", "auto")
+            if source_mode == "files":
+                setup_args.ingest_files = parse_paths_input(input("Enter file paths: ").strip())
+            elif source_mode == "contracts-dir":
+                args.contracts_dir = _prompt_with_default("Contracts directory", str(base / "knowledge" / "contracts"))
+            elif source_mode == "drive-export-dir":
+                args.drive_export_dir = _prompt_with_default("Drive export directory", str(base))
+        if not args.build and not args.no_build:
+            setup_args.build = _prompt_yes_no("Build playbook after ingest?", True)
+        if not args.review_file and not args.review_text:
+            if _prompt_yes_no("Run review at the end?", True):
+                args.review_file = _prompt_with_default("Review file path", str(Path(__file__).resolve().parent / "tests" / "fixtures" / "sample_nda.txt"))
+
+    cmd_setup(setup_args)
+
+    if args.contracts_dir or args.drive_export_dir:
+        ingest_args = Obj()
+        ingest_args.base = str(base)
+        ingest_args.policy = args.policy
+        ingest_args.files = []
+        ingest_args.contracts_dir = args.contracts_dir
+        ingest_args.drive_export_dir = args.drive_export_dir
+        ingest_args.no_prompt = True
+        ingest_args.yes = True
+        cmd_ingest(ingest_args)
+
+    if args.review_file or args.review_text:
+        review_args = Obj()
+        review_args.base = str(base)
+        review_args.playbook = args.playbook or str(base / "output" / "nda_playbook.json")
+        review_args.counterparty = args.counterparty
+        review_args.file = args.review_file
+        review_args.text = args.review_text
+        review_args.out_json = args.out_json
+        review_args.out_md = args.out_md
+        review_args.why = args.why
+        review_args.learn_profile = args.learn_profile
+        review_args.scoring_profile = args.scoring_profile
+        review_args.scoring_profiles = args.scoring_profiles
+        cmd_review(review_args)
 
 
 def main():
@@ -1453,6 +1942,10 @@ def main():
     p_review.add_argument("--text")
     p_review.add_argument("--out-json")
     p_review.add_argument("--out-md")
+    p_review.add_argument("--why", action="store_true", help="Include concise explainability evidence for each finding")
+    p_review.add_argument("--learn-profile", action="store_true", help="Write deterministic counterparty profile updates from this review")
+    p_review.add_argument("--scoring-profile", help="Scoring profile name")
+    p_review.add_argument("--scoring-profiles", help="Path to scoring profiles JSON")
     p_review.set_defaults(func=cmd_review)
 
     p_snap = sub.add_parser("playbook-snapshot", help="Snapshot current playbook version")
@@ -1475,6 +1968,7 @@ def main():
     p_red = sub.add_parser("generate-redlines", help="Generate clause-ready redline draft from review JSON")
     p_red.add_argument("--review-json", required=True)
     p_red.add_argument("--out", required=True)
+    p_red.add_argument("--mode", choices=["classic", "v2"], default="classic")
     p_red.set_defaults(func=cmd_generate_redlines)
 
     p_office = sub.add_parser("generate-office-script", help="Generate Office Script bridge from step5 find/replace pack")
@@ -1520,12 +2014,16 @@ def main():
     p_init.add_argument("--ai-policy", default="guardrailed", choices=["restricted", "guardrailed", "permissive"])
     p_init.add_argument("--retention-carveout", default="Allow limited backup/legal retention under continuing confidentiality obligations.")
     p_init.add_argument("--default-policy", help="Default policy seed file path", default="config/default-policy.json")
+    p_init.add_argument("--scoring-profile", help="Scoring profile name")
+    p_init.add_argument("--scoring-profiles", help="Path to scoring profiles JSON")
     p_init.set_defaults(func=cmd_init)
 
     p_ingest = sub.add_parser("ingest", help="Ingest existing contracts/playbooks and propose policy/profile updates")
     p_ingest.add_argument("--base", default=str(Path(__file__).resolve().parent))
     p_ingest.add_argument("--policy", help="Policy config path", default="config/org-policy.json")
     p_ingest.add_argument("--files", nargs="*", help="Optional files to ingest. If omitted, auto-discovers from knowledge/inbox, knowledge/contracts, knowledge/redlines, inbox, input")
+    p_ingest.add_argument("--contracts-dir", help="Shortcut: recurse through a local contracts directory and ingest supported files")
+    p_ingest.add_argument("--drive-export-dir", help="Shortcut: recurse through a local Google Drive export folder and ingest supported files")
     p_ingest.add_argument("--yes", action="store_true", help="Approve auto-discovered files without confirmation")
     p_ingest.add_argument("--no-prompt", action="store_true", help="Do not prompt when no files are found")
     p_ingest.set_defaults(func=cmd_ingest)
@@ -1543,12 +2041,68 @@ def main():
     p_setup.add_argument("--default-policy", help="Default policy seed file path", default="config/default-policy.json")
     p_setup.add_argument("--policy", help="Policy config path for ingest", default="config/org-policy.json")
     p_setup.add_argument("--ingest-files", nargs="+")
+    p_setup.add_argument("--contracts-dir", help="Shortcut: recurse through a local contracts directory during setup")
+    p_setup.add_argument("--drive-export-dir", help="Shortcut: recurse through a local Google Drive export folder during setup")
     p_setup.add_argument("--build", action="store_true", help="Run build-playbook at the end of setup")
     p_setup.add_argument("--no-build", action="store_true", help="Skip build-playbook at the end of setup, including quick mode default build")
     p_setup.add_argument("--quick", action="store_true", help="Zero-friction onboarding: defaults + auto-ingest discovery")
     p_setup.add_argument("--yes", action="store_true", help="Approve auto-discovered files without confirmation")
     p_setup.add_argument("--no-prompt", action="store_true", help="Do not prompt for file paths when none are found")
+    p_setup.add_argument("--scoring-profile", help="Scoring profile name")
+    p_setup.add_argument("--scoring-profiles", help="Path to scoring profiles JSON")
     p_setup.set_defaults(func=cmd_setup)
+
+    p_profile = sub.add_parser("profile-learn", help="Learn or update a counterparty profile from a saved review JSON")
+    p_profile.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_profile.add_argument("--review-json", required=True)
+    p_profile.add_argument("--counterparty")
+    p_profile.set_defaults(func=cmd_profile_learn)
+
+    p_cal = sub.add_parser("calibrate-scoring", help="Evaluate a labeled validation set against a scoring profile")
+    p_cal.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_cal.add_argument("--playbook", default=str(Path(__file__).resolve().parent / "output/nda_playbook.json"))
+    p_cal.add_argument("--validation-set", required=True)
+    p_cal.add_argument("--scoring-profile", default="balanced")
+    p_cal.add_argument("--scoring-profiles", help="Path to scoring profiles JSON")
+    p_cal.add_argument("--out-json")
+    p_cal.set_defaults(func=cmd_calibrate_scoring)
+
+    p_release = sub.add_parser("release-helper", help="Generate release notes from CHANGELOG and suggest a git tag command")
+    p_release.add_argument("--changelog", default=str(Path(__file__).resolve().parent / "CHANGELOG.md"))
+    p_release.add_argument("--version", required=True)
+    p_release.add_argument("--out")
+    p_release.set_defaults(func=cmd_release_helper)
+
+    p_wizard = sub.add_parser("wizard", help="Guided setup -> ingest -> build -> review flow")
+    p_wizard.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_wizard.add_argument("--playbook")
+    p_wizard.add_argument("--org-name")
+    p_wizard.add_argument("--template", choices=sorted(SUPPORTED_TEMPLATES.keys()))
+    p_wizard.add_argument("--risk-posture", default="balanced", choices=["strict", "balanced", "commercial"])
+    p_wizard.add_argument("--preferred-jurisdictions", default="Austria")
+    p_wizard.add_argument("--survival-years", type=int, default=5)
+    p_wizard.add_argument("--ai-policy", default="guardrailed", choices=["restricted", "guardrailed", "permissive"])
+    p_wizard.add_argument("--retention-carveout", default="Allow limited backup/legal retention under continuing confidentiality obligations.")
+    p_wizard.add_argument("--default-policy", default="config/default-policy.json")
+    p_wizard.add_argument("--policy", default="config/org-policy.json")
+    p_wizard.add_argument("--quick", action="store_true")
+    p_wizard.add_argument("--build", action="store_true")
+    p_wizard.add_argument("--no-build", action="store_true")
+    p_wizard.add_argument("--yes", action="store_true")
+    p_wizard.add_argument("--no-prompt", action="store_true")
+    p_wizard.add_argument("--ingest-files", nargs="+")
+    p_wizard.add_argument("--contracts-dir")
+    p_wizard.add_argument("--drive-export-dir")
+    p_wizard.add_argument("--review-file")
+    p_wizard.add_argument("--review-text")
+    p_wizard.add_argument("--counterparty")
+    p_wizard.add_argument("--out-json")
+    p_wizard.add_argument("--out-md")
+    p_wizard.add_argument("--why", action="store_true")
+    p_wizard.add_argument("--learn-profile", action="store_true")
+    p_wizard.add_argument("--scoring-profile", help="Scoring profile name")
+    p_wizard.add_argument("--scoring-profiles", help="Path to scoring profiles JSON")
+    p_wizard.set_defaults(func=cmd_wizard)
 
     args = parser.parse_args()
     args.func(args)

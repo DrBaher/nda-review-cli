@@ -1,0 +1,43 @@
+{
+  "profiles": {
+    "balanced": {
+      "weights": {
+        "legal": 1.2,
+        "commercial": 1.0,
+        "operational": 1.0,
+        "severity_high": 3,
+        "severity_low": 1
+      },
+      "decision_thresholds": {
+        "approve_max": 4.99,
+        "escalate_max": 9.99
+      }
+    },
+    "strict": {
+      "weights": {
+        "legal": 1.4,
+        "commercial": 1.1,
+        "operational": 1.2,
+        "severity_high": 4,
+        "severity_low": 1
+      },
+      "decision_thresholds": {
+        "approve_max": 3.99,
+        "escalate_max": 8.99
+      }
+    },
+    "commercial": {
+      "weights": {
+        "legal": 1.0,
+        "commercial": 0.9,
+        "operational": 0.9,
+        "severity_high": 3,
+        "severity_low": 1
+      },
+      "decision_thresholds": {
+        "approve_max": 5.99,
+        "escalate_max": 10.99
+      }
+    }
+  }
+}

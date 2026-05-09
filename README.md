@@ -23,6 +23,12 @@ cd /path/to/nda-review-cli
 # Optional: counterparty profile-aware review (loads profiles/<name>.json)
 ./nda_review_cli.py review --file /path/to/nda.txt --counterparty "Counterparty Name"
 
+# Review explainability mode with concise evidence
+./nda_review_cli.py review --file /path/to/nda.txt --why --out-json output/reviews/review.json --out-md output/reviews/review.md
+
+# Review + deterministic profile learning
+./nda_review_cli.py review --file /path/to/nda.txt --counterparty "Counterparty Name" --learn-profile --out-json output/reviews/review.json
+
 # 4) Review inline text
 ./nda_review_cli.py review --text "Mutual NDA ..."
 
@@ -38,10 +44,23 @@ cd /path/to/nda-review-cli
 # 7) Combined setup (init + optional ingest)
 ./nda_review_cli.py setup --org-name "Acme" --ingest-files /path/to/nda1.txt --build
 
+# Import connector shortcuts
+./nda_review_cli.py ingest --contracts-dir /path/to/contracts
+./nda_review_cli.py ingest --drive-export-dir /path/to/google-drive-export
+
 # 8) Fastest onboarding (zero required args)
 ./nda_review_cli.py setup --quick --yes
 
-# 9) Validate policy files and first-run environment
+# 9) Guided wizard flow
+./nda_review_cli.py wizard --quick --yes --review-file /path/to/nda.txt --out-json output/reviews/wizard.json
+
+# 10) Score calibration against a labeled validation set
+./nda_review_cli.py calibrate-scoring --validation-set tests/fixtures/scoring_validation_set.json --scoring-profile balanced --out-json output/calibration.json
+
+# 11) Release notes helper
+./nda_review_cli.py release-helper --version 0.4.0 --out output/release-notes-0.4.0.md
+
+# 12) Validate policy files and first-run environment
 ./nda_review_cli.py policy-validate --file config/default-policy.json
 ./nda_review_cli.py doctor
 ```
@@ -51,12 +70,15 @@ cd /path/to/nda-review-cli
 - `./nda_review_cli.py setup --quick --yes` → writes base config + profile using defaults, auto-discovers ingest files, and runs `build-playbook` by default.
 - `setup --quick` now defaults `build=true`; use `--no-build` to skip, or `--build` on non-quick setup to opt in.
 - `init` supports opinionated templates: `--template saas|healthcare|enterprise`.
+- `init`, `review`, `setup`, and `wizard` accept `--scoring-profile` plus optional `--scoring-profiles config/scoring-profiles.json`.
 - If you do not pass `--ingest-files`, `setup` and `ingest` auto-scan:
   - `knowledge/inbox/`
   - `knowledge/contracts/`
   - `knowledge/redlines/`
   - `inbox/`
   - `input/`
+- `ingest --contracts-dir` recurses through a local contracts folder.
+- `ingest --drive-export-dir` recurses through a downloaded Google Drive export folder such as `My Drive/` or `Takeout/`.
 - When files are auto-discovered, the CLI shows the candidate list and asks for confirmation unless you pass `--yes` or `--no-prompt`.
 - If nothing is found and you are in an interactive terminal, the CLI asks once for file paths.
 
@@ -82,6 +104,39 @@ The CLI is generic by default:
 - required top-level keys: `org_name`, `clause_rules`, `negotiation_signal_patterns`
 - required clause rule shape: `keywords`, `preferred`, `red_flags`
 - readable JSON/schema error output with exit code `2` on failure
+
+## Review explainability and profile learning
+
+- `review --why` adds a concise evidence block per finding in JSON and markdown:
+  - triggered phrase(s)
+  - heading / paragraph index
+  - matched rule patterns
+  - confidence score
+- `review --learn-profile` updates `profiles/<counterparty>.json` deterministically and records:
+  - `source_review_file`
+  - UTC timestamp
+  - changed fields
+- You can also learn from an existing review file:
+
+```bash
+./nda_review_cli.py profile-learn --counterparty "Counterparty Name" --review-json output/reviews/review.json
+```
+
+## Scoring profiles and calibration
+
+- Committed defaults live in `config/scoring-profiles.json`.
+- Built-in profile names: `balanced`, `strict`, `commercial`.
+- Decision thresholds are file-driven and can be overridden by editing the scoring profiles file.
+
+```bash
+./nda_review_cli.py review --file /path/to/nda.txt --scoring-profile strict
+
+./nda_review_cli.py calibrate-scoring \
+  --playbook output/nda_playbook.json \
+  --validation-set tests/fixtures/scoring_validation_set.json \
+  --scoring-profile balanced \
+  --out-json output/calibration.json
+```
 
 ## Expected input files
 
@@ -164,11 +219,38 @@ Default heuristic (`--mode defaults`):
 # Clause-ready redline draft from review JSON
 ./nda_review_cli.py generate-redlines --review-json output/reviews/review-*.json --out output/reviews/clause-ready-redline.md
 
+# Clause-specific redline generator v2
+./nda_review_cli.py generate-redlines --mode v2 --review-json output/reviews/review-*.json --out output/reviews/clause-ready-redline-v2.md
+
 # Office Script bridge from Step 5 pack
 ./nda_review_cli.py generate-office-script --find-replace-pack output/reviews/find-replace-pack-*.md --out output/tracked-redline/office-script.ts
 
 # Quality gate before Step 4
 ./nda_review_cli.py quality-gate --redline output/reviews/redline-instructions-*.md --source-text /path/to/nda.txt --out-json output/reviews/quality-gate.json
+
+# Release helper from CHANGELOG
+./nda_review_cli.py release-helper --version 0.4.0
+```
+
+## Wizard flow
+
+`wizard` walks setup -> ingest -> build -> review with plain terminal prompts when stdin is interactive.
+For non-interactive runs, pass the same flags directly:
+
+```bash
+./nda_review_cli.py wizard \
+  --base /tmp/nda-cli \
+  --quick \
+  --yes \
+  --no-prompt \
+  --contracts-dir /path/to/contracts \
+  --drive-export-dir /path/to/drive-export \
+  --review-file /path/to/nda.txt \
+  --counterparty "Counterparty Name" \
+  --why \
+  --learn-profile \
+  --out-json output/reviews/wizard-review.json \
+  --out-md output/reviews/wizard-review.md
 ```
 
 ## Quality gates in Step 4
@@ -185,6 +267,7 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 GitHub Actions runs the same checks on push/PR.
+The CI matrix covers Linux and macOS.
 
 ## Anchor safety mode (Step 5)
 
