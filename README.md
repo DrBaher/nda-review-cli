@@ -189,6 +189,33 @@ Stance flows into both modes:
 - **`negotiate counter --auto`** — fully deterministic, no LLM. Generates amendments from your policy + stance + the rule engine's red-flag detection.
 - **`negotiate counter --agent --llm <provider>`** — stance is injected into the LLM prompt as concrete instructions, alongside your clause-by-clause preferred language.
 
+### Game-theoretic predictions (validated by `negotiate simulate`)
+
+The deterministic `--auto` mode is a bargaining game. Each clause has a preferred text per party; each stance defines an acceptance threshold. The convergence rule is the equilibrium condition. We've validated the predicted outcomes empirically — see `tests/test_negotiate_simulate.py`.
+
+| Party A × Party B | Outcome | Rounds | Why |
+|---|---|---|---|
+| **conservative × conservative** | **blocked** | ~7 (stalemate) | Both sides counter every clause that differs from their preferred text → oscillating non-convergence → stalemate detector flips status to `blocked` after 4 rounds without progress |
+| conservative × middleground | converged | 2–3 | M concedes on non-red-flag clauses, A holds firm and wins the contested ones |
+| conservative × compromising | converged | 2–3 | C concedes everywhere; only A's red flags are negotiated |
+| middleground × middleground | converged | 2 | Both sides only push back on red flags; usually one round resolves them |
+| middleground × compromising | converged | 2 | C concedes; M just polices red flags |
+| compromising × compromising | converged | 2 | Both sides accept everything that doesn't fire a red flag |
+
+When two parties **both** insist on their own preferred language with no give, no rules-only mechanism can converge — that's the well-known result for symmetric strict-preference bargaining. The CLI surfaces this rather than looping forever: status flips to `blocked` with a diagnosis listing the stuck clauses. Try one side compromising, switch to `--agent --llm` (which can spot semantically-equivalent text), or escalate to humans.
+
+Run the simulation yourself:
+
+```bash
+nda-review-cli negotiate simulate \
+  --party-a-base /path/to/party-a-workspace \
+  --party-b-base /path/to/party-b-workspace \
+  --stance-a conservative --stance-b conservative \
+  --mode auto --max-rounds 10
+```
+
+The report includes per-round trajectory (agreed/disputed counts), winner-per-clause for converged outcomes, and a `block_diagnosis` listing stuck clauses for blocked outcomes.
+
 **Sign-off before finalize** is a required human checkpoint. Once `status: converged`, both parties run `negotiate sign-off` to review the **key points** — clauses changed from the initial draft, amendments applied (with their source: manual / `auto:<stance>` / `agent:<stance>`), and any red-flag patterns still present in the final text. `negotiate finalize` is blocked until both sign-offs land. This is the gate that lets you trust agent-assisted rounds without losing the human review.
 
 **How it works:**

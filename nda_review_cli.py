@@ -3155,9 +3155,14 @@ def _negotiate_auto_propose(state: dict, party: str, org_policy: dict, stance: s
 
     counter_amendments = []
     accept_clauses = []
+    countered_clauses = set()
     rationale_prefix = f"[auto:{stance}] "
 
-    # Counter-proposal logic over each policy clause.
+    # Pass 1: per-clause decision over the *current* text.
+    # Counter when stance demands; otherwise accept the current text as-is.
+    # This is the fix that enables convergence when the initial draft is
+    # acceptable to the counter-party (previously acceptance only triggered
+    # off the other side's amendments — which round 1 has zero of).
     for clause, cfg in rules.items():
         current_block = _negotiate_extract_clause_text(text, clause)
         preferred = (cfg.get("preferred") or "").strip()
@@ -3166,46 +3171,42 @@ def _negotiate_auto_propose(state: dict, party: str, org_policy: dict, stance: s
         red_flags_fired = bool(red_flag_hits(current_block.lower(), clause))
         differs = preferred not in current_block
 
-        if stance == "conservative":
-            if differs:
-                counter_amendments.append({
-                    "clause": clause,
-                    "old_text": current_block,
-                    "new_text": preferred,
-                    "rationale": rationale_prefix + "current text differs from your preferred position.",
-                })
-        elif stance == "middleground":
-            if red_flags_fired:
-                counter_amendments.append({
-                    "clause": clause,
-                    "old_text": current_block,
-                    "new_text": preferred,
-                    "rationale": rationale_prefix + f"red-flag pattern fired on this clause; replacing with preferred language.",
-                })
-        elif stance == "compromising":
-            if red_flags_fired:
-                counter_amendments.append({
-                    "clause": clause,
-                    "old_text": current_block,
-                    "new_text": preferred,
-                    "rationale": rationale_prefix + "dealbreaker red flag still present; pushing back even in compromising mode.",
-                })
+        will_counter = False
+        rationale = ""
+        if stance == "conservative" and differs:
+            will_counter = True
+            rationale = "current text differs from your preferred position."
+        elif stance == "middleground" and red_flags_fired:
+            will_counter = True
+            rationale = "red-flag pattern fired on this clause; replacing with preferred language."
+        elif stance == "compromising" and red_flags_fired:
+            will_counter = True
+            rationale = "dealbreaker red flag still present; pushing back even in compromising mode."
 
-    # Acceptance logic over the other party's last-round amendments.
-    for am in last_amendments:
-        clause = am.get("clause")
-        if not clause:
-            continue
-        proposed = (am.get("new_text") or "")
-        proposed_red_flags = bool(red_flag_hits(proposed.lower(), clause)) if clause in rules else False
-        if stance == "conservative":
-            # Reject everything; rely on counter loop above to push back.
-            continue
-        if stance == "middleground":
-            if not proposed_red_flags and clause not in last_amendment_clauses_in_counters(counter_amendments):
+        if will_counter:
+            counter_amendments.append({
+                "clause": clause,
+                "old_text": current_block,
+                "new_text": preferred,
+                "rationale": rationale_prefix + rationale,
+            })
+            countered_clauses.add(clause)
+        else:
+            accept_clauses.append(clause)
+
+    # Pass 2: explicit acceptance of other-party amendments from the previous
+    # round. Only adds clauses that aren't already in the lists from pass 1.
+    # Conservative still rejects all proposals.
+    if stance != "conservative":
+        for am in last_amendments:
+            clause = am.get("clause")
+            if not clause or clause in countered_clauses or clause in accept_clauses:
+                continue
+            proposed = (am.get("new_text") or "")
+            proposed_red_flags = bool(red_flag_hits(proposed.lower(), clause)) if clause in rules else False
+            if stance == "middleground" and not proposed_red_flags:
                 accept_clauses.append(clause)
-        elif stance == "compromising":
-            if not proposed_red_flags:
+            elif stance == "compromising" and not proposed_red_flags:
                 accept_clauses.append(clause)
 
     accept_clauses = sorted(set(accept_clauses))
@@ -3296,6 +3297,61 @@ def _negotiate_recompute_clause_status(state: dict, rules: dict) -> dict:
                 status[clause]["last_proposer"] = proposer
                 status[clause]["agreed_in_round"] = None
     return status
+
+
+DEFAULT_STALEMATE_THRESHOLD = 4
+
+
+def _negotiate_agreed_count_at_round(state: dict, round_index: int, rules: dict) -> int:
+    """How many clauses are 'agreed' if we look at state up to and including round_index."""
+    truncated = {**state, "rounds": state["rounds"][: round_index + 1]}
+    cs = _negotiate_recompute_clause_status(truncated, rules)
+    return sum(1 for s in cs.values() if s.get("status") == "agreed")
+
+
+def _negotiate_rounds_without_progress(state: dict, rules: dict) -> int:
+    """Number of consecutive most-recent rounds during which the count of
+    `agreed` clauses did not strictly increase. Used by the stalemate detector.
+
+    Round 1 is the initial draft and has no "previous" agreed count, so we
+    measure progress starting from round 2."""
+    rounds = state.get("rounds", [])
+    if len(rounds) < 2:
+        return 0
+    # Pre-compute agreed_count at each round.
+    counts = [_negotiate_agreed_count_at_round(state, i, rules) for i in range(len(rounds))]
+    # Walk backwards from the most recent round, counting "no increase" rounds.
+    no_progress = 0
+    for i in range(len(counts) - 1, 0, -1):
+        if counts[i] > counts[i - 1]:
+            break
+        no_progress += 1
+    return no_progress
+
+
+def _negotiate_check_blocked(state: dict, rules: dict, threshold: int = DEFAULT_STALEMATE_THRESHOLD) -> dict:
+    """If `rounds_without_progress >= threshold`, flips status to `blocked` and
+    attaches a diagnostic. Idempotent — once blocked, leaves the state alone.
+    Returns the (possibly-modified) state."""
+    if state.get("status") in ("converged", "signed_off", "finalized", "blocked"):
+        return state
+    no_progress = _negotiate_rounds_without_progress(state, rules)
+    if no_progress >= threshold:
+        cs = state.get("clause_status", {})
+        stuck = sorted(c for c, s in cs.items() if s.get("status") == "disputed")
+        state["status"] = "blocked"
+        state["block_diagnosis"] = {
+            "rounds_without_progress": no_progress,
+            "threshold": threshold,
+            "stuck_clauses": stuck,
+            "note": (
+                "No new clause has reached `agreed` status for several consecutive "
+                "rounds. Likely cause: both parties' stances are too rigid for the "
+                "rules-engine to resolve. Try `--stance compromising` for one side, "
+                "switch to `--agent --llm`, or escalate to humans."
+            ),
+        }
+    return state
 
 
 def _negotiate_is_converged(state: dict) -> bool:
@@ -3469,6 +3525,13 @@ def cmd_negotiate_counter(args):
     org_policy = _negotiate_load_org_policy(base)
     rules = org_policy.get("clause_rules", {}) or {}
     party = _negotiate_resolve_party(state, args.as_party, base)
+    if state.get("status") == "blocked" and not getattr(args, "force_unblock", False):
+        diag = state.get("block_diagnosis", {})
+        raise SystemExit(
+            f"Negotiation is `blocked` (no progress for {diag.get('rounds_without_progress','?')} rounds). "
+            f"Stuck clauses: {diag.get('stuck_clauses')}. "
+            "Pass `--force-unblock` to keep going at your own risk, or change stance / switch to --agent."
+        )
     last = state["rounds"][-1]
     if last["proposer"] == party:
         raise SystemExit(
@@ -3528,6 +3591,8 @@ def cmd_negotiate_counter(args):
     state["clause_status"] = _negotiate_recompute_clause_status(state, rules)
     if _negotiate_is_converged(state):
         state["status"] = "converged"
+    else:
+        state = _negotiate_check_blocked(state, rules)
 
     out = Path(args.out or args.state)
     _negotiate_save(out, state)
@@ -3582,6 +3647,8 @@ def cmd_negotiate_accept(args):
     state["clause_status"] = _negotiate_recompute_clause_status(state, rules)
     if _negotiate_is_converged(state):
         state["status"] = "converged"
+    else:
+        state = _negotiate_check_blocked(state, rules)
     out = Path(args.out or args.state)
     _negotiate_save(out, state)
     print(json.dumps({
@@ -3629,6 +3696,204 @@ def _negotiate_run_hook(cmd_template: str, vars: dict) -> tuple:
         return proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired:
         return 124, "", "hook timed out after 300s"
+
+
+def _negotiate_simulate_one_round(state_path: Path, party_base: Path, party: str, mode: str, stance: Optional[str]) -> dict:
+    """Simulate-only helper: run a single counter round in-process."""
+    class _A: pass
+    a = _A()
+    a.base = str(party_base)
+    a.state = str(state_path)
+    a.out = None
+    a.as_party = party
+    a.amendments_file = None
+    a.auto = (mode == "auto")
+    a.agent = (mode == "agent")
+    a.stance = stance
+    a.llm = "auto"
+    a.llm_model = None
+    a.llm_base_url = None
+    a.yes_llm_send = True
+    a.force_unblock = False
+    # Capture stdout JSON of cmd_negotiate_counter via redirect.
+    import io as _io
+    saved_stdout = sys.stdout
+    sys.stdout = _io.StringIO()
+    try:
+        cmd_negotiate_counter(a)
+        return json.loads(sys.stdout.getvalue() or "{}")
+    finally:
+        sys.stdout = saved_stdout
+
+
+def _negotiate_simulate_init(state_path: Path, party_a_base: Path, party_b_name: str, party_b_address: str) -> None:
+    org_policy = _negotiate_load_org_policy(party_a_base)
+    party_a_name = org_policy.get("org_name", "Party A")
+    class _A: pass
+    a = _A()
+    a.base = str(party_a_base)
+    a.template = "mutual"
+    a.out = str(state_path)
+    a.purpose = "(simulation)"
+    a.effective_date = "2026-01-01"
+    a.governing_law = None
+    a.party_a_name = party_a_name
+    a.party_a_address = "(simulated)"
+    a.party_b_name = party_b_name
+    a.party_b_address = "(simulated)"
+    a.disclosing_party = None
+    a.disclosing_party_address = None
+    a.receiving_party = None
+    a.receiving_party_address = None
+    import io as _io
+    saved_stdout = sys.stdout
+    sys.stdout = _io.StringIO()
+    try:
+        cmd_negotiate_init(a)
+    finally:
+        sys.stdout = saved_stdout
+
+
+def cmd_negotiate_simulate(args):
+    """Run both sides of a negotiation on one machine and report the outcome.
+
+    Use case: empirical validation of stance × stance predictions, regression
+    testing of the convergence/blocking logic, and exploring the negotiation
+    dynamics before committing to a real exchange."""
+    party_a_base = Path(args.party_a_base)
+    party_b_base = Path(args.party_b_base)
+    org_a = _negotiate_load_org_policy(party_a_base)
+    org_b = _negotiate_load_org_policy(party_b_base)
+    rules = org_a.get("clause_rules", {}) or {}
+
+    state_path = Path(args.state) if args.state else party_a_base / "_simulate_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    if state_path.exists():
+        state_path.unlink()
+
+    _negotiate_simulate_init(
+        state_path,
+        party_a_base,
+        party_b_name=org_b.get("org_name", "Party B"),
+        party_b_address="(simulated)",
+    )
+
+    # Optionally override stance per side without mutating the user's policy.
+    # We do this by writing a temporary stance into the policy file just for
+    # the duration of each call; restore at the end.
+    def _maybe_apply_stance_override(base: Path, override: Optional[str]):
+        if not override:
+            return None
+        p = base / "config" / "org-policy.json"
+        original = p.read_text()
+        cfg = json.loads(original)
+        cfg.setdefault("defaults", {})["negotiation_stance"] = override
+        p.write_text(json.dumps(cfg))
+        return original
+
+    def _restore(base: Path, original: Optional[str]):
+        if original is None:
+            return
+        (base / "config" / "org-policy.json").write_text(original)
+
+    saved_a = _maybe_apply_stance_override(party_a_base, args.stance_a)
+    saved_b = _maybe_apply_stance_override(party_b_base, args.stance_b)
+
+    trajectory = []
+
+    def _record(round_idx: int):
+        s = _negotiate_load(state_path)
+        cs = s.get("clause_status", {})
+        agreed = sum(1 for v in cs.values() if v.get("status") == "agreed")
+        disputed = sum(1 for v in cs.values() if v.get("status") == "disputed")
+        proposed = sum(1 for v in cs.values() if v.get("status") == "proposed")
+        trajectory.append({
+            "round": round_idx,
+            "proposer": s["rounds"][round_idx - 1]["proposer"],
+            "agreed": agreed,
+            "disputed": disputed,
+            "proposed": proposed,
+            "status": s.get("status"),
+        })
+        return s
+
+    state = _record(1)  # initial round 1
+
+    outcome = "max_rounds_exceeded"
+    rounds_used = 1
+    error: Optional[str] = None
+
+    try:
+        for round_idx in range(2, args.max_rounds + 1):
+            current = _negotiate_load(state_path)
+            if current.get("status") in ("converged", "blocked"):
+                break
+            next_proposer = "b" if current["rounds"][-1]["proposer"] == "a" else "a"
+            base = party_b_base if next_proposer == "b" else party_a_base
+            stance = args.stance_b if next_proposer == "b" else args.stance_a
+            try:
+                _negotiate_simulate_one_round(state_path, base, next_proposer, args.mode, stance)
+            except SystemExit as e:
+                error = f"Round {round_idx} ({next_proposer}) raised: {e}"
+                break
+            state = _record(round_idx)
+            rounds_used = round_idx
+            if state.get("status") == "converged":
+                outcome = "converged"
+                break
+            if state.get("status") == "blocked":
+                outcome = "blocked"
+                break
+        else:
+            outcome = "max_rounds_exceeded"
+    finally:
+        _restore(party_a_base, saved_a)
+        _restore(party_b_base, saved_b)
+
+    # Build winner-per-clause for converged outcomes: who proposed the
+    # final-accepted text for each clause? (last_proposer wins.)
+    winner_per_clause = {}
+    final = _negotiate_load(state_path)
+    for clause, st in final.get("clause_status", {}).items():
+        if st.get("status") == "agreed":
+            winner_per_clause[clause] = st.get("last_proposer")
+
+    report = {
+        "outcome": outcome,
+        "rounds_used": rounds_used,
+        "max_rounds": args.max_rounds,
+        "stances": {
+            "a": args.stance_a or _negotiate_resolve_stance(org_a, None),
+            "b": args.stance_b or _negotiate_resolve_stance(org_b, None),
+        },
+        "mode": args.mode,
+        "final_status": final.get("status"),
+        "final_clause_status": {k: v.get("status") for k, v in final.get("clause_status", {}).items()},
+        "winner_per_clause": winner_per_clause,
+        "trajectory": trajectory,
+        "block_diagnosis": final.get("block_diagnosis"),
+        "error": error,
+        "state_file": str(state_path),
+    }
+    if args.out:
+        Path(args.out).write_text(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    _print_friendly(
+        title=f"Simulation: {report['stances']['a']} × {report['stances']['b']} ({args.mode})",
+        lines=[
+            f"Outcome: {outcome}  ({rounds_used}/{args.max_rounds} rounds)",
+            f"Final status: {final.get('status')}",
+            f"Agreed: {sum(1 for v in final.get('clause_status', {}).values() if v.get('status') == 'agreed')}",
+            f"Disputed: {sum(1 for v in final.get('clause_status', {}).values() if v.get('status') == 'disputed')}",
+        ],
+        next_steps=(
+            ["Stalemate diagnosed. Try the same simulation with one side compromising, or with --mode agent."]
+            if outcome == "blocked" else
+            (["Converged. Trajectory shows how concessions accumulated."] if outcome == "converged" else
+             ["Did not converge within max-rounds. Either bump --max-rounds or investigate the trajectory."])
+        ),
+    )
 
 
 def _negotiate_key_points(state: dict, org_policy: dict) -> list:
@@ -4310,6 +4575,7 @@ def main():
     p_nc.add_argument("--as", dest="as_party", choices=["a", "b"])
     p_nc.add_argument("--amendments-file", help="Manual amendments JSON file: {accept_clauses, counter_amendments, summary}")
     p_nc.add_argument("--auto", action="store_true", help="Deterministic stance-driven amendment generator (no LLM). Uses your policy + negotiation_stance.")
+    p_nc.add_argument("--force-unblock", action="store_true", help="Continue countering even if status is `blocked` (rarely useful)")
     p_nc.add_argument("--stance", choices=sorted(NEGOTIATE_STANCE_DESCRIPTORS.keys()), help="Override negotiation_stance from policy for this round only")
     p_nc.add_argument("--agent", action="store_true", help="Use the configured LLM as a negotiation agent to draft amendments")
     p_nc.add_argument("--llm", choices=["auto", "anthropic", "openai", "ollama", "openai-compatible"], default="auto")
@@ -4328,6 +4594,17 @@ def main():
     p_ns = neg_sub.add_parser("status", help="Show negotiation rounds, per-clause status, signatures")
     p_ns.add_argument("--state", required=True)
     p_ns.set_defaults(func=cmd_negotiate_status)
+
+    p_sim = neg_sub.add_parser("simulate", help="Run both sides on one machine with configurable stances; report converged/blocked/max-rounds outcome (game-theoretic validation)")
+    p_sim.add_argument("--party-a-base", required=True, help="Workspace for Party A (must have config/org-policy.json)")
+    p_sim.add_argument("--party-b-base", required=True, help="Workspace for Party B (must have config/org-policy.json)")
+    p_sim.add_argument("--stance-a", choices=sorted(NEGOTIATE_STANCE_DESCRIPTORS.keys()), help="Override Party A's stance for this simulation")
+    p_sim.add_argument("--stance-b", choices=sorted(NEGOTIATE_STANCE_DESCRIPTORS.keys()), help="Override Party B's stance for this simulation")
+    p_sim.add_argument("--mode", choices=["auto", "agent"], default="auto", help="Counter mode: auto (deterministic) or agent (LLM)")
+    p_sim.add_argument("--max-rounds", type=int, default=20)
+    p_sim.add_argument("--state", help="Where to write the simulation state file (default: <party_a_base>/_simulate_state.json)")
+    p_sim.add_argument("--out", help="Where to write the simulation report JSON")
+    p_sim.set_defaults(func=cmd_negotiate_simulate)
 
     p_nso = neg_sub.add_parser("sign-off", help="Review key points (changed clauses, applied amendments, red flags) and approve before finalize")
     p_nso.add_argument("--base", default=str(Path(__file__).resolve().parent))

@@ -160,6 +160,34 @@ The CLI promises (for the deterministic rule-engine review, i.e. without `--llm`
 
 If you find a determinism bug in the rule-engine path — same input producing different output across runs — that's a high-priority issue. Please open one with reproducer.
 
+## Game-theoretic foundations of `negotiate`
+
+The `negotiate counter --auto` mode is a deterministic bargaining algorithm. Each clause is an independent two-player game; each player's stance defines their acceptance threshold. The convergence rule is the equilibrium condition; the stalemate detector bounds the worst case.
+
+**Per-clause game tree:**
+1. Round 1: Party A drafts, choosing `T_A` (their preferred text) for every clause.
+2. Round 2: Party B sees the document. For each clause:
+   - If the current text is acceptable to B's stance (no red flag fires for compromising/middleground; matches B's preferred for conservative), B *accepts* the clause. `last_proposer` stays A; if A subsequently doesn't re-amend, the clause moves to `agreed`.
+   - Otherwise, B *counters* with `T_B`. The clause moves to `disputed`, `last_proposer` becomes B.
+3. Round 3+: Each party iterates the same logic on the current document state.
+
+**Equilibrium analysis:**
+
+| Stance pair | Equilibrium | Why |
+|---|---|---|
+| compromising × compromising | Pareto-acceptable convergence | Both accept any non-red-flag text; the first draft sticks. |
+| middleground × middleground | Convergence biased toward whoever drafted | Same as above except red-flag clauses get exactly one counter-round. |
+| conservative × {compromising, middleground} | Convergence; conservative's text wins | Asymmetric: the rigid party holds, the flexible one concedes. |
+| conservative × conservative | **No fixed point** | Both demand `T_p` rigidly; documents oscillate `T_A ↔ T_B` without ever reaching `agreed`. |
+
+The conservative × conservative case is the classic "give-no-quarter" bargaining game. There is no Nash equilibrium with mutual acceptance under symmetric strict preferences. The CLI handles this by detecting stalemate (no clause moves to `agreed` for 4 consecutive rounds) and flipping status to `blocked` with a diagnosis pointing at the stuck clauses. Resolution requires changing the game: one party concedes (switch to compromising), introduce a tiebreaker (LLM agent that detects functionally-equivalent text), or escalate to humans.
+
+**Why the LLM agent helps but doesn't solve it:**
+
+Even with `--agent --llm`, conservative × conservative remains structurally unstable. The LLM can occasionally accept the other side's text by recognising it as "functionally equivalent" — but you'd be relying on probabilistic model judgment to break a structural deadlock. Better to surface the stalemate explicitly and prompt the human to change strategy.
+
+`tests/test_negotiate_simulate.py` locks in this matrix as regression tests; running `negotiate simulate` against any pair of workspaces produces a structured report including the per-round agreed/disputed trajectory, winner-per-clause for convergent outcomes, and a stalemate diagnosis when blocked.
+
 ## Optional LLM augmentation
 
 `--llm` on `review` adds a second pass via a user-configured provider (Anthropic, OpenAI, Ollama, or any OpenAI-compatible endpoint). The HTTP transport is `urllib.request` from the stdlib — no `anthropic` or `openai` SDK is imported.
