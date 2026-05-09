@@ -4,7 +4,7 @@ set -euo pipefail
 BASE="$(cd "$(dirname "$0")" && pwd)"
 SRC_DOCX="${1:-}"
 COUNTERPARTY="${2:-}"
-EDITOR_NAME="${3:-Medicus AI Legal}"
+EDITOR_NAME="${3:-NDA Reviewer}"
 
 if [[ -z "$SRC_DOCX" || -z "$COUNTERPARTY" ]]; then
   echo "Usage: $0 /path/to/source.docx 'Counterparty Name' ['Editor Name']"
@@ -57,7 +57,7 @@ SAFE_CP=$(echo "$COUNTERPARTY" | tr ' /' '__' | tr -cd '[:alnum:]_-.')
 OUTDIR="$BASE/output/tracked-redline/$SAFE_CP-$STAMP"
 mkdir -p "$OUTDIR"
 
-OUT_DOCX="$OUTDIR/CDA_${SAFE_CP}_MedicusAI_TRACKED.docx"
+OUT_DOCX="$OUTDIR/CDA_${SAFE_CP}_TRACKED.docx"
 cp "$SRC_DOCX" "$OUT_DOCX"
 
 RUNBOOK="$OUTDIR/TRACKED_CHANGES_RUNBOOK.md"

@@ -2,10 +2,12 @@ import json
 import unittest
 from pathlib import Path
 
-from nda_review_cli import CLAUSE_RULES, review_text
+from nda_review_cli import load_policy_config, review_text
 
 
 def make_playbook():
+    repo = Path(__file__).resolve().parents[1]
+    policy = load_policy_config(repo, "config/default-policy.json")
     return {
         "policy": [
             {
@@ -14,7 +16,7 @@ def make_playbook():
                 "red_flags": cfg["red_flags"],
                 "keywords": cfg["keywords"],
             }
-            for clause, cfg in CLAUSE_RULES.items()
+            for clause, cfg in policy["clause_rules"].items()
         ]
     }
 

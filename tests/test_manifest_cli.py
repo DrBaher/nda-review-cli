@@ -22,7 +22,7 @@ class ManifestCliTests(unittest.TestCase):
                 "--counterparty",
                 "Healthchecks360",
                 "--playbook",
-                str(repo / "output/medicus_nda_playbook.json"),
+                str(repo / "output/nda_playbook.json"),
                 "--files",
                 "README.md",
                 "--out",

@@ -4,7 +4,7 @@ set -euo pipefail
 BASE="$(cd "$(dirname "$0")" && pwd)"
 INPUT="${1:-}"
 COUNTERPARTY="${2:-Counterparty}"
-REVIEWER="${3:-Medicus AI Legal}"
+REVIEWER="${3:-NDA Reviewer}"
 
 if [[ -z "$INPUT" || ! -f "$INPUT" ]]; then
   echo "Usage: $0 /path/to/nda.txt-or-docx 'Counterparty Name' ['Reviewer Name']"
@@ -65,7 +65,7 @@ fi
 "$BASE/nda_review_cli.py" create-manifest \
   --base "$BASE" \
   --counterparty "$COUNTERPARTY" \
-  --playbook "$BASE/output/medicus_nda_playbook.json" \
+  --playbook "$BASE/output/nda_playbook.json" \
   --decisions-source "$LATEST_PACK" \
   --files "${MANIFEST_FILES[@]}" \
   --out "$MANIFEST" >/tmp/nda_run_all_manifest.out

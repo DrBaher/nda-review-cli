@@ -14,7 +14,7 @@ if [[ ! -f "$INPUT" ]]; then
   exit 1
 fi
 
-PLAYBOOK="$BASE/output/medicus_nda_playbook.json"
+PLAYBOOK="${PLAYBOOK:-$BASE/output/nda_playbook.json}"
 if [[ ! -f "$PLAYBOOK" ]]; then
   echo "Playbook missing. Building now..."
   "$BASE/nda_review_cli.py" build-playbook >/dev/null
@@ -28,6 +28,7 @@ OUT_JSON="$OUTDIR/review-$STAMP.json"
 OUT_MD="$OUTDIR/review-$STAMP.md"
 
 "$BASE/nda_review_cli.py" review \
+  --playbook "$PLAYBOOK" \
   --file "$INPUT" \
   --out-json "$OUT_JSON" \
   --out-md "$OUT_MD"

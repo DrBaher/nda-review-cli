@@ -1,18 +1,18 @@
-# NDA Review CLI (Medicus)
+# NDA Review CLI
 
-Builds an NDA negotiation playbook from your extracted Gmail/Drive corpus, then reviews NDA text against that playbook.
+Builds an NDA negotiation playbook from a user's extracted Gmail/Drive corpus, then reviews NDA text against that playbook.
 
 ## Commands
 
 ```bash
-cd /Users/bbot/.openclaw/workspace/projects/nda-review-cli-medicus
+cd /path/to/nda-review-cli
 
 # 1) Build playbook from raw_strict dataset
 ./nda_review_cli.py build-playbook
 
 # Outputs:
-# - output/medicus_nda_playbook.json
-# - output/medicus_nda_playbook.md
+# - output/nda_playbook.json
+# - output/nda_playbook.md
 
 # 2) One-command review for a new NDA (recommended)
 ./review_nda.sh /path/to/nda.txt
@@ -21,7 +21,7 @@ cd /Users/bbot/.openclaw/workspace/projects/nda-review-cli-medicus
 ./nda_review_cli.py review --file /path/to/nda.txt
 
 # Optional: counterparty profile-aware review (loads profiles/<name>.json)
-./nda_review_cli.py review --file /path/to/nda.txt --counterparty "Healthchecks360"
+./nda_review_cli.py review --file /path/to/nda.txt --counterparty "Counterparty Name"
 
 # 4) Review inline text
 ./nda_review_cli.py review --text "Mutual NDA ..."
@@ -36,18 +36,43 @@ cd /Users/bbot/.openclaw/workspace/projects/nda-review-cli-medicus
 ./nda_review_cli.py setup --org-name "Acme" --ingest-files /path/to/nda1.txt
 ```
 
+## Policy configuration
+
+The CLI is generic by default:
+
+- Committed seed policy: `config/default-policy.json`
+- Local user/org override: `config/org-policy.json` (ignored by git)
+- Explicit override: pass `--policy /path/to/policy.json`
+
+`build-playbook` loads policy in this order:
+
+1. `--policy`, if provided
+2. `config/org-policy.json`, if present
+3. `config/default-policy.json`
+4. minimal built-in fallback rules
+
 ## Expected input files
 
-- `data/raw_strict/gmail_baher_strict.json`
-- `data/raw_strict/gmail_personal_strict.json`
-- `data/raw_strict/drive_baher_strict.json`
-- `data/raw_strict/drive_personal_strict.json`
+By default, `build-playbook` looks for:
+
+- `data/raw_strict/gmail_primary.json`
+- `data/raw_strict/gmail_secondary.json`
+- `data/raw_strict/drive_primary.json`
+- `data/raw_strict/drive_secondary.json`
+
+You can override these paths:
+
+```bash
+./nda_review_cli.py build-playbook \
+  --gmail-paths data/raw_strict/gmail_work.json data/raw_strict/gmail_personal.json \
+  --drive-paths data/raw_strict/drive_work.json data/raw_strict/drive_personal.json
+```
 
 ## Notes
 
 - This is a rules-first MVP generated from corpus signals.
-- Use output playbook as a living policy file and refine clause positions over time.
-
+- Use the output playbook as a living policy file and refine clause positions over time.
+- Keep user/org-specific policies, extracted email/Drive data, and review outputs local.
 
 ## One-command pipeline
 
@@ -57,7 +82,6 @@ cd /Users/bbot/.openclaw/workspace/projects/nda-review-cli-medicus
 
 This runs deterministic review, hybrid pack, step3 redline instructions, and step5 find/replace pack.
 If input is `.docx`, it also prepares step4 tracked-redline package.
-
 
 ## Step 2 pass (choose one-by-one or defaults)
 
@@ -95,7 +119,7 @@ Default heuristic (`--mode defaults`):
 # Playbook versioning
 ./nda_review_cli.py playbook-snapshot
 ./nda_review_cli.py playbook-diff --a output/playbook_versions/playbook-A.json --b output/playbook_versions/playbook-B.json --out output/playbook_versions/diff.patch
-./nda_review_cli.py playbook-lock --counterparty "Healthchecks360"
+./nda_review_cli.py playbook-lock --counterparty "Counterparty Name"
 
 # Clause-ready redline draft from review JSON
 ./nda_review_cli.py generate-redlines --review-json output/reviews/review-*.json --out output/reviews/clause-ready-redline.md
@@ -109,7 +133,7 @@ Default heuristic (`--mode defaults`):
 
 ## Quality gates in Step 4
 
-`step4_prepare_tracked_redline.sh` now checks:
+`step4_prepare_tracked_redline.sh` checks:
 - Step 3 redline pack has actionable numbered items
 - Potential AI clause contradiction signals (allow + prohibit)
 

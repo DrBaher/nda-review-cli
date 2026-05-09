@@ -12,68 +12,16 @@ from rule_engine import clause_hit, red_flag_hits
 
 NDA_PAT = re.compile(r"\b(nda|non[-\s]?disclosure|confidentiality agreement|confidential disclosure agreement|cda|mutual nda|geheimhaltungsvereinbarung|vertraulich|vertrauliche informationen)\b", re.I)
 
-CLAUSE_RULES = {
-    "mutuality": {
-        "keywords": [r"unilateral", r"mutual", r"both parties", r"disclosing party", r"receiving party", r"vertragspartner", r"überlasser", r"empfänger"],
-        "preferred": "Mutual NDA preferred; avoid one-sided obligations.",
-        "red_flags": ["unilateral obligations", "only one party bound"],
-    },
+FALLBACK_CLAUSE_RULES = {
     "definition_of_confidential_information": {
-        "keywords": [r"confidential information", r"marked confidential", r"oral disclosure", r"written disclosure", r"vertrauliche information", r"gekennzeichnet", r"mündlich", r"schriftlich"],
-        "preferred": "Broad but clear definition with practical marking/confirmation rules.",
-        "red_flags": ["overly vague definition", "no objective boundary"],
-    },
-    "exceptions": {
-        "keywords": [r"public domain", r"already known", r"independently developed", r"rightfully received", r"required by law", r"allgemein bekannt", r"bereits vorher", r"unabhängig.*entwickelt", r"behördlichen.*anordnung", r"zwingender rechtlicher"],
-        "preferred": "Keep standard carve-outs: public, prior knowledge, independent development, third-party lawful receipt, legal compulsion.",
-        "red_flags": ["missing standard carve-outs", "narrow legal disclosure carve-out"],
-    },
-    "term_and_survival": {
-        "keywords": [r"term", r"survival", r"(\d+) years", r"perpetual", r"indefinite", r"dauer", r"nachwirkung", r"jahre", r"geschäftsgeheimnisse"],
-        "preferred": "Finite confidentiality survival (commonly 2–5 years) unless trade-secret carve-out.",
-        "red_flags": ["perpetual for all info", "unclear survival"],
-    },
-    "use_restrictions": {
-        "keywords": [r"sole purpose", r"evaluate", r"business relationship", r"purpose", r"zweck", r"nur.*verwenden"],
-        "preferred": "Use limited to evaluating/performing the business relationship.",
-        "red_flags": ["too broad use license", "purpose not defined"],
-    },
-    "return_or_destroy": {
-        "keywords": [r"return", r"destroy", r"certify destruction", r"retention", r"zurückzugeben", r"vernichten", r"löschen", r"backup", r"archiv"],
-        "preferred": "Return/destroy on request with limited backup/legal retention carve-out.",
-        "red_flags": ["immediate purge without backup carve-out", "no return/destroy right"],
-    },
-    "residuals": {
-        "keywords": [r"residual", r"unaided memory", r"gedächtnis"],
-        "preferred": "Avoid broad residuals clauses; if present, tightly limit scope.",
-        "red_flags": ["broad residuals rights"],
-    },
-    "non_solicit_non_compete": {
-        "keywords": [r"non-solicit", r"non solicit", r"non-compete", r"non compete", r"hire", r"abwerb", r"wettbewerb"],
-        "preferred": "NDA should avoid hidden non-compete/non-solicit obligations unless explicitly negotiated.",
-        "red_flags": ["embedded non-compete", "overbroad non-solicit"],
-    },
-    "governing_law_jurisdiction": {
-        "keywords": [r"governing law", r"jurisdiction", r"venue", r"courts of", r"österreichischem recht", r"zuständige gericht", r"ausschließlich"],
-        "preferred": "Prefer neutral/favorable jurisdiction; avoid hard-to-enforce foreign venues where possible.",
-        "red_flags": ["exclusive unfavorable venue"],
-    },
-    "liability_and_remedies": {
-        "keywords": [r"injunctive", r"equitable relief", r"damages", r"liability", r"indemn", r"haft", r"gewährleistung", r"istzustand"],
-        "preferred": "Allow injunctive relief but avoid unlimited liability expansion hidden in NDA.",
-        "red_flags": ["uncapped indemnity in NDA", "asymmetric remedies"],
-    },
-    "assignment_and_affiliates": {
-        "keywords": [r"assignment", r"affiliate", r"successors", r"verbundene unternehmen", r"abtret"],
-        "preferred": "Assignment by consent, with affiliate sharing allowed under same obligations when needed.",
-        "red_flags": ["free assignment to unknown third parties"],
-    },
+        "keywords": [r"confidential information"],
+        "preferred": "Use clear definition and objective boundaries.",
+        "red_flags": ["no objective boundary"],
+    }
 }
 
-NEGOTIATION_SIGNAL_PATTERNS = {
-    "pushback": [r"cannot accept", r"not acceptable", r"we cannot", r"please revise", r"redline", r"counter"],
-    "acceptance": [r"looks good", r"agreed", r"approved", r"works for us", r"signed"],
-    "risk": [r"liability", r"indemn", r"unlimited", r"perpetual", r"injunctive", r"exclusive jurisdiction"],
+FALLBACK_SIGNAL_PATTERNS = {
+    "risk": [r"liability", r"indemn", r"unlimited", r"perpetual"],
 }
 
 
@@ -90,6 +38,52 @@ def load_messages(paths):
         if isinstance(data, list):
             out.extend(data)
     return out
+
+
+def load_policy_config(base: Path, policy_path: Optional[str] = None):
+    candidates = []
+    if policy_path:
+        p = Path(policy_path)
+        candidates.append(p if p.is_absolute() else (base / p))
+    org_cfg = base / "config" / "org-policy.json"
+    default_cfg = base / "config" / "default-policy.json"
+    candidates.append(org_cfg)
+    candidates.append(default_cfg)
+
+    default_data = {}
+    if default_cfg.exists():
+        try:
+            default_data = json.loads(default_cfg.read_text())
+        except Exception:
+            default_data = {}
+    default_clause_rules = default_data.get("clause_rules") or FALLBACK_CLAUSE_RULES
+    default_signal_patterns = default_data.get("negotiation_signal_patterns") or FALLBACK_SIGNAL_PATTERNS
+
+    for c in candidates:
+        if not c.exists():
+            continue
+        try:
+            data = json.loads(c.read_text())
+            clause_rules = data.get("clause_rules") or default_clause_rules
+            signal_patterns = data.get("negotiation_signal_patterns") or default_signal_patterns
+            org_name = data.get("org_name") or "Generic Org"
+            return {
+                "path": str(c),
+                "org_name": org_name,
+                "clause_rules": clause_rules,
+                "negotiation_signal_patterns": signal_patterns,
+                "raw": data,
+            }
+        except Exception:
+            continue
+
+    return {
+        "path": None,
+        "org_name": "Generic Org",
+        "clause_rules": default_clause_rules,
+        "negotiation_signal_patterns": default_signal_patterns,
+        "raw": {},
+    }
 
 
 def msg_text(msg):
@@ -203,10 +197,10 @@ def locate_clause(text, keywords):
 
 
 def derive_context_and_recommendation(clause, snippet, preferred_position):
-    context = f"Clause '{clause}' was detected in the agreement text and should be reviewed against Medicus preferred position."
+    context = f"Clause '{clause}' was detected in the agreement text and should be reviewed against the configured preferred position."
     if snippet:
-        context = f"Detected clause text indicates '{clause}' is present. Validate whether this exact wording aligns with Medicus standards."
-    recommendation = f"Align this clause with Medicus position: {preferred_position}"
+        context = f"Detected clause text indicates '{clause}' is present. Validate whether this exact wording aligns with your configured policy standards."
+    recommendation = f"Align this clause with configured position: {preferred_position}"
     return context, recommendation
 
 
@@ -266,17 +260,17 @@ def sha256_file(path: Path):
 
 def suggest_posture(clause, profile):
     if not profile:
-        return "Use Medicus default position."
+        return "Use configured default position."
     prefs = profile.get("clause_preferences", {})
     if clause in prefs:
         return f"Counterparty posture: {prefs[clause]}"
     fallback = profile.get("fallback_posture")
     if fallback:
         return f"Counterparty fallback posture: {fallback}"
-    return "Use Medicus default position."
+    return "Use configured default position."
 
 
-def build_playbook(messages, drive_items):
+def build_playbook(messages, drive_items, clause_rules, signal_patterns, org_name="Generic Org"):
     clause_counts = Counter()
     evidence = defaultdict(list)
     signal_counts = Counter()
@@ -285,12 +279,12 @@ def build_playbook(messages, drive_items):
         txt = msg_text(m)
         ltxt = txt.lower()
 
-        for sig, pats in NEGOTIATION_SIGNAL_PATTERNS.items():
+        for sig, pats in signal_patterns.items():
             if any(re.search(p, ltxt, re.I) for p in pats):
                 signal_counts[sig] += 1
 
         sents = extract_sentences(txt)
-        for clause, cfg in CLAUSE_RULES.items():
+        for clause, cfg in clause_rules.items():
             if any(re.search(k, ltxt, re.I) for k in cfg["keywords"]):
                 clause_counts[clause] += 1
                 if len(evidence[clause]) < 8:
@@ -306,6 +300,7 @@ def build_playbook(messages, drive_items):
 
     playbook = {
         "version": "0.1.0",
+        "org_name": org_name,
         "source_summary": {
             "nda_emails_analyzed": total,
             "drive_docs_flagged": len(drive_items),
@@ -334,7 +329,7 @@ def build_playbook(messages, drive_items):
         },
     }
 
-    for clause, cfg in CLAUSE_RULES.items():
+    for clause, cfg in clause_rules.items():
         playbook["policy"].append({
             "clause": clause,
             "preferred_position": cfg["preferred"],
@@ -421,7 +416,7 @@ def review_text(text, playbook, profile=None):
                 "point": i + 1,
                 "clause": f.get("clause"),
                 "severity": f.get("severity"),
-                "concern": ", ".join(f.get("red_flags") or []) or "Clause deviates from preferred Medicus position.",
+                "concern": ", ".join(f.get("red_flags") or []) or "Clause deviates from configured preferred position.",
                 "clause_snippet": f.get("clause_snippet", ""),
                 "context": f.get("context", ""),
                 "recommendation": f.get("recommendation", ""),
@@ -639,6 +634,8 @@ def cmd_init(args):
         ai_usage = args.ai_policy
         retention = args.retention_carveout
 
+    default_policy = load_policy_config(base, args.default_policy)
+
     if posture == "strict":
         weights = {"legal": 1.4, "commercial": 1.0, "operational": 1.2, "severity_high": 4, "severity_low": 1}
     elif posture == "commercial":
@@ -657,6 +654,8 @@ def cmd_init(args):
             "retention_carveout": retention,
         },
         "risk_weights": weights,
+        "clause_rules": default_policy["clause_rules"],
+        "negotiation_signal_patterns": default_policy["negotiation_signal_patterns"],
     }
 
     profile = {
@@ -686,6 +685,8 @@ def _read_any_text(path: Path):
 
 def cmd_ingest(args):
     base = Path(args.base)
+    policy_cfg = load_policy_config(base, args.policy)
+    clause_rules = policy_cfg["clause_rules"]
     kdir = base / "knowledge"
     kdir.mkdir(parents=True, exist_ok=True)
     proposed_dir = kdir / "proposed"
@@ -693,7 +694,7 @@ def cmd_ingest(args):
 
     paths = [Path(p) for p in args.files]
     sources = []
-    aggregate = {k: {"hits": 0, "examples": []} for k in CLAUSE_RULES.keys()}
+    aggregate = {k: {"hits": 0, "examples": []} for k in clause_rules.keys()}
 
     for p in paths:
         rp = p if p.is_absolute() else (base / p)
@@ -702,7 +703,7 @@ def cmd_ingest(args):
         text = _read_any_text(rp)
         ltxt = text.lower()
         matched = []
-        for clause, cfg in CLAUSE_RULES.items():
+        for clause, cfg in clause_rules.items():
             hit, pats = clause_hit(ltxt, cfg.get("keywords", []))
             if not hit:
                 continue
@@ -718,7 +719,7 @@ def cmd_ingest(args):
             continue
         suggestions.append({
             "clause": clause,
-            "proposed_preference": CLAUSE_RULES[clause]["preferred"],
+            "proposed_preference": clause_rules[clause]["preferred"],
             "confidence": "high" if data["hits"] >= 3 else "medium",
             "seen_count": data["hits"],
             "evidence": data["examples"],
@@ -729,6 +730,7 @@ def cmd_ingest(args):
     out = proposed_dir / f"ingest-suggestions-{ts}.json"
     payload = {
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "policy_path": policy_cfg.get("path"),
         "sources": sources,
         "suggestions": suggestions,
         "note": "Proposed-only. Review before promotion to active policy/profile.",
@@ -751,38 +753,41 @@ def cmd_setup(args):
     init_args.survival_years = args.survival_years
     init_args.ai_policy = args.ai_policy
     init_args.retention_carveout = args.retention_carveout
+    init_args.default_policy = args.default_policy
     cmd_init(init_args)
 
     if args.ingest_files:
         ingest_args = Obj()
         ingest_args.base = args.base
         ingest_args.files = args.ingest_files
+        ingest_args.policy = args.policy
         cmd_ingest(ingest_args)
 
 
 def cmd_build(args):
     base = Path(args.base)
-    gmail_paths = [
-        base / "data/raw_strict/gmail_baher_strict.json",
-        base / "data/raw_strict/gmail_personal_strict.json",
-    ]
-    drive_paths = [
-        base / "data/raw_strict/drive_baher_strict.json",
-        base / "data/raw_strict/drive_personal_strict.json",
-    ]
+    policy_cfg = load_policy_config(base, args.policy)
+    gmail_paths = [base / p for p in args.gmail_paths]
+    drive_paths = [base / p for p in args.drive_paths]
 
     messages = filter_nda(load_messages(gmail_paths))
     drive_items = load_messages(drive_paths)
 
-    playbook = build_playbook(messages, drive_items)
+    playbook = build_playbook(
+        messages,
+        drive_items,
+        policy_cfg["clause_rules"],
+        policy_cfg["negotiation_signal_patterns"],
+        org_name=policy_cfg.get("org_name", "Generic Org"),
+    )
 
-    out_json = base / "output/medicus_nda_playbook.json"
-    out_md = base / "output/medicus_nda_playbook.md"
+    out_json = base / args.out_json
+    out_md = base / args.out_md
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(playbook, indent=2, ensure_ascii=False))
 
     md = [
-        "# Medicus NDA Playbook",
+        f"# {playbook.get('org_name','Generic')} NDA Playbook",
         "",
         f"- NDA emails analyzed: **{playbook['source_summary']['nda_emails_analyzed']}**",
         f"- Drive docs flagged: **{playbook['source_summary']['drive_docs_flagged']}**",
@@ -807,7 +812,7 @@ def cmd_build(args):
         md += [""]
 
     out_md.write_text("\n".join(md))
-    print(json.dumps({"ok": True, "playbook_json": str(out_json), "playbook_md": str(out_md)}, indent=2))
+    print(json.dumps({"ok": True, "policy_path": policy_cfg.get("path"), "playbook_json": str(out_json), "playbook_md": str(out_md)}, indent=2))
 
 
 def cmd_review(args):
@@ -901,16 +906,21 @@ def cmd_review(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Medicus NDA Review CLI")
+    parser = argparse.ArgumentParser(description="NDA Review CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_build = sub.add_parser("build-playbook", help="Build NDA playbook from extracted Gmail/Drive corpus")
     p_build.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_build.add_argument("--policy", help="Policy config path (defaults to config/org-policy.json then config/default-policy.json)")
+    p_build.add_argument("--gmail-paths", nargs="+", default=["data/raw_strict/gmail_primary.json", "data/raw_strict/gmail_secondary.json"])
+    p_build.add_argument("--drive-paths", nargs="+", default=["data/raw_strict/drive_primary.json", "data/raw_strict/drive_secondary.json"])
+    p_build.add_argument("--out-json", default="output/nda_playbook.json")
+    p_build.add_argument("--out-md", default="output/nda_playbook.md")
     p_build.set_defaults(func=cmd_build)
 
     p_review = sub.add_parser("review", help="Review NDA text against generated playbook")
     p_review.add_argument("--base", default=str(Path(__file__).resolve().parent))
-    p_review.add_argument("--playbook", default=str(Path(__file__).resolve().parent / "output/medicus_nda_playbook.json"))
+    p_review.add_argument("--playbook", default=str(Path(__file__).resolve().parent / "output/nda_playbook.json"))
     p_review.add_argument("--counterparty", help="Counterparty profile name (loads profiles/<name>.json)")
     p_review.add_argument("--file")
     p_review.add_argument("--text")
@@ -920,7 +930,7 @@ def main():
 
     p_snap = sub.add_parser("playbook-snapshot", help="Snapshot current playbook version")
     p_snap.add_argument("--base", default=str(Path(__file__).resolve().parent))
-    p_snap.add_argument("--playbook", default=str(Path(__file__).resolve().parent / "output/medicus_nda_playbook.json"))
+    p_snap.add_argument("--playbook", default=str(Path(__file__).resolve().parent / "output/nda_playbook.json"))
     p_snap.set_defaults(func=cmd_playbook_snapshot)
 
     p_diff = sub.add_parser("playbook-diff", help="Diff two playbook snapshots")
@@ -931,7 +941,7 @@ def main():
 
     p_lock = sub.add_parser("playbook-lock", help="Lock current playbook for a specific counterparty")
     p_lock.add_argument("--base", default=str(Path(__file__).resolve().parent))
-    p_lock.add_argument("--playbook", default=str(Path(__file__).resolve().parent / "output/medicus_nda_playbook.json"))
+    p_lock.add_argument("--playbook", default=str(Path(__file__).resolve().parent / "output/nda_playbook.json"))
     p_lock.add_argument("--counterparty", required=True)
     p_lock.set_defaults(func=cmd_playbook_lock)
 
@@ -970,10 +980,12 @@ def main():
     p_init.add_argument("--survival-years", type=int, default=5)
     p_init.add_argument("--ai-policy", default="guardrailed", choices=["restricted", "guardrailed", "permissive"])
     p_init.add_argument("--retention-carveout", default="Allow limited backup/legal retention under continuing confidentiality obligations.")
+    p_init.add_argument("--default-policy", help="Default policy seed file path", default="config/default-policy.json")
     p_init.set_defaults(func=cmd_init)
 
     p_ingest = sub.add_parser("ingest", help="Ingest existing contracts/playbooks and propose policy/profile updates")
     p_ingest.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_ingest.add_argument("--policy", help="Policy config path", default="config/org-policy.json")
     p_ingest.add_argument("--files", nargs="+", required=True)
     p_ingest.set_defaults(func=cmd_ingest)
 
@@ -986,6 +998,8 @@ def main():
     p_setup.add_argument("--survival-years", type=int, default=5)
     p_setup.add_argument("--ai-policy", default="guardrailed", choices=["restricted", "guardrailed", "permissive"])
     p_setup.add_argument("--retention-carveout", default="Allow limited backup/legal retention under continuing confidentiality obligations.")
+    p_setup.add_argument("--default-policy", help="Default policy seed file path", default="config/default-policy.json")
+    p_setup.add_argument("--policy", help="Policy config path for ingest", default="config/org-policy.json")
     p_setup.add_argument("--ingest-files", nargs="+")
     p_setup.set_defaults(func=cmd_setup)
 

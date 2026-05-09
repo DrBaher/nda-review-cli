@@ -4,6 +4,10 @@ output/reviews/
 output/tracked-redline/
 output/*.json
 output/*.txt
+output/*.md
+
+# Local organization-specific policy; commit default-policy.json only
+config/org-policy.json
 
 # env/OS
 .DS_Store
