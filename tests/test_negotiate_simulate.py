@@ -48,7 +48,7 @@ def make_party_b_divergent(td: Path) -> None:
     p.write_text(json.dumps(o))
 
 
-def run_simulation(party_a: Path, party_b: Path, stance_a: str, stance_b: str, max_rounds: int = 10) -> dict:
+def run_simulation(party_a: Path, party_b: Path, stance_a: str, stance_b: str, max_rounds: int = 12) -> dict:
     result = subprocess.run(
         [
             "python3", str(CLI), "negotiate", "simulate",
@@ -71,25 +71,31 @@ def run_simulation(party_a: Path, party_b: Path, stance_a: str, stance_b: str, m
 class StanceMatrixTests(unittest.TestCase):
     """The predicted bargaining-theory outcomes, locked in as a regression."""
 
-    @classmethod
-    def setUpClass(cls):
-        cls.workdir = Path(tempfile.mkdtemp(prefix="nda-sim-"))
-        cls.party_a = cls.workdir / "a"
-        cls.party_b = cls.workdir / "b"
-        quickstart(cls.party_a, "Acme")
-        quickstart(cls.party_b, "Beta")
-        make_party_b_divergent(cls.party_b)
+    def setUp(self):
+        # Per-test fresh workspaces so the few tests that disable fatigue don't
+        # leak state into later tests.
+        self.workdir = Path(tempfile.mkdtemp(prefix="nda-sim-"))
+        self.party_a = self.workdir / "a"
+        self.party_b = self.workdir / "b"
+        quickstart(self.party_a, "Acme")
+        quickstart(self.party_b, "Beta")
+        make_party_b_divergent(self.party_b)
 
-    def test_conservative_x_conservative_blocks(self):
-        """Pure 'never give ground' on both sides → mutual rejection equilibrium → no deal."""
-        report = run_simulation(self.party_a, self.party_b, "conservative", "conservative")
-        self.assertEqual(report["outcome"], "blocked")
-        # Stalemate detector kicks in within max-rounds
-        self.assertLess(report["rounds_used"], 10)
-        # At least some clauses still disputed (the ones where preferred text differs)
-        disputed = sum(1 for v in report["final_clause_status"].values() if v == "disputed")
-        self.assertGreaterEqual(disputed, 1)
-        self.assertIsNotNone(report.get("block_diagnosis"))
+    def test_conservative_x_conservative_resolves_via_fatigue(self):
+        """Pure 'never give ground' would be a no-deal equilibrium under static stance,
+        but fatigue concession force-resolves clauses that bounce too many times.
+        Result: converges (or partial-converges within max-rounds) and at least one
+        round is tagged with +fatigue source."""
+        report = run_simulation(self.party_a, self.party_b, "conservative", "conservative", max_rounds=20)
+        # Either fully converges via fatigue, or hits max_rounds with significant
+        # progress made through fatigue concessions
+        self.assertIn(report["outcome"], ("converged", "max_rounds_exceeded"))
+        agreed = sum(1 for v in report["final_clause_status"].values() if v == "agreed")
+        self.assertGreater(agreed, 0)
+        # At least one round should be tagged as fatigue-driven
+        state = json.loads(Path(report["state_file"]).read_text())
+        fatigue_rounds = [r for r in state["rounds"] if "+fatigue" in r.get("amendment_source", "")]
+        self.assertGreater(len(fatigue_rounds), 0, "Expected at least one fatigue-tagged round")
 
     def test_compromising_x_compromising_converges_fast(self):
         """Both sides accept anything that doesn't fire a red flag — converges in 2-3 rounds."""
@@ -114,9 +120,17 @@ class StanceMatrixTests(unittest.TestCase):
         winner_b = sum(1 for w in report["winner_per_clause"].values() if w == "b")
         self.assertGreater(winner_a, winner_b, f"winners A={winner_a}, B={winner_b}")
 
-    def test_blocked_state_includes_stuck_clauses(self):
-        """When blocked, the diagnosis must list the clauses still disputed."""
+    def test_blocked_state_includes_stuck_clauses_when_fatigue_disabled(self):
+        """With fatigue disabled (max_clause_bounces=0), conservative × conservative
+        falls back to the original behavior: blocked, with a diagnosis listing stuck clauses."""
+        # Disable fatigue on both parties
+        for base in (self.party_a, self.party_b):
+            p = base / "config" / "org-policy.json"
+            o = json.loads(p.read_text())
+            o.setdefault("defaults", {})["max_clause_bounces"] = 0
+            p.write_text(json.dumps(o))
         report = run_simulation(self.party_a, self.party_b, "conservative", "conservative")
+        self.assertEqual(report["outcome"], "blocked")
         diag = report.get("block_diagnosis")
         self.assertIsNotNone(diag)
         self.assertIn("stuck_clauses", diag)
@@ -143,6 +157,12 @@ class StalemateDetectorTests(unittest.TestCase):
         quickstart(party_a, "Acme")
         quickstart(party_b, "Beta")
         make_party_b_divergent(party_b)
+        # Disable fatigue so the stalemate actually blocks rather than self-resolving
+        for base in (party_a, party_b):
+            p = base / "config" / "org-policy.json"
+            o = json.loads(p.read_text())
+            o.setdefault("defaults", {})["max_clause_bounces"] = 0
+            p.write_text(json.dumps(o))
         report = run_simulation(party_a, party_b, "conservative", "conservative")
         self.assertEqual(report["outcome"], "blocked")
         # After block, attempting another counter without --force-unblock is rejected
@@ -175,6 +195,13 @@ class PriorityLogrollingTests(unittest.TestCase):
         quickstart(a, "Acme")
         quickstart(b, "Beta")
         make_party_b_divergent(b)
+        # Disable fatigue for these tests so we can isolate the priority-based
+        # logrolling effect from the fatigue-based force-concession effect.
+        for base in (a, b):
+            p = base / "config" / "org-policy.json"
+            o = json.loads(p.read_text())
+            o.setdefault("defaults", {})["max_clause_bounces"] = 0
+            p.write_text(json.dumps(o))
         if with_priorities:
             # Realistic non-overlapping: conflicting clauses fall into A's
             # concession zone for two of them, B's for one of them. The
@@ -239,6 +266,61 @@ class PriorityLogrollingTests(unittest.TestCase):
             self.assertEqual(winners["return_or_destroy"], "b", f"B should win return_or_destroy (in A's concession zone)")
         if "residuals" in winners:
             self.assertEqual(winners["residuals"], "a", f"A should win residuals (in B's concession zone)")
+
+
+class FatigueConcessionTests(unittest.TestCase):
+    """Tests for the fatigue concession rule."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workdir = Path(tempfile.mkdtemp(prefix="nda-fatigue-"))
+
+    def _setup(self, max_bounces: int):
+        a = self.workdir / f"a-mb{max_bounces}"
+        b = self.workdir / f"b-mb{max_bounces}"
+        quickstart(a, "Acme")
+        quickstart(b, "Beta")
+        make_party_b_divergent(b)
+        for base in (a, b):
+            p = base / "config" / "org-policy.json"
+            o = json.loads(p.read_text())
+            o.setdefault("defaults", {})["max_clause_bounces"] = max_bounces
+            p.write_text(json.dumps(o))
+        return a, b
+
+    def test_fatigue_resolves_conservative_x_conservative(self):
+        """Default max_clause_bounces=4: cons × cons converges via fatigue."""
+        a, b = self._setup(max_bounces=4)
+        report = run_simulation(a, b, "conservative", "conservative", max_rounds=20)
+        # Should converge or at least make significant progress through fatigue
+        agreed = sum(1 for v in report["final_clause_status"].values() if v == "agreed")
+        self.assertGreater(agreed, 7, f"Expected most clauses agreed via fatigue; got {agreed}")
+        # Check the state file for fatigue tags
+        state = json.loads(Path(report["state_file"]).read_text())
+        fatigue_rounds = [r for r in state["rounds"] if "+fatigue" in r.get("amendment_source", "")]
+        self.assertGreater(len(fatigue_rounds), 0)
+        # Each fatigued round should list which clauses were fatigue-conceded
+        for r in fatigue_rounds:
+            self.assertIn("fatigue_concessions", r)
+            self.assertGreater(len(r["fatigue_concessions"]), 0)
+
+    def test_fatigue_disabled_with_max_bounces_zero(self):
+        """max_clause_bounces=0 disables fatigue → cons × cons blocks as before."""
+        a, b = self._setup(max_bounces=0)
+        report = run_simulation(a, b, "conservative", "conservative")
+        self.assertEqual(report["outcome"], "blocked")
+
+    def test_fatigue_only_concedes_bouncing_clauses(self):
+        """A clause that converges normally (no bouncing) should not get fatigue-concessions."""
+        a, b = self._setup(max_bounces=4)
+        report = run_simulation(a, b, "compromising", "compromising", max_rounds=10)
+        # Compromising x compromising converges in round 2; nothing bounces
+        state = json.loads(Path(report["state_file"]).read_text())
+        for r in state["rounds"]:
+            self.assertEqual(
+                r.get("fatigue_concessions") or [], [],
+                f"Round {r['round']} unexpectedly applied fatigue: {r.get('fatigue_concessions')}",
+            )
 
 
 class ConcessionZoneTests(unittest.TestCase):

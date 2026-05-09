@@ -192,9 +192,23 @@ For each clause, the agent applies the rule: **"If this clause is in my concessi
 
 The pathological case is **identical priority orderings + conservative stance** — both parties insist on the same top 70% with no concession overlap. With 11 clauses and 11! ≈ 40M possible orderings, the probability of identical real-world priority lists is vanishingly small, but the CLI still bounds this with the stalemate detector: no clause moves to `agreed` for 4 consecutive rounds → `status: blocked` + `block_diagnosis` listing stuck clauses → human/LLM agent intervention required.
 
+**Fatigue concession — the deterministic deadlock-breaker:**
+
+The remaining cons × cons stalemate (when priorities overlap) is resolved by a per-clause fatigue rule. For each clause, the CLI computes a "bounce count" — the number of consecutive most-recent rounds in which the clause was amended by alternating proposers. Once that count crosses `max_clause_bounces` (default 4), the next proposer is forced to concede that clause regardless of stance, priority, or red flags.
+
+Properties:
+
+- **Deterministic.** Bounce count is a pure function of state; no RNG. Reproducible across runs.
+- **Targeted.** Only clauses that are actively bouncing get force-conceded. Clauses that converge naturally are unaffected.
+- **Audit-friendly.** The amendment source is tagged `auto:<stance>+fatigue` and the sign-off step lists fatigue-conceded clauses as a separate block ("Fatigue concessions — review carefully") so humans always see which clauses were structurally resolved rather than naturally agreed.
+- **Predictable parity rule.** Whoever proposes the breaking round (round K+1) concedes. Since proposers strictly alternate, this is determined by round number.
+- **Tunable / disable-able.** `max_clause_bounces: 0` in policy disables fatigue entirely → reverts to original blocked-state behavior. Useful when stalemates should be surfaced for human escalation rather than auto-resolved.
+
+**Why we don't randomize:** introducing `random.random()` would break the determinism promise that the rest of the architecture depends on (hash chain integrity, golden tests, audit trail). Even seeded randomness adds cognitive overhead — "the RNG flipped this clause" is harder to defend in an audit than "this clause was conceded after 4 rounds of bouncing per the configured threshold". Fatigue concession achieves the same convergence guarantee that mixed-strategy randomization would, with none of the determinism cost.
+
 **Why the LLM agent helps but doesn't structurally solve it:**
 
-Even with `--agent --llm`, conservative × conservative with identical priorities remains structurally unstable. The LLM can occasionally accept the other side's text by recognising it as "functionally equivalent" — but you'd be relying on probabilistic model judgment to break a structural deadlock. Better to surface the stalemate explicitly and prompt the human to change stance or priorities.
+Even with `--agent --llm`, conservative × conservative with identical priorities would remain structurally unstable without fatigue. The LLM can occasionally accept the other side's text by recognising it as "functionally equivalent" — but you'd be relying on probabilistic model judgment to break a structural deadlock. Fatigue applies regardless of mode (manual / `--auto` / `--agent`), so even LLM-driven negotiations are guaranteed to converge within bounded rounds.
 
 **Why the LLM agent helps but doesn't solve it:**
 

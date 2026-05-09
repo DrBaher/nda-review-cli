@@ -197,13 +197,13 @@ The convergence rule is the equilibrium condition; the stalemate detector bounds
 
 | Party A × Party B | Outcome | Rounds | Why |
 |---|---|---|---|
-| **conservative × conservative** (default priorities) | blocked | ~7 (stalemate) | Symmetric strict preferences → no Nash equilibrium with mutual acceptance → oscillating non-convergence |
-| conservative × conservative (**non-overlapping priorities**) | converged or partial-convergence | 3–5 | Logrolling: A concedes its bottom-30% to B, B concedes its bottom-30% to A. Reduces disputes from 3 → 1 in our test fixtures |
-| conservative × middleground | converged | 2–3 | M concedes on non-red-flag clauses, A holds firm and wins the contested ones |
-| conservative × compromising | converged | 2–3 | C concedes everywhere; only A's red flags are negotiated |
-| middleground × middleground | converged | 2 | Both sides only push back on red flags; usually one round resolves them |
-| middleground × compromising | converged | 2 | C concedes; M just polices red flags |
-| compromising × compromising | converged | 2 | Both sides accept everything that doesn't fire a red flag |
+| **conservative × conservative** | converged via fatigue | 6 (3 clauses force-conceded) | Pure-stance equilibrium would block, but **fatigue concession** force-resolves clauses bouncing past `max_clause_bounces` (default 4). Fatigue-conceded clauses are tagged `auto:conservative+fatigue` and surfaced in sign-off for human review. |
+| conservative × conservative, fatigue disabled (`max_clause_bounces=0`) | blocked | ~7 (stalemate) | Original behavior — symmetric strict preferences have no Nash equilibrium → CLI flips to `blocked` with diagnostic. Set `max_clause_bounces=0` to opt out of fatigue and surface deadlocks for human escalation. |
+| conservative × middleground | converged | 2–3 | M concedes on non-red-flag clauses, A holds firm and wins the contested ones. No fatigue needed. |
+| conservative × compromising | converged | 2–3 | C concedes everywhere; only A's red flags are negotiated. No fatigue needed. |
+| middleground × middleground | converged | 2 | Both sides only push back on red flags; usually one round resolves them. |
+| middleground × compromising | converged | 2 | C concedes; M just polices red flags. |
+| compromising × compromising | converged | 2 | Both sides accept everything that doesn't fire a red flag. |
 
 #### How logrolling works in practice
 
@@ -218,6 +218,19 @@ Each party ranks the clauses 1..N during `quickstart` (1 = most important). Stan
 When the agent runs `--auto`, it accepts the current text for any clause in its concession zone (no matter how different from your preferred). It only counters on clauses outside its concession zone, applying the stance's red-flag/diff logic.
 
 **Why two conservatives with different priorities can converge** (and statistically will): with 11 clauses, there are 11! ≈ 40M possible orderings — the chance two real teams have identical priorities is essentially zero. As long as A's bottom-30% covers some of the clauses B insists on (and vice versa), those clauses converge through logrolling. The residual stalemate is bounded to clauses where **both** parties' top priorities overlap; if the overlap is too large, the stalemate detector still trips and the CLI prompts you to change strategy.
+
+#### Fatigue concession — the structural deadlock-breaker
+
+Even when priorities perfectly overlap (the pathological case), the CLI guarantees convergence via **fatigue concession**. Each clause has a "bounce count" — the number of consecutive most-recent rounds in which the clause was amended by alternating proposers. Once a clause's bounce count reaches `max_clause_bounces` (default **4**), the next round's proposer is forced to accept the current text regardless of stance, priority, or red flags.
+
+Fatigue-conceded amendments are tagged `auto:<stance>+fatigue` in the round, and the sign-off step surfaces them as a separate "Fatigue concessions (review carefully)" block — so humans always see which clauses were force-resolved and can override before signing.
+
+**Tuning the fatigue threshold:**
+- Default `max_clause_bounces: 4` in `config/org-policy.json` `defaults` block.
+- Lower values (1–3) → faster convergence but more clauses force-conceded without earning genuine agreement.
+- `max_clause_bounces: 0` disables fatigue entirely → conservative × conservative falls back to the original blocked-state behavior, useful when you want deadlocks surfaced for human escalation rather than auto-resolved.
+
+This is the architectural answer to the "give-no-quarter" bargaining game: rather than randomize (which would break determinism), we apply a deterministic rule that mirrors real-world negotiation — parties get tired of arguing the same clause repeatedly and concede the issues that are bouncing the most. The choice of who concedes is determined by round parity (whoever proposes round K+1 concedes), so it's predictable and auditable.
 
 Run the simulation yourself:
 

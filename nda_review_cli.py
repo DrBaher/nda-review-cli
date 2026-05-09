@@ -3334,6 +3334,7 @@ def _negotiate_recompute_clause_status(state: dict, rules: dict) -> dict:
 
 
 DEFAULT_STALEMATE_THRESHOLD = 4
+DEFAULT_MAX_CLAUSE_BOUNCES = 4
 
 # Per-stance concession-zone size: fraction of clauses (by priority rank,
 # bottom-up) that the agent is willing to concede when not stance-required to
@@ -3344,6 +3345,70 @@ NEGOTIATE_CONCESSION_PCT = {
     "middleground": 0.60,
     "compromising": 0.85,
 }
+
+
+def _negotiate_clause_bounce_count(state: dict, clause: str) -> int:
+    """Count consecutive most-recent rounds in which `clause` was amended,
+    with proposers strictly alternating each round. A clause that was amended
+    only once has bounce count 1. Two parties going back and forth on the
+    same clause increments the count every round; if either party amends
+    something else (or the same party amends twice in a row), the streak
+    breaks. Used by the fatigue-concession rule to detect deadlocks."""
+    rounds = state.get("rounds", [])
+    count = 0
+    last_proposer = None
+    for r in reversed(rounds):
+        amended = {a.get("clause") for a in (r.get("amendments") or []) if a.get("clause")}
+        if clause not in amended:
+            break
+        proposer = r["proposer"]
+        if last_proposer is None:
+            count = 1
+            last_proposer = proposer
+        elif proposer != last_proposer:
+            count += 1
+            last_proposer = proposer
+        else:
+            break
+    return count
+
+
+def _apply_fatigue(proposal: dict, state: dict, max_bounces: int) -> dict:
+    """Apply fatigue concession: any clause that's bouncing >= max_bounces
+    times consecutively is force-conceded by the current proposer regardless
+    of stance / priority / red flags. Mutates proposal in place: clauses move
+    from counter_amendments → accept_clauses, and a `fatigue_concessions`
+    list is added so the round can be tagged auto:<stance>+fatigue."""
+    if max_bounces <= 0:
+        proposal["fatigue_concessions"] = []
+        return proposal
+
+    fatigued = []
+    for am in list(proposal.get("counter_amendments") or []):
+        clause = am.get("clause")
+        if not clause:
+            continue
+        if _negotiate_clause_bounce_count(state, clause) >= max_bounces:
+            fatigued.append(clause)
+
+    if fatigued:
+        fatigued_set = set(fatigued)
+        proposal["counter_amendments"] = [
+            am for am in (proposal.get("counter_amendments") or [])
+            if am.get("clause") not in fatigued_set
+        ]
+        proposal["accept_clauses"] = sorted(set(
+            list(proposal.get("accept_clauses") or []) + fatigued
+        ))
+        # Annotate the rationale on each fatigue concession so the audit trail
+        # explains why this party gave ground on a clause they were countering.
+        existing_summary = proposal.get("summary", "")
+        proposal["summary"] = (existing_summary + " " if existing_summary else "") + (
+            f"Fatigue: conceding {len(fatigued)} clause(s) after >= {max_bounces} consecutive amendment rounds: "
+            f"{', '.join(fatigued)}."
+        )
+    proposal["fatigue_concessions"] = fatigued
+    return proposal
 
 
 def _negotiate_priority_rank(priorities: list, clause: str) -> int:
@@ -3612,6 +3677,8 @@ def cmd_negotiate_counter(args):
 
     stance = _negotiate_resolve_stance(org_policy, getattr(args, "stance", None))
 
+    max_bounces = int((org_policy.get("defaults") or {}).get("max_clause_bounces", DEFAULT_MAX_CLAUSE_BOUNCES))
+
     if args.amendments_file:
         proposal = json.loads(Path(args.amendments_file).read_text())
         proposal_source = "manual"
@@ -3639,6 +3706,14 @@ def cmd_negotiate_counter(args):
             "or --agent --llm <provider> (LLM-driven)."
         )
 
+    # Apply fatigue concession uniformly across all proposal modes — clauses
+    # bouncing >= max_bounces times consecutively get force-conceded by the
+    # current proposer regardless of how the proposal was generated.
+    proposal = _apply_fatigue(proposal, state, max_bounces)
+    fatigue_concessions = proposal.get("fatigue_concessions") or []
+    if fatigue_concessions:
+        proposal_source = proposal_source + "+fatigue"
+
     accept_clauses = proposal.get("accept_clauses") or []
     counter_amendments = proposal.get("counter_amendments") or []
     summary = proposal.get("summary") or ""
@@ -3655,6 +3730,7 @@ def cmd_negotiate_counter(args):
         "signature": {"signer": party, "signed_at": datetime.now(timezone.utc).isoformat(), "method": "json_flag"},
         "amendment_source": proposal_source,
         "stance": stance,
+        "fatigue_concessions": fatigue_concessions,
     }
     if proposal.get("parse_error"):
         new_round["agent_parse_error"] = proposal["parse_error"]
@@ -4011,9 +4087,24 @@ def _negotiate_key_points(state: dict, org_policy: dict) -> list:
                 "new_text_excerpt": (am.get("new_text", "")[:200] + "...") if len(am.get("new_text", "")) > 200 else am.get("new_text", ""),
             })
 
+    # Fatigue concessions deserve explicit human attention — these are
+    # clauses where one party gave ground after a long bounce streak rather
+    # than because of stance/priority logic. Reviewers should sanity-check
+    # them before signing off.
+    fatigue_concessions = []
+    for r in rounds[1:]:
+        for clause in r.get("fatigue_concessions") or []:
+            fatigue_concessions.append({
+                "round": r["round"],
+                "conceded_by": r["proposer"],
+                "clause": clause,
+                "note": "Force-conceded after the clause bounced past the max-bounces threshold.",
+            })
+
     return [
         {"kind": "clause_evolution", "items": key_points},
         {"kind": "applied_amendments", "items": applied_amendments},
+        {"kind": "fatigue_concessions", "items": fatigue_concessions},
     ]
 
 
@@ -4039,16 +4130,23 @@ def cmd_negotiate_signoff(args):
     # Friendly summary to stderr.
     clause_changes = key_points[0]["items"]
     amendments = key_points[1]["items"]
+    fatigue = key_points[2]["items"] if len(key_points) > 2 else []
     summary_lines = [
         f"Clauses changed from initial draft: {sum(1 for c in clause_changes if c['changed_from_initial'])}",
         f"Clauses with active red flags in final text: {sum(1 for c in clause_changes if c['red_flags_active'])}",
         f"Total amendments applied across rounds: {len(amendments)}",
+        f"Fatigue-conceded clauses (force-resolved after bouncing): {len(fatigue)}",
         "",
         "Sources:",
     ]
     src_counts = Counter(a["source"] for a in amendments)
     for src, n in sorted(src_counts.items()):
         summary_lines.append(f"  - {src}: {n}")
+    if fatigue:
+        summary_lines.append("")
+        summary_lines.append("Fatigue concessions (review carefully):")
+        for f in fatigue:
+            summary_lines.append(f"  - round {f['round']}, conceded by Party {f['conceded_by'].upper()}: {f['clause']}")
 
     interactive = sys.stdin.isatty() and not args.yes
     if interactive:
