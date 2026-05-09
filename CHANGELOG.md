@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-09
+
 - Added **`non_negotiable_clauses`** in policy: hard floor — clauses in this list are NEVER fatigue-conceded by your agent and are always force-countered when text differs from your preferred, regardless of stance/priority/concession-zone. Provides absolute-redline semantics for clauses you're unwilling to compromise on. Surfaces in the LLM agent's system prompt and the `block_diagnosis` text when the negotiation deadlocks on a non-negotiable conflict.
 - Added **`negotiate counter --dry-run`** for previewing the proposal (manual / `--auto` / `--agent`) without writing to the state file. Critical safety for `--agent` mode where you want to see what the LLM proposed before committing.
 - Added **`negotiate diff [--from-round N] [--to-round M]`** for clause-by-clause redline view of what changed between two rounds. Optional `--out-md` produces a human-friendly markdown file with code-fenced diff blocks, accepted-clauses list, and fatigue concessions.
