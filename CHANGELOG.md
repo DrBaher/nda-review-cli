@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Added **`negotiate analyze --out-md`** for human-readable markdown post-mortems alongside the JSON dashboard. Includes outcome label + notes, per-round trajectory table, wins-by-party, winner-per-clause, source breakdown, fatigue concessions (flagged for human review), and block diagnosis.
+- Added top-level **`Makefile`** with common dev targets: `make test / smoke / build / install-dev / tutorial / clean`. Reduces newcomer cognitive load and gives a single canonical entry point for the local dev loop.
+- Added **`.github/dependabot.yml`** for monthly GitHub Actions version bumps (auto-PRs labelled `dependencies` + `github-actions`). Set-and-forget; keeps CI workflow steps from going stale.
 - Added **`negotiate validate`** — standalone integrity check (schema version + hash-chain verification + per-round structural shape: round numbering, proposer alternation, signer-matches-proposer, text/text_hash present). Exits 0 on success, 2 on any failure with the specific issue listed. Useful when receiving a state file from another party or after hand-editing.
 - CI: added a **`negotiate-smoke`** job that runs the full negotiate flow end-to-end (init → counter → accept → sign-off → finalize → analyze → validate → simulate) on every push/PR. Catches packaging regressions in the negotiate code path.
 

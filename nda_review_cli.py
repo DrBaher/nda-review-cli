@@ -4394,6 +4394,76 @@ def cmd_negotiate_analyze(args):
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
+    if args.out_md:
+        lines = [
+            f"# Negotiation analysis — `{state.get('negotiation_id', '?')}`",
+            "",
+            f"- **Status**: `{state.get('status')}`",
+            f"- **Outcome**: {outcome_interpretation['label']}",
+            f"- **Rounds**: {len(rounds)}",
+            f"- **Parties**: A = {state['parties'].get('a', {}).get('name')}, B = {state['parties'].get('b', {}).get('name')}",
+            "",
+        ]
+        if outcome_interpretation.get("notes"):
+            lines.append("**Notes:**")
+            lines.append("")
+            for n in outcome_interpretation["notes"]:
+                lines.append(f"- {n}")
+            lines.append("")
+
+        lines.append("## Trajectory")
+        lines.append("")
+        lines.append("| Round | Proposer | Source | Stance | Agreed | Disputed | Proposed |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for t in trajectory:
+            lines.append(
+                f"| {t['round']} | {t['proposer'].upper()} | `{t['amendment_source']}` "
+                f"| {t.get('stance') or '—'} | {t['agreed']} | {t['disputed']} | {t['proposed']} |"
+            )
+        lines.append("")
+
+        lines.append("## Wins by party")
+        lines.append("")
+        lines.append(f"- **Party A** ({state['parties'].get('a', {}).get('name')}): {payload['wins_by_party']['a']} clauses")
+        lines.append(f"- **Party B** ({state['parties'].get('b', {}).get('name')}): {payload['wins_by_party']['b']} clauses")
+        lines.append("")
+
+        if winners:
+            lines.append("## Winner per agreed clause")
+            lines.append("")
+            for clause, who in sorted(winners.items()):
+                lines.append(f"- `{clause}` → Party {(who or '?').upper()}")
+            lines.append("")
+
+        lines.append("## Amendment-source breakdown")
+        lines.append("")
+        for src, n in sorted(src_counter.items()):
+            lines.append(f"- `{src}`: {n} round(s)")
+        lines.append("")
+
+        if fatigue_clauses:
+            lines.append("## Fatigue concessions (force-resolved)")
+            lines.append("")
+            lines.append("These clauses were force-conceded after bouncing past the threshold. **Review carefully** — they were not agreed organically.")
+            lines.append("")
+            for f in fatigue_clauses:
+                lines.append(f"- Round {f['round']}, conceded by Party {f['conceded_by'].upper()}: `{f['clause']}`")
+            lines.append("")
+
+        if state.get("block_diagnosis"):
+            diag = state["block_diagnosis"]
+            lines.append("## Block diagnosis")
+            lines.append("")
+            lines.append(f"- Rounds without progress: {diag.get('rounds_without_progress')}")
+            lines.append(f"- Threshold: {diag.get('threshold')}")
+            lines.append(f"- Stuck clauses: `{', '.join(diag.get('stuck_clauses', []))}`")
+            lines.append("")
+            lines.append(f"> {diag.get('note', '')}")
+            lines.append("")
+
+        Path(args.out_md).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out_md).write_text("\n".join(lines))
+
 
 def _negotiate_interpret_outcome(state: dict, trajectory: list, src_counter: Counter) -> dict:
     """Lightweight game-theoretic interpretation of the negotiation."""
@@ -5175,6 +5245,7 @@ def main():
     p_na = neg_sub.add_parser("analyze", help="Read-only post-hoc dashboard for any state file (trajectory, winners, source breakdown, fatigue summary, outcome interpretation)")
     p_na.add_argument("--base", default=str(Path(__file__).resolve().parent))
     p_na.add_argument("--state", required=True)
+    p_na.add_argument("--out-md", help="Optional markdown output for sharing with humans (the JSON dashboard is hard to read in a meeting)")
     p_na.set_defaults(func=cmd_negotiate_analyze)
 
     p_nv = neg_sub.add_parser("validate", help="Standalone integrity check: schema version + hash-chain verification + per-round structural shape (exits 2 on any failure)")
