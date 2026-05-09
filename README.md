@@ -1,6 +1,6 @@
 # NDA Review CLI
 
-> Review NDAs against your own house playbook — locally, deterministically, and without sending a single clause to a third-party service.
+> Review and draft NDAs against your own house policy — deterministic by default, with optional second-pass LLM adjudication via the model of your choice (Anthropic, OpenAI, Ollama, or any OpenAI-compatible endpoint). Local-first, no telemetry, single-file Python.
 
 [![CI](https://github.com/DrBaher/nda-review-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/DrBaher/nda-review-cli/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -75,6 +75,43 @@ It writes a replayable `config/quickstart-answers.json` so you can re-run non-in
 | **Playbook** | A snapshot built from your corpus + policy: clause-by-clause guidance the review engine consults. Rebuilt on demand. | `output/nda_playbook.json` (+ `.md`) |
 
 Rule of thumb: **edit the policy, let the profile learn, regenerate the playbook.**
+
+## LLM-augmented review (opt-in)
+
+The deterministic rule engine handles every review on its own. Pass `--llm` to run a second pass through a model of your choice — it (1) votes on each rule finding (`agree` / `soften` / `escalate` / `drop`), (2) adds findings the rules missed, and (3) suggests replacement clause language for high-severity items. Results land in `llm_annotations` in the review JSON; the deterministic findings are never overwritten.
+
+```bash
+# Anthropic Claude
+NDA_LLM_API_KEY=sk-ant-... ./nda_review_cli.py review --file nda.txt --why \
+  --llm anthropic --llm-model claude-sonnet-4-6 --yes-llm-send \
+  --out-json output/reviews/with-llm.json --out-md output/reviews/with-llm.md
+
+# OpenAI
+NDA_LLM_API_KEY=sk-... ./nda_review_cli.py review --file nda.txt --why \
+  --llm openai --llm-model gpt-4o-mini --yes-llm-send
+
+# Local Ollama (Qwen, Llama, etc.) — no key required, fully on-prem
+./nda_review_cli.py review --file nda.txt --why \
+  --llm ollama --llm-model qwen2.5:14b --yes-llm-send
+
+# Any OpenAI-compatible endpoint (Qwen API, Together, Groq, vLLM, LM Studio...)
+./nda_review_cli.py review --file nda.txt --why \
+  --llm openai-compatible --llm-base-url https://your-endpoint/v1 \
+  --llm-model your-model --yes-llm-send
+```
+
+Configure once in `config/llm.json` (gitignored — see `config/llm.json.example` for the schema) and you can omit the flags:
+
+```bash
+cp config/llm.json.example config/llm.json
+$EDITOR config/llm.json   # set provider, model, api_key
+./nda_review_cli.py review --file nda.txt --why --llm --yes-llm-send
+```
+
+**Important:**
+- Sending NDA text to a third-party provider may breach the NDA you're reviewing. Use `--llm ollama` or a local `openai-compatible` endpoint for fully on-prem inference.
+- The CLI prints the destination (provider + base URL + model) and asks for confirmation before sending. Pass `--yes-llm-send` or set `NDA_LLM_NO_CONFIRM=1` to skip the prompt in CI.
+- Network I/O is restricted to this code path. Without `--llm`, no contract text leaves the machine. See [SECURITY.md → LLM data flow](SECURITY.md#llm-data-flow-opt-in).
 
 ## Drafting an NDA to send out
 

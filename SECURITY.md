@@ -2,11 +2,29 @@
 
 ## Threat model
 
-`nda-review-cli` is a local, deterministic tool. It does not send contract text, policies, or profiles over the network. The primary security concerns are therefore:
+`nda-review-cli` is a local, deterministic tool by default. The deterministic rule-engine review never sends contract text, policies, or profiles over the network. An optional second-pass LLM review (`--llm`, opt-in) does call out to the provider you configure — see [LLM data flow](#llm-data-flow-opt-in) below.
 
-1. **Data exfiltration** — anything that turns this from a local tool into one that leaks contract content is a critical bug.
+The primary security concerns are:
+
+1. **Data exfiltration** — anything that turns the *deterministic* path into one that leaks contract content is a critical bug. The LLM path is opt-in and gated behind explicit flags + a per-call confirmation prompt.
 2. **Code execution from inputs** — NDAs are untrusted text. Crafted inputs (especially `.docx` or `.pdf` via shell-out extractors) must not lead to code execution or path traversal.
 3. **Policy/profile tampering** — the deterministic guarantee depends on the user owning their `config/` and `profiles/` directories. We document this rather than enforce it in code, but we will not silently merge external policy data.
+4. **API key leakage** — `config/llm.json` is gitignored; tests should never exercise real network calls; the CLI does not log the API key to stdout/stderr.
+
+## LLM data flow (opt-in)
+
+The deterministic review pipeline never makes network calls. The `--llm` flag on `review` is the only code path that does. When set, the CLI:
+
+1. Loads provider, model, base URL, and API key from `config/llm.json` (gitignored), then env vars (`NDA_LLM_PROVIDER`, `NDA_LLM_MODEL`, `NDA_LLM_BASE_URL`, `NDA_LLM_API_KEY`), then the CLI flags (`--llm`, `--llm-model`, `--llm-base-url`).
+2. Prints a confirmation showing **provider + base URL + model** and waits for Enter, unless `--yes-llm-send` is passed or `NDA_LLM_NO_CONFIRM=1` is set. In a non-interactive context (e.g. CI) without explicit consent, the call is refused.
+3. Sends a single HTTPS POST containing the system prompt, the NDA text (truncated to 50,000 characters), and a JSON summary of the deterministic findings. No counterparty profiles, no policies, no API keys belonging to anyone but you.
+4. Stores the response under `llm_annotations` in the review JSON, alongside the deterministic findings — the rule-engine output is never modified by the LLM.
+
+**Implications you should know:**
+
+- Choosing `--llm anthropic` sends NDA text to Anthropic. Choosing `--llm openai` sends to OpenAI. Choosing `--llm ollama` (local) sends to your local Ollama server. Choosing `--llm openai-compatible` with a custom base URL sends to whatever endpoint you point at. The CLI shows the destination before sending.
+- If the NDA you're reviewing is itself confidential to a third party, sending it to a third-party LLM provider may breach that NDA. Use the `ollama` or local `openai-compatible` presets (e.g. vLLM, LM Studio) for fully on-prem inference.
+- API keys live in `config/llm.json` (gitignored) or env vars. They are never written to stdout, not echoed in prompts, not included in review output.
 
 ## Supported versions
 

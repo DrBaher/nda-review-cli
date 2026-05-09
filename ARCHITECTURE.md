@@ -151,13 +151,25 @@ Tweaking these is the cleanest way to retune output without rewriting rules.
 
 ## Determinism guarantees
 
-The CLI promises:
+The CLI promises (for the deterministic rule-engine review, i.e. without `--llm`):
 
 - **No clocks in review output.** Any timestamp in a review file lives in a clearly labelled `reviewed_at` field at the top level, never inside a finding body.
 - **Stable iteration order.** All dicts that flow into output are sorted or constructed in a fixed order.
-- **No randomness.** Nothing in the review pipeline calls `random` or makes a network request.
+- **No randomness.** Nothing in the deterministic review pipeline calls `random` or makes a network request.
 
-If you find a determinism bug — same input producing different output across runs — that's a high-priority issue. Please open one with reproducer.
+If you find a determinism bug in the rule-engine path — same input producing different output across runs — that's a high-priority issue. Please open one with reproducer.
+
+## Optional LLM augmentation
+
+`--llm` on `review` adds a second pass via a user-configured provider (Anthropic, OpenAI, Ollama, or any OpenAI-compatible endpoint). The HTTP transport is `urllib.request` from the stdlib — no `anthropic` or `openai` SDK is imported.
+
+Architectural rules:
+
+- **Opt-in only.** Without `--llm`, the network is never touched.
+- **Side-by-side output.** LLM output lands under `result["llm_annotations"]`. The deterministic `result["findings"]` are never modified.
+- **Confirmation gate.** Before any send, the CLI prints destination details and waits for Enter (or `--yes-llm-send` / `NDA_LLM_NO_CONFIRM=1`). In a non-interactive context without explicit consent, the call is refused.
+- **Provider abstraction.** A single `llm_call(cfg, system, user)` dispatches on `cfg["provider"]` to either `llm_call_anthropic` or `llm_call_openai_compatible`. Adding a new provider means adding one function and an entry to `LLM_PROVIDER_PRESETS`.
+- **Defensive parsing.** `_parse_llm_review_response` tolerates code fences and surrounding prose; on failure it returns a `_parse_error` field instead of raising, and preserves the raw text for debugging.
 
 ## Non-goals
 

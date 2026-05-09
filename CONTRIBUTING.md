@@ -15,9 +15,9 @@ If tests pass on a fresh clone, you're set up.
 ## Ground rules
 
 - **Keep changes focused.** One PR = one concern. A bug fix shouldn't ship with a refactor.
-- **Don't introduce new runtime dependencies.** The CLI is intentionally a single-file script with stdlib only. If you genuinely need a third-party package, raise an issue first.
-- **Determinism is a feature.** Anything that affects review output must be reproducible — no clocks, no randomness, no model calls in the hot path.
-- **All review/redline output stays local.** Don't add network calls, telemetry, or logging that exfiltrates contract content.
+- **Don't introduce new runtime dependencies.** The CLI is intentionally a single-file script with stdlib only. The optional LLM adapters (`--llm`) use `urllib.request` directly — no `anthropic` or `openai` SDK. If you genuinely need a third-party package, raise an issue first.
+- **Deterministic by default.** The rule-engine review must remain reproducible — no clocks, no randomness, no model calls. The `--llm` second pass is opt-in and its output is stored separately under `llm_annotations`; it must never modify the deterministic findings.
+- **No silent network calls.** Network I/O is allowed only behind an explicit `--llm` (or future opt-in) flag, and must show the destination + wait for confirmation unless the user passes `--yes-llm-send` / sets `NDA_LLM_NO_CONFIRM=1`. Telemetry of any kind is not allowed.
 
 ## Development workflow
 

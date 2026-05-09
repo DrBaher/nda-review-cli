@@ -9,6 +9,10 @@ output/*.md
 # Local organization-specific policy; commit default-policy.json only
 config/org-policy.json
 
+# Local LLM provider config (API keys, base URLs); commit llm.json.example only
+config/llm.json
+config/quickstart-answers.json
+
 # env/OS
 .DS_Store
 *.log

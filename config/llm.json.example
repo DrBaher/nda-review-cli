@@ -1,0 +1,42 @@
+{
+  "_comment": "Copy this file to config/llm.json and fill in your provider details. config/llm.json is gitignored.",
+  "_provider_options": ["anthropic", "openai", "ollama", "openai-compatible"],
+
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "api_key": "sk-ant-...",
+
+  "_alternate_examples": {
+    "openai": {
+      "provider": "openai",
+      "model": "gpt-4o-mini",
+      "api_key": "sk-..."
+    },
+    "ollama_local": {
+      "provider": "ollama",
+      "model": "qwen2.5:14b",
+      "base_url": "http://localhost:11434/v1",
+      "api_key": "ollama"
+    },
+    "openai_compatible_qwen": {
+      "provider": "openai-compatible",
+      "model": "qwen-max",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "api_key": "sk-..."
+    },
+    "vllm_or_lmstudio": {
+      "provider": "openai-compatible",
+      "model": "your-served-model",
+      "base_url": "http://localhost:8000/v1",
+      "api_key": "not-required"
+    }
+  },
+
+  "_env_var_overrides": {
+    "NDA_LLM_PROVIDER": "overrides provider",
+    "NDA_LLM_MODEL": "overrides model",
+    "NDA_LLM_API_KEY": "overrides api_key",
+    "NDA_LLM_BASE_URL": "overrides base_url",
+    "NDA_LLM_NO_CONFIRM": "set to 1 to skip the per-call send confirmation"
+  }
+}

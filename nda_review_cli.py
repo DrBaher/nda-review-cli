@@ -1742,6 +1742,284 @@ def cmd_build(args):
     print(json.dumps({"ok": True, "policy_path": policy_cfg.get("path"), "playbook_json": str(out_json), "playbook_md": str(out_md)}, indent=2))
 
 
+# ----------------------------------------------------------------------------
+# Optional LLM augmentation (opt-in via --llm).
+# Adapters use stdlib urllib only — no anthropic/openai SDK dependency.
+# ----------------------------------------------------------------------------
+
+import urllib.request
+import urllib.error
+
+LLM_PROVIDER_PRESETS = {
+    "anthropic": {
+        "base_url": "https://api.anthropic.com/v1",
+        "default_model": "claude-sonnet-4-6",
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4o-mini",
+    },
+    "ollama": {
+        "base_url": "http://localhost:11434/v1",
+        "default_model": "qwen2.5:14b",
+        "default_api_key": "ollama",
+    },
+    "openai-compatible": {
+        "base_url": None,
+        "default_model": None,
+    },
+}
+
+
+def load_llm_config(base: Path, args) -> dict:
+    """Resolution order: CLI args > env vars > config/llm.json > preset defaults."""
+    cfg = {"provider": None, "model": None, "base_url": None, "api_key": None}
+    cfg_path = base / "config" / "llm.json"
+    if cfg_path.exists():
+        try:
+            file_cfg = json.loads(cfg_path.read_text())
+            for k in ("provider", "model", "base_url", "api_key"):
+                if file_cfg.get(k):
+                    cfg[k] = file_cfg[k]
+        except Exception as e:
+            raise SystemExit(f"Could not parse {cfg_path}: {e}")
+
+    env_map = {
+        "provider": "NDA_LLM_PROVIDER",
+        "model": "NDA_LLM_MODEL",
+        "base_url": "NDA_LLM_BASE_URL",
+        "api_key": "NDA_LLM_API_KEY",
+    }
+    for cfg_key, env_key in env_map.items():
+        v = os.environ.get(env_key)
+        if v:
+            cfg[cfg_key] = v
+
+    cli_provider = getattr(args, "llm", None)
+    if cli_provider and cli_provider != "auto":
+        if cfg.get("provider") and cfg["provider"] != cli_provider:
+            # Switching provider on the CLI: clear provider-specific fields so
+            # the new provider's preset fills them in (avoids sending an
+            # Anthropic model name to Ollama, etc.).
+            cfg["model"] = None
+            cfg["base_url"] = None
+        cfg["provider"] = cli_provider
+    if getattr(args, "llm_model", None):
+        cfg["model"] = args.llm_model
+    if getattr(args, "llm_base_url", None):
+        cfg["base_url"] = args.llm_base_url
+
+    provider = cfg.get("provider")
+    if provider in LLM_PROVIDER_PRESETS:
+        preset = LLM_PROVIDER_PRESETS[provider]
+        if not cfg["base_url"] and preset.get("base_url"):
+            cfg["base_url"] = preset["base_url"]
+        if not cfg["model"] and preset.get("default_model"):
+            cfg["model"] = preset["default_model"]
+        if not cfg["api_key"] and preset.get("default_api_key"):
+            cfg["api_key"] = preset["default_api_key"]
+
+    return cfg
+
+
+def _llm_http_post(url: str, body: dict, headers: dict, timeout: int = 120) -> dict:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", **headers},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body_txt = e.read().decode("utf-8", errors="replace")[:500]
+        raise SystemExit(f"LLM HTTP {e.code}: {body_txt}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"LLM transport error: {e.reason}")
+
+
+def llm_call_anthropic(cfg: dict, system: str, user: str, max_tokens: int = 4096) -> dict:
+    if not cfg.get("api_key"):
+        raise SystemExit("Anthropic provider requires api_key (env NDA_LLM_API_KEY or config/llm.json).")
+    url = cfg["base_url"].rstrip("/") + "/messages"
+    headers = {
+        "x-api-key": cfg["api_key"],
+        "anthropic-version": "2023-06-01",
+    }
+    body = {
+        "model": cfg["model"],
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    raw = _llm_http_post(url, body, headers)
+    text = "".join(part.get("text", "") for part in raw.get("content", []) if part.get("type") == "text")
+    usage = raw.get("usage", {}) or {}
+    return {
+        "text": text,
+        "model": raw.get("model"),
+        "usage": {
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+        },
+    }
+
+
+def llm_call_openai_compatible(cfg: dict, system: str, user: str, max_tokens: int = 4096) -> dict:
+    if not cfg.get("base_url"):
+        raise SystemExit("OpenAI-compatible providers require base_url (env NDA_LLM_BASE_URL or config/llm.json).")
+    url = cfg["base_url"].rstrip("/") + "/chat/completions"
+    headers = {}
+    if cfg.get("api_key"):
+        headers["Authorization"] = f"Bearer {cfg['api_key']}"
+    body = {
+        "model": cfg["model"],
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    raw = _llm_http_post(url, body, headers)
+    choices = raw.get("choices") or []
+    text = ""
+    if choices:
+        msg = choices[0].get("message") or {}
+        text = msg.get("content") or ""
+    usage = raw.get("usage", {}) or {}
+    return {
+        "text": text,
+        "model": raw.get("model"),
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens"),
+            "output_tokens": usage.get("completion_tokens"),
+        },
+    }
+
+
+def llm_call(cfg: dict, system: str, user: str, max_tokens: int = 4096) -> dict:
+    provider = (cfg.get("provider") or "").lower()
+    if provider == "anthropic":
+        return llm_call_anthropic(cfg, system, user, max_tokens)
+    if provider in ("openai", "ollama", "openai-compatible"):
+        return llm_call_openai_compatible(cfg, system, user, max_tokens)
+    raise SystemExit(
+        f"Unknown LLM provider: {provider!r}. "
+        "Supported: anthropic, openai, ollama, openai-compatible."
+    )
+
+
+LLM_REVIEW_SYSTEM_PROMPT = (
+    "You are an experienced NDA reviewer assisting a deterministic rule engine. "
+    "Your job is to (1) vote on each rule-engine finding, (2) add findings the rules missed, "
+    "and (3) suggest replacement clause language for high-severity issues. "
+    "Reply ONLY with a single JSON object matching this schema:\n"
+    "{\n"
+    '  "votes": [{"finding_index": int, "vote": "agree"|"soften"|"escalate"|"drop", "rationale": str}],\n'
+    '  "additional_findings": [{"clause": str, "severity": "high"|"low", "concern": str, "evidence": str}],\n'
+    '  "clause_suggestions": [{"clause": str, "suggested_text": str, "reason": str}]\n'
+    "}\n"
+    "Do not include any commentary outside the JSON object."
+)
+
+
+def _build_llm_review_user_prompt(text: str, result: dict, max_chars: int = 50000) -> str:
+    nda = text if len(text) <= max_chars else (text[:max_chars] + "\n[...truncated for length...]")
+    findings_summary = []
+    for i, f in enumerate(result.get("findings", [])):
+        findings_summary.append({
+            "finding_index": i,
+            "clause": f.get("clause"),
+            "severity": f.get("severity"),
+            "concern": f.get("concern") or f.get("preferred_position"),
+            "snippet": (f.get("clause_snippet") or "")[:300],
+        })
+    return (
+        "## NDA TEXT\n\n"
+        f"{nda}\n\n"
+        "## DETERMINISTIC FINDINGS (from rule engine)\n\n"
+        f"{json.dumps(findings_summary, ensure_ascii=False, indent=2)}\n\n"
+        "Reply with the JSON schema described in the system prompt."
+    )
+
+
+def _parse_llm_review_response(text: str) -> dict:
+    """Defensive JSON parse: tolerate code fences and surrounding prose."""
+    if not text:
+        return {"votes": [], "additional_findings": [], "clause_suggestions": [], "_parse_error": "empty response"}
+    candidate = text.strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, re.S)
+    if fence:
+        candidate = fence.group(1)
+    else:
+        first = candidate.find("{")
+        last = candidate.rfind("}")
+        if first != -1 and last != -1 and last > first:
+            candidate = candidate[first : last + 1]
+    try:
+        parsed = json.loads(candidate)
+    except Exception as e:
+        return {
+            "votes": [],
+            "additional_findings": [],
+            "clause_suggestions": [],
+            "_parse_error": f"json decode failed: {e}",
+            "_raw_text": text[:1000],
+        }
+    return {
+        "votes": parsed.get("votes") or [],
+        "additional_findings": parsed.get("additional_findings") or [],
+        "clause_suggestions": parsed.get("clause_suggestions") or [],
+    }
+
+
+def _confirm_llm_send(cfg: dict, yes: bool) -> None:
+    if yes or os.environ.get("NDA_LLM_NO_CONFIRM") == "1":
+        return
+    if not sys.stderr.isatty() or not sys.stdin.isatty():
+        # Non-interactive without explicit consent — fail closed.
+        raise SystemExit(
+            "Refusing to send NDA text to an LLM in a non-interactive context "
+            "without explicit consent. Pass --yes-llm-send or set NDA_LLM_NO_CONFIRM=1."
+        )
+    print(
+        f"\n  About to send NDA text to provider={cfg.get('provider')} "
+        f"base_url={cfg.get('base_url')} model={cfg.get('model')}.",
+        file=sys.stderr,
+    )
+    print("  Press Enter to continue, or Ctrl-C to abort.", file=sys.stderr)
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit("Aborted by user.")
+
+
+def llm_augment_review(result: dict, source_text: str, cfg: dict, yes_send: bool) -> dict:
+    if not cfg.get("provider"):
+        raise SystemExit(
+            "--llm requires a provider. Set it in config/llm.json, env NDA_LLM_PROVIDER, "
+            "or pass --llm <anthropic|openai|ollama|openai-compatible>."
+        )
+    if not cfg.get("model"):
+        raise SystemExit("LLM model not set. Provide via config/llm.json, NDA_LLM_MODEL, or --llm-model.")
+    _confirm_llm_send(cfg, yes_send)
+    user_prompt = _build_llm_review_user_prompt(source_text, result)
+    raw = llm_call(cfg, LLM_REVIEW_SYSTEM_PROMPT, user_prompt)
+    parsed = _parse_llm_review_response(raw["text"])
+    return {
+        "provider": cfg.get("provider"),
+        "model": raw.get("model") or cfg.get("model"),
+        "base_url": cfg.get("base_url"),
+        "usage": raw.get("usage", {}),
+        "votes": parsed.get("votes", []),
+        "additional_findings": parsed.get("additional_findings", []),
+        "clause_suggestions": parsed.get("clause_suggestions", []),
+        "parse_error": parsed.get("_parse_error"),
+    }
+
+
 def cmd_review(args):
     playbook = json.loads(Path(args.playbook).read_text())
     base = Path(args.base)
@@ -1766,6 +2044,11 @@ def cmd_review(args):
         source_review_file = args.out_json or "(stdout-only-review)"
         learning_result = learn_profile_from_review(base, args.counterparty, result, source_review_file)
         result["profile_learning"] = learning_result
+
+    if getattr(args, "llm", None):
+        llm_cfg = load_llm_config(base, args)
+        result["llm_annotations"] = llm_augment_review(result, text, llm_cfg, getattr(args, "yes_llm_send", False))
+        result["llm_used"] = True
 
     if args.out_json:
         out_json = Path(args.out_json)
@@ -1847,6 +2130,39 @@ def cmd_review(args):
             lines.append("")
         if learning_result:
             lines += ["", "## Profile Learning", "", f"- Profile updated: `{learning_result['profile_path']}`", f"- Changed fields: {', '.join(learning_result['changed_fields'])}"]
+        if result.get("llm_annotations"):
+            ann = result["llm_annotations"]
+            lines += [
+                "",
+                "## LLM Annotations (opt-in, second-pass)",
+                "",
+                f"- Provider: `{ann.get('provider')}` · model: `{ann.get('model')}`",
+                f"- Tokens: in={ann.get('usage', {}).get('input_tokens')} / out={ann.get('usage', {}).get('output_tokens')}",
+            ]
+            if ann.get("parse_error"):
+                lines.append(f"- _Parse error_: {ann['parse_error']} (raw text preserved in JSON)")
+            if ann.get("votes"):
+                lines += ["", "### Votes on rule-engine findings", ""]
+                for v in ann["votes"]:
+                    idx = v.get("finding_index")
+                    clause = ""
+                    if isinstance(idx, int) and 0 <= idx < len(result.get("findings", [])):
+                        clause = result["findings"][idx].get("clause", "")
+                    lines.append(f"- _(LLM)_ finding #{idx} `{clause}` → **{v.get('vote')}** — {v.get('rationale','')}")
+            if ann.get("additional_findings"):
+                lines += ["", "### Additional findings (LLM)", ""]
+                for af in ann["additional_findings"]:
+                    lines.append(f"- _(LLM)_ **{af.get('clause','')}** ({af.get('severity','')}): {af.get('concern','')}")
+                    if af.get("evidence"):
+                        lines.append(f"  - Evidence: {af['evidence']}")
+            if ann.get("clause_suggestions"):
+                lines += ["", "### Suggested replacement clause language (LLM)", ""]
+                for cs in ann["clause_suggestions"]:
+                    lines.append(f"- _(LLM)_ **{cs.get('clause','')}** — {cs.get('reason','')}")
+                    if cs.get("suggested_text"):
+                        lines.append(f"  ```")
+                        lines.append(f"  {cs['suggested_text']}")
+                        lines.append(f"  ```")
         out_md.write_text("\n".join(lines))
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -2846,6 +3162,16 @@ def main():
     p_review.add_argument("--learn-profile", action="store_true", help="Write deterministic counterparty profile updates from this review")
     p_review.add_argument("--scoring-profile", help="Scoring profile name")
     p_review.add_argument("--scoring-profiles", help="Path to scoring profiles JSON")
+    p_review.add_argument(
+        "--llm",
+        nargs="?",
+        const="auto",
+        choices=["auto", "anthropic", "openai", "ollama", "openai-compatible"],
+        help="Opt-in: also run a second-pass LLM review (votes + new findings + clause suggestions). 'auto' uses provider from config/llm.json or NDA_LLM_PROVIDER.",
+    )
+    p_review.add_argument("--llm-model", help="Override the LLM model id (e.g. claude-sonnet-4-6, gpt-4o-mini, qwen2.5:14b)")
+    p_review.add_argument("--llm-base-url", help="Override the LLM base URL (useful for openai-compatible / Ollama / local servers)")
+    p_review.add_argument("--yes-llm-send", action="store_true", help="Skip the per-call confirmation that NDA text is being sent to the LLM provider")
     p_review.set_defaults(func=cmd_review)
 
     p_snap = sub.add_parser("playbook-snapshot", help="Snapshot current playbook version")
