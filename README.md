@@ -28,6 +28,7 @@ Sending NDAs to a SaaS reviewer means leaking your counterparty list, your fallb
 - **Builds a playbook** from your historical Gmail/Drive corpus (or any folder of contracts).
 - **Reviews NDAs** clause-by-clause against that playbook with severity-scored findings and explainability evidence.
 - **Drafts NDAs to send out** using your house clause language — mutual or one-way disclosing — straight to `.md` + `.docx`.
+- **Negotiates between two parties** turn by turn, each side running their own CLI + policy + optional LLM agent, with a tamper-evident state file passed by any channel (email, Drive, Git).
 - **Generates redlines** ready to drop into Word, plus tracked-changes packs and Office Script bridges.
 - **Learns counterparty profiles** deterministically so repeat parties get a consistent stance.
 
@@ -136,6 +137,56 @@ $EDITOR config/llm.json   # set provider, model, api_key
 - Sending NDA text to a third-party provider may breach the NDA you're reviewing. Use `--llm ollama` or a local `openai-compatible` endpoint for fully on-prem inference.
 - The CLI prints the destination (provider + base URL + model) and asks for confirmation before sending. Pass `--yes-llm-send` or set `NDA_LLM_NO_CONFIRM=1` to skip the prompt in CI.
 - Network I/O is restricted to this code path. Without `--llm`, no contract text leaves the machine. See [SECURITY.md → LLM data flow](SECURITY.md#llm-data-flow-opt-in).
+
+## Negotiating between two parties
+
+When both sides have their own CLI install, they can co-negotiate an NDA without sending text through any third-party service. The protocol is file-based: each party signs one round at a time and passes the state file to the other side via any channel (email, shared Drive, private Git repo). Each side's LLM agent (if enabled) drafts amendments aligned with that side's `config/org-policy.json`; humans always review and sign each round before it goes back.
+
+```bash
+# Party A initializes
+nda-review-cli negotiate init \
+  --template mutual \
+  --party-a-name "Acme Inc." --party-a-address "1 Main" \
+  --party-b-name "Beta LLC"  --party-b-address "2 Side" \
+  --purpose "evaluating a partnership" \
+  --effective-date 2026-05-09 \
+  --out negotiation.json
+# → emits negotiation.json (round 1, signed by A) — send to Party B
+
+# Party B reviews against their own policy (read-only)
+nda-review-cli negotiate review --state negotiation.json
+
+# Party B drafts a counter via LLM agent (or supplies --amendments-file for manual)
+nda-review-cli negotiate counter --state negotiation.json \
+  --as b --agent --llm anthropic --yes-llm-send
+# → updates negotiation.json (round 2, signed by B) — send to Party A
+
+# Party A accepts (or counters again)
+nda-review-cli negotiate accept --state negotiation.json --as a
+# → round 3, signed by A. clause_status now agreed for all touched clauses → status="converged"
+
+# Status check at any point
+nda-review-cli negotiate status --state negotiation.json
+
+# Finalize: emit the agreed .md + .docx, and (optionally) hand off to your
+# external docx2pdf and sign-CLI tooling via config/integrations.json hooks
+nda-review-cli negotiate finalize \
+  --state negotiation.json \
+  --out-md output/agreed.md \
+  --out-docx output/agreed.docx \
+  --to-pdf --sign
+```
+
+**How it works:**
+- **State file** is a single JSON document with all rounds, each round's full text, a SHA-256 hash chain (each round's hash incorporates the previous round's hash → tamper evidence), and per-round signatures (currently a JSON flag).
+- **The agent** is `review --llm` repurposed: it sees your party's policy + the latest amendments and proposes which clauses to accept and which to counter. It never signs on your behalf.
+- **Convergence** happens when no clause is `disputed` and the latest two rounds were signed by alternating parties (one drafted/countered, the other accepted).
+- **Finalize hooks** (`config/integrations.json`, gitignored) let you delegate PDF conversion and signing to your own tools — for example a `docx2pdf` repo and a `sign-CLI` repo. The CLI passes `{input_docx}`, `{output_pdf}`, `{negotiation_id}`, `{party_a_name}`, `{party_b_name}` placeholders to your configured commands. See [`config/integrations.json.example`](config/integrations.json.example).
+
+**Safety rails:**
+- Humans always run `negotiate accept` / `negotiate counter` to advance a round; the LLM agent never signs.
+- `--agent` requires `--yes-llm-send` (or `NDA_LLM_NO_CONFIRM=1` env) in non-interactive contexts to prevent accidental contract leaks to a provider.
+- The hash chain is verified on every load — tampering between rounds is detected.
 
 ## Drafting an NDA to send out
 

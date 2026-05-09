@@ -2976,6 +2976,610 @@ def cmd_draft(args):
     )
 
 
+# ----------------------------------------------------------------------------
+# Negotiate: two-party turn-taking NDA negotiation with LLM agent assistance.
+# File-based protocol — no networking. Each round is signed by exactly one
+# party. Tamper evidence via a per-round SHA-256 chain.
+# ----------------------------------------------------------------------------
+
+NEGOTIATE_SCHEMA_VERSION = "0.1"
+
+
+def _negotiate_hash(round_text: str, prev_hash: str) -> str:
+    h = hashlib.sha256()
+    h.update(prev_hash.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(round_text.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _negotiate_load(path: Path) -> dict:
+    if not path.exists():
+        raise SystemExit(f"Negotiation state file not found: {path}")
+    state = json.loads(path.read_text())
+    if state.get("schema_version") != NEGOTIATE_SCHEMA_VERSION:
+        raise SystemExit(
+            f"Unsupported negotiation schema version: {state.get('schema_version')!r}. "
+            f"Expected {NEGOTIATE_SCHEMA_VERSION}."
+        )
+    # Validate hash chain end-to-end.
+    prev = ""
+    for r in state.get("rounds", []):
+        expected = _negotiate_hash(r["text"], prev)
+        if r.get("text_hash") != expected:
+            raise SystemExit(
+                f"Hash-chain mismatch at round {r.get('round')}. "
+                "State file may have been tampered with."
+            )
+        prev = expected
+    return state
+
+
+def _negotiate_save(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False))
+
+
+def _negotiate_resolve_party(state: dict, override: Optional[str], base: Path) -> str:
+    """Returns 'a' or 'b'. Override wins; otherwise auto-match org_name from local policy."""
+    if override in ("a", "b"):
+        return override
+    org_policy_path = base / "config" / "org-policy.json"
+    if org_policy_path.exists():
+        org = json.loads(org_policy_path.read_text()).get("org_name", "")
+        for key in ("a", "b"):
+            party_name = (state["parties"].get(key) or {}).get("name", "")
+            if party_name and org.strip().lower() == party_name.strip().lower():
+                return key
+    raise SystemExit(
+        "Could not auto-detect which party you are. Pass `--as a` or `--as b`, "
+        "or set `org_name` in config/org-policy.json to match one of the negotiation parties."
+    )
+
+
+def _negotiate_other(party: str) -> str:
+    return "b" if party == "a" else "a"
+
+
+def _negotiate_clause_status_init(rules: dict) -> dict:
+    return {clause: {"status": "pending", "agreed_in_round": None, "last_proposer": None} for clause in rules}
+
+
+def _negotiate_apply_amendments(text: str, amendments: list) -> str:
+    """Replace clause text in the markdown body. Each amendment has clause / old_text / new_text.
+    Falls back to appending a clarifying note if old_text not found."""
+    out = text
+    for a in amendments:
+        old = a.get("old_text", "")
+        new = a.get("new_text", "")
+        if old and old in out:
+            out = out.replace(old, new, 1)
+        else:
+            # Couldn't find exact text — append a note so the change isn't silently lost.
+            out += f"\n\n<!-- amendment to {a.get('clause','?')}: {new} -->\n"
+    return out
+
+
+def _negotiate_extract_clause_text(full_text: str, clause: str) -> str:
+    """Best-effort extraction: find a ## section whose heading mentions clause keywords.
+    Returns the paragraph after the heading, or empty string."""
+    keyword_map = {
+        "definition_of_confidential_information": "Definition of Confidential",
+        "exceptions": "Exceptions",
+        "use_restrictions": "Use Restrictions",
+        "term_and_survival": "Term and Survival",
+        "return_or_destroy": "Return or Destruction",
+        "residuals": "Residual Knowledge",
+        "assignment_and_affiliates": "Permitted Disclosures",
+        "governing_law_jurisdiction": "Governing Law",
+        "liability_and_remedies": "Liability and Remedies",
+        "non_solicit_non_compete": "Non-Solicitation",
+    }
+    needle = keyword_map.get(clause)
+    if not needle:
+        return ""
+    pat = re.compile(rf"^##\s+\d*\.?\s*{re.escape(needle)}.*?$\n+(.*?)(?=^##\s|\Z)", re.M | re.S)
+    m = pat.search(full_text)
+    return m.group(1).strip() if m else ""
+
+
+NEGOTIATE_LLM_AGENT_SYSTEM = (
+    "You are an NDA negotiation agent representing one party. You receive: "
+    "(1) the current full NDA text, (2) your party's house policy (clause-by-clause "
+    "preferred language and red flags), (3) the latest round of amendments proposed "
+    "by the other party. Your job is to propose your party's response: which other-party "
+    "amendments to accept, which to counter, and any new amendments your policy requires. "
+    "Be concise and align language with your party's preferred clause text where possible. "
+    "Reply ONLY with a JSON object matching this schema:\n"
+    "{\n"
+    '  "accept_clauses": [string],            # clauses where the other side\'s proposal is acceptable\n'
+    '  "counter_amendments": [{"clause": str, "old_text": str, "new_text": str, "rationale": str}],\n'
+    '  "summary": string                      # one-paragraph negotiation note\n'
+    "}\n"
+    "Do not include any commentary outside the JSON object."
+)
+
+
+def _negotiate_agent_propose(state: dict, party: str, org_policy: dict, llm_cfg: dict) -> dict:
+    """Run the LLM agent against the current state to propose the next round's amendments."""
+    rules = org_policy.get("clause_rules", {}) or {}
+    pref_lines = "\n".join(
+        f"- {clause}: {cfg.get('preferred','')}"
+        for clause, cfg in rules.items()
+    )
+    last_round = state["rounds"][-1]
+    last_amendments = last_round.get("amendments") or []
+    user_prompt = (
+        f"## Your party: {state['parties'][party]['name']} ({state['parties'][party].get('role','')})\n\n"
+        f"## Your house policy preferred language by clause\n\n{pref_lines}\n\n"
+        f"## Current full NDA text\n\n{last_round['text']}\n\n"
+        f"## Latest amendments proposed by the other party (round {last_round['round']})\n\n"
+        f"{json.dumps(last_amendments, ensure_ascii=False, indent=2)}\n\n"
+        f"Reply with the JSON schema described in the system prompt."
+    )
+    raw = llm_call(llm_cfg, NEGOTIATE_LLM_AGENT_SYSTEM, user_prompt)
+    parsed = _parse_llm_review_response(raw["text"])
+    # Reuse the same defensive parser; it tolerates extra keys.
+    try:
+        obj = json.loads(raw["text"]) if not parsed.get("_parse_error") else None
+    except Exception:
+        obj = None
+    if obj and isinstance(obj, dict):
+        return {
+            "accept_clauses": obj.get("accept_clauses") or [],
+            "counter_amendments": obj.get("counter_amendments") or [],
+            "summary": obj.get("summary") or "",
+            "model": raw.get("model") or llm_cfg.get("model"),
+            "usage": raw.get("usage", {}),
+        }
+    return {
+        "accept_clauses": [],
+        "counter_amendments": [],
+        "summary": "",
+        "parse_error": parsed.get("_parse_error"),
+        "raw_text": (raw.get("text") or "")[:1000],
+    }
+
+
+def _negotiate_recompute_clause_status(state: dict, rules: dict) -> dict:
+    """Walk all rounds, derive per-clause status.
+
+    Round 1 by Party A is the initial draft — all clauses are implicitly proposed by A.
+    Subsequent rounds may amend a clause (sets last_proposer to that round's proposer)
+    or accept it (counter-party agreement → status becomes 'agreed')."""
+    status = _negotiate_clause_status_init(rules)
+    if state.get("rounds"):
+        initial = state["rounds"][0]
+        for clause in status:
+            status[clause]["last_proposer"] = initial["proposer"]
+            status[clause]["status"] = "proposed"
+    for r in state["rounds"][1:]:
+        proposer = r["proposer"]
+        for clause in r.get("accept_clauses", []) or []:
+            if clause in status and status[clause]["last_proposer"] != proposer:
+                status[clause]["status"] = "agreed"
+                status[clause]["agreed_in_round"] = r["round"]
+        for am in r.get("amendments", []) or []:
+            clause = am.get("clause")
+            if clause and clause in status:
+                status[clause]["status"] = "disputed"
+                status[clause]["last_proposer"] = proposer
+                status[clause]["agreed_in_round"] = None
+    return status
+
+
+def _negotiate_is_converged(state: dict) -> bool:
+    """Converged when no clause is currently `disputed` and the latest two rounds were
+    signed by alternating parties (one drafted/countered, the other accepted)."""
+    cs = state.get("clause_status", {})
+    if not cs:
+        return False
+    if any(s.get("status") == "disputed" for s in cs.values()):
+        return False
+    if not any(s.get("status") == "agreed" for s in cs.values()):
+        return False  # No clauses have been agreed by both sides yet.
+    last_two = state["rounds"][-2:]
+    if len(last_two) < 2:
+        return False
+    return last_two[0]["proposer"] != last_two[1]["proposer"]
+
+
+def _negotiate_load_org_policy(base: Path) -> dict:
+    p = base / "config" / "org-policy.json"
+    if not p.exists():
+        raise SystemExit(
+            "config/org-policy.json not found. Run `nda-review-cli quickstart` or `setup --quick --yes` first."
+        )
+    return json.loads(p.read_text())
+
+
+def cmd_negotiate_init(args):
+    base = Path(args.base)
+    org_policy = _negotiate_load_org_policy(base)
+    rules = org_policy.get("clause_rules", {}) or {}
+
+    # Build the initial draft using the existing draft pipeline.
+    repo = Path(__file__).resolve().parent
+    template_text = (repo / DRAFT_TEMPLATES[args.template]).read_text()
+    profile_path = base / "profiles" / "default.json"
+    profile = json.loads(profile_path.read_text()) if profile_path.exists() else {}
+
+    class _A: pass
+    da = _A()
+    da.template = args.template
+    da.party_a = args.party_a_name if args.template == "mutual" else args.disclosing_party
+    da.party_a_address = args.party_a_address if args.template == "mutual" else args.disclosing_party_address
+    da.party_b = args.party_b_name if args.template == "mutual" else args.receiving_party
+    da.party_b_address = args.party_b_address if args.template == "mutual" else args.receiving_party_address
+    da.disclosing_party = args.disclosing_party
+    da.disclosing_party_address = args.disclosing_party_address
+    da.receiving_party = args.receiving_party
+    da.receiving_party_address = args.receiving_party_address
+    da.purpose = args.purpose
+    da.effective_date = args.effective_date
+    da.governing_law = args.governing_law
+    subs = _build_draft_substitutions(da, org_policy, profile)
+    text, missing = _fill_template(template_text, subs)
+    if missing:
+        raise SystemExit(f"Missing template values: {missing}. Pass corresponding flags.")
+
+    party_a_name = da.party_a or da.disclosing_party or org_policy.get("org_name") or "Party A"
+    party_b_name = da.party_b or da.receiving_party or "Party B"
+    parties = {
+        "a": {
+            "name": party_a_name,
+            "address": da.party_a_address or da.disclosing_party_address or "",
+            "role": "mutual" if args.template == "mutual" else "disclosing",
+        },
+        "b": {
+            "name": party_b_name,
+            "address": da.party_b_address or da.receiving_party_address or "",
+            "role": "mutual" if args.template == "mutual" else "receiving",
+        },
+    }
+
+    initial_hash = _negotiate_hash(text, "")
+    state = {
+        "schema_version": NEGOTIATE_SCHEMA_VERSION,
+        "negotiation_id": hashlib.sha256(f"{datetime.now(timezone.utc).isoformat()}::{party_a_name}::{party_b_name}".encode()).hexdigest()[:16],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "parties": parties,
+        "purpose": da.purpose,
+        "template": args.template,
+        "rounds": [
+            {
+                "round": 1,
+                "proposer": "a",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "text": text,
+                "text_hash": initial_hash,
+                "amendments": [],
+                "accept_clauses": [],
+                "summary": "Initial draft.",
+                "signature": {"signer": "a", "signed_at": datetime.now(timezone.utc).isoformat(), "method": "json_flag"},
+                "amendment_source": "initial",
+            }
+        ],
+        "clause_status": _negotiate_clause_status_init(rules),
+        "status": "in_progress",
+        "finalized": None,
+    }
+    out = Path(args.out)
+    _negotiate_save(out, state)
+    print(json.dumps({"ok": True, "negotiation_id": state["negotiation_id"], "state_file": str(out), "round": 1, "proposer": "a"}, ensure_ascii=False))
+    _print_friendly(
+        title=f"Negotiation initialized ({args.template})",
+        lines=[
+            f"State file: {out}",
+            f"Party A: {party_a_name}",
+            f"Party B: {party_b_name}",
+            f"Round 1 signed by Party A.",
+        ],
+        next_steps=[
+            f"Send {out.name} to the other party (email, Drive, Git — any channel).",
+            "Other party runs `negotiate review --state <file>` to see findings against their policy.",
+            "Other party runs `negotiate counter [--agent --llm] --state <file> --as b` to propose round 2.",
+        ],
+    )
+
+
+def cmd_negotiate_review(args):
+    base = Path(args.base)
+    state = _negotiate_load(Path(args.state))
+    org_policy = _negotiate_load_org_policy(base)
+    party = _negotiate_resolve_party(state, args.as_party, base)
+
+    last = state["rounds"][-1]
+    # Run a deterministic review of the current text against your policy.
+    playbook_path = base / "output" / "nda_playbook.json"
+    playbook = json.loads(playbook_path.read_text()) if playbook_path.exists() else {"policy": [
+        {"clause": k, "preferred": v.get("preferred", ""), "red_flags": v.get("red_flags", [])}
+        for k, v in (org_policy.get("clause_rules") or {}).items()
+    ]}
+    profile = load_counterparty_profile(base, None)
+    scoring = scoring_profile_details(base, None, None)
+    review = review_text(last["text"], playbook, profile=profile, scoring_profile=scoring, explainability=True)
+
+    payload = {
+        "ok": True,
+        "negotiation_id": state["negotiation_id"],
+        "you_are": party,
+        "current_round": last["round"],
+        "current_round_proposer": last["proposer"],
+        "your_turn": last["proposer"] != party,
+        "review": {
+            "decision": review.get("decision"),
+            "risk_score": review.get("risk_score"),
+            "findings_count": len(review.get("findings", [])),
+            "high_severity_clauses": [f["clause"] for f in review.get("findings", []) if f.get("severity") == "high"],
+        },
+        "clause_status": state.get("clause_status", {}),
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    _print_friendly(
+        title=f"Negotiation review (round {last['round']})",
+        lines=[
+            f"Your role: Party {party.upper()} ({state['parties'][party]['name']})",
+            f"Current round proposed by: Party {last['proposer'].upper()}",
+            f"Your turn? {'yes' if last['proposer'] != party else 'no — you proposed the latest round'}",
+            f"Decision (your policy): {review.get('decision','?').upper()}  risk={review.get('risk_score')}",
+            f"High-severity clauses: {', '.join(payload['review']['high_severity_clauses']) or '(none)'}",
+        ],
+        next_steps=[
+            "Run `negotiate counter --agent --llm` to draft amendments via your LLM agent.",
+            "Or `negotiate counter --amendments-file <my-edits.json>` to hand-write amendments.",
+            "Or `negotiate accept` to accept the current text and trigger convergence.",
+        ],
+    )
+
+
+def cmd_negotiate_counter(args):
+    base = Path(args.base)
+    state = _negotiate_load(Path(args.state))
+    org_policy = _negotiate_load_org_policy(base)
+    rules = org_policy.get("clause_rules", {}) or {}
+    party = _negotiate_resolve_party(state, args.as_party, base)
+    last = state["rounds"][-1]
+    if last["proposer"] == party:
+        raise SystemExit(
+            f"Round {last['round']} was proposed by you (Party {party.upper()}). "
+            "It's the other party's turn — wait for their counter, or use `negotiate accept` to converge on the current text."
+        )
+
+    if args.amendments_file:
+        proposal = json.loads(Path(args.amendments_file).read_text())
+    elif args.agent:
+        llm_cfg = load_llm_config(base, args)
+        if not llm_cfg.get("provider") or not llm_cfg.get("model"):
+            raise SystemExit("--agent requires LLM provider/model. Configure config/llm.json or pass --llm/--llm-model.")
+        if not args.yes_llm_send and not (sys.stderr.isatty() and sys.stdin.isatty()):
+            raise SystemExit("Refusing non-interactive LLM call without --yes-llm-send.")
+        if not args.yes_llm_send:
+            print(f"\n  Agent will call provider={llm_cfg['provider']} model={llm_cfg['model']}.", file=sys.stderr)
+            print("  Press Enter to continue, or Ctrl-C to abort.", file=sys.stderr)
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                raise SystemExit("Aborted by user.")
+        proposal = _negotiate_agent_propose(state, party, org_policy, llm_cfg)
+    else:
+        raise SystemExit("Pass --amendments-file <path> for manual amendments, or --agent --llm for LLM-drafted amendments.")
+
+    accept_clauses = proposal.get("accept_clauses") or []
+    counter_amendments = proposal.get("counter_amendments") or []
+    summary = proposal.get("summary") or ""
+    new_text = _negotiate_apply_amendments(last["text"], counter_amendments)
+    new_round = {
+        "round": last["round"] + 1,
+        "proposer": party,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "text": new_text,
+        "text_hash": _negotiate_hash(new_text, last["text_hash"]),
+        "amendments": counter_amendments,
+        "accept_clauses": accept_clauses,
+        "summary": summary,
+        "signature": {"signer": party, "signed_at": datetime.now(timezone.utc).isoformat(), "method": "json_flag"},
+        "amendment_source": "agent" if args.agent else "manual",
+    }
+    if proposal.get("parse_error"):
+        new_round["agent_parse_error"] = proposal["parse_error"]
+    state["rounds"].append(new_round)
+    state["clause_status"] = _negotiate_recompute_clause_status(state, rules)
+    if _negotiate_is_converged(state):
+        state["status"] = "converged"
+
+    out = Path(args.out or args.state)
+    _negotiate_save(out, state)
+    print(json.dumps({
+        "ok": True,
+        "round": new_round["round"],
+        "amendments_count": len(counter_amendments),
+        "accepted_clauses": accept_clauses,
+        "status": state["status"],
+        "state_file": str(out),
+    }, ensure_ascii=False))
+    _print_friendly(
+        title=f"Round {new_round['round']} signed (Party {party.upper()})",
+        lines=[
+            f"Amendments proposed: {len(counter_amendments)}",
+            f"Other-side clauses you accepted: {len(accept_clauses)}",
+            f"Negotiation status: {state['status']}",
+        ],
+        next_steps=(
+            ["Run `negotiate finalize` to emit the agreed .md/.docx and (optionally) hand off to docx2pdf + sign-CLI."]
+            if state["status"] == "converged" else
+            [f"Send {out.name} to the other party for round {new_round['round'] + 1}."]
+        ),
+    )
+
+
+def cmd_negotiate_accept(args):
+    base = Path(args.base)
+    state = _negotiate_load(Path(args.state))
+    org_policy = _negotiate_load_org_policy(base)
+    rules = org_policy.get("clause_rules", {}) or {}
+    party = _negotiate_resolve_party(state, args.as_party, base)
+    last = state["rounds"][-1]
+    if last["proposer"] == party:
+        raise SystemExit("You proposed the latest round; the other party must accept or counter, not you.")
+
+    # Accept the entire current text — every clause we know about gets agreed by us.
+    touched_clauses = sorted(rules.keys())
+    new_round = {
+        "round": last["round"] + 1,
+        "proposer": party,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "text": last["text"],
+        "text_hash": _negotiate_hash(last["text"], last["text_hash"]),
+        "amendments": [],
+        "accept_clauses": touched_clauses,
+        "summary": "Accept current text as final.",
+        "signature": {"signer": party, "signed_at": datetime.now(timezone.utc).isoformat(), "method": "json_flag"},
+        "amendment_source": "accept",
+    }
+    state["rounds"].append(new_round)
+    state["clause_status"] = _negotiate_recompute_clause_status(state, rules)
+    if _negotiate_is_converged(state):
+        state["status"] = "converged"
+    out = Path(args.out or args.state)
+    _negotiate_save(out, state)
+    print(json.dumps({
+        "ok": True,
+        "round": new_round["round"],
+        "status": state["status"],
+        "accepted_clauses": touched_clauses,
+        "state_file": str(out),
+    }, ensure_ascii=False))
+
+
+def cmd_negotiate_status(args):
+    state = _negotiate_load(Path(args.state))
+    rounds = state.get("rounds", [])
+    summary = {
+        "negotiation_id": state["negotiation_id"],
+        "status": state.get("status"),
+        "round_count": len(rounds),
+        "parties": {k: v.get("name") for k, v in state["parties"].items()},
+        "latest_round_proposer": rounds[-1]["proposer"] if rounds else None,
+        "clause_status": state.get("clause_status", {}),
+        "rounds": [
+            {
+                "round": r["round"],
+                "proposer": r["proposer"],
+                "amendments_count": len(r.get("amendments", [])),
+                "accepted_clauses_count": len(r.get("accept_clauses", [])),
+                "amendment_source": r.get("amendment_source"),
+                "summary": r.get("summary", "")[:140],
+            }
+            for r in rounds
+        ],
+        "finalized": state.get("finalized"),
+    }
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+
+def _negotiate_run_hook(cmd_template: str, vars: dict) -> tuple:
+    """Run a configured external command. Returns (returncode, stdout, stderr)."""
+    cmd = cmd_template
+    for k, v in vars.items():
+        cmd = cmd.replace("{" + k + "}", str(v))
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "hook timed out after 300s"
+
+
+def cmd_negotiate_finalize(args):
+    base = Path(args.base)
+    state = _negotiate_load(Path(args.state))
+    if state.get("status") != "converged":
+        raise SystemExit(
+            f"Negotiation status is {state.get('status')!r}, not 'converged'. "
+            "Both parties must alternate-sign to a state with no disputed clauses."
+        )
+
+    last = state["rounds"][-1]
+    final_text = last["text"]
+    out_md = Path(args.out_md)
+    out_docx = Path(args.out_docx)
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+    out_docx.parent.mkdir(parents=True, exist_ok=True)
+    out_md.write_text(final_text)
+    md_to_docx(final_text, out_docx)
+
+    pdf_path = None
+    signed_pdf_path = None
+    integrations = {}
+    integ_path = base / "config" / "integrations.json"
+    if integ_path.exists():
+        try:
+            integrations = json.loads(integ_path.read_text())
+        except Exception as e:
+            print(f"Warning: could not parse {integ_path}: {e}", file=sys.stderr)
+
+    hook_log = []
+    if args.to_pdf:
+        cmd_t = integrations.get("docx2pdf_cmd")
+        if not cmd_t:
+            raise SystemExit("--to-pdf requested but `docx2pdf_cmd` not configured in config/integrations.json.")
+        pdf_path = str(out_docx.with_suffix(".pdf"))
+        rc, so, se = _negotiate_run_hook(cmd_t, {
+            "input_docx": str(out_docx),
+            "output_pdf": pdf_path,
+        })
+        hook_log.append({"hook": "docx2pdf", "returncode": rc, "stdout": so[-500:], "stderr": se[-500:]})
+        if rc != 0:
+            raise SystemExit(f"docx2pdf hook failed (rc={rc}): {se[-300:]}")
+
+    if args.sign:
+        cmd_t = integrations.get("sign_cli_cmd")
+        if not cmd_t:
+            raise SystemExit("--sign requested but `sign_cli_cmd` not configured in config/integrations.json.")
+        if not pdf_path:
+            raise SystemExit("--sign requires --to-pdf (sign-CLI operates on the PDF).")
+        signed_pdf_path = str(Path(pdf_path).with_name(Path(pdf_path).stem + ".signed.pdf"))
+        rc, so, se = _negotiate_run_hook(cmd_t, {
+            "input_pdf": pdf_path,
+            "output_pdf": signed_pdf_path,
+            "party_a_name": state["parties"]["a"]["name"],
+            "party_b_name": state["parties"]["b"]["name"],
+            "negotiation_id": state["negotiation_id"],
+        })
+        hook_log.append({"hook": "sign_cli", "returncode": rc, "stdout": so[-500:], "stderr": se[-500:]})
+        if rc != 0:
+            raise SystemExit(f"sign-CLI hook failed (rc={rc}): {se[-300:]}")
+
+    state["finalized"] = {
+        "finalized_at": datetime.now(timezone.utc).isoformat(),
+        "final_text_hash": last["text_hash"],
+        "out_md": str(out_md),
+        "out_docx": str(out_docx),
+        "out_pdf": pdf_path,
+        "signed_pdf": signed_pdf_path,
+        "hooks": hook_log,
+    }
+    state["status"] = "finalized"
+    _negotiate_save(Path(args.state), state)
+    print(json.dumps({"ok": True, "finalized": state["finalized"], "state_file": args.state}, indent=2, ensure_ascii=False))
+    _print_friendly(
+        title="Negotiation finalized",
+        lines=[
+            f"Markdown: {out_md}",
+            f"Word doc: {out_docx}",
+            f"PDF:      {pdf_path or '(skipped)'}",
+            f"Signed:   {signed_pdf_path or '(skipped)'}",
+            f"Hash:     {last['text_hash'][:16]}...",
+        ],
+        next_steps=(
+            ["Distribute the signed PDF to both parties for archival."]
+            if signed_pdf_path else
+            ["Sign and distribute the .docx via your usual channel.",
+             "Or wire up `docx2pdf_cmd` and `sign_cli_cmd` in config/integrations.json and rerun with --to-pdf --sign."]
+        ),
+    )
+
+
 def cmd_tutorial(args):
     repo = Path(__file__).resolve().parent
     interactive = sys.stdin.isatty() and not args.no_prompt
@@ -3394,6 +3998,67 @@ def main():
     p_draft.add_argument("--review-after", action="store_true", help="Run the generated draft through `review --why` as a sanity check")
     p_draft.add_argument("--no-disclaimer", action="store_true", help="Omit the 'this is a starting point' header")
     p_draft.set_defaults(func=cmd_draft)
+
+    p_neg = sub.add_parser("negotiate", help="Two-party turn-taking NDA negotiation with optional LLM agent assistance (file-based protocol)")
+    neg_sub = p_neg.add_subparsers(dest="neg_cmd", required=True)
+
+    p_ni = neg_sub.add_parser("init", help="Start a negotiation: draft NDA from template + parties, sign as Party A, emit state file")
+    p_ni.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_ni.add_argument("--template", choices=sorted(DRAFT_TEMPLATES.keys()), default="mutual")
+    p_ni.add_argument("--out", required=True, help="Output negotiation state JSON file")
+    p_ni.add_argument("--purpose", required=True)
+    p_ni.add_argument("--effective-date")
+    p_ni.add_argument("--governing-law")
+    # Mutual party fields
+    p_ni.add_argument("--party-a-name")
+    p_ni.add_argument("--party-a-address")
+    p_ni.add_argument("--party-b-name")
+    p_ni.add_argument("--party-b-address")
+    # One-way fields
+    p_ni.add_argument("--disclosing-party")
+    p_ni.add_argument("--disclosing-party-address")
+    p_ni.add_argument("--receiving-party")
+    p_ni.add_argument("--receiving-party-address")
+    p_ni.set_defaults(func=cmd_negotiate_init)
+
+    p_nr = neg_sub.add_parser("review", help="Read-only: review the latest round vs your policy")
+    p_nr.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_nr.add_argument("--state", required=True, help="Negotiation state JSON file")
+    p_nr.add_argument("--as", dest="as_party", choices=["a", "b"], help="Which party you are; auto-detected from org_name if omitted")
+    p_nr.set_defaults(func=cmd_negotiate_review)
+
+    p_nc = neg_sub.add_parser("counter", help="Sign a counter-round with amendments (manual or LLM-drafted)")
+    p_nc.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_nc.add_argument("--state", required=True)
+    p_nc.add_argument("--out", help="Where to write the updated state file (defaults to overwriting --state)")
+    p_nc.add_argument("--as", dest="as_party", choices=["a", "b"])
+    p_nc.add_argument("--amendments-file", help="Manual amendments JSON file: {accept_clauses, counter_amendments, summary}")
+    p_nc.add_argument("--agent", action="store_true", help="Use the configured LLM as a negotiation agent to draft amendments")
+    p_nc.add_argument("--llm", choices=["auto", "anthropic", "openai", "ollama", "openai-compatible"], default="auto")
+    p_nc.add_argument("--llm-model")
+    p_nc.add_argument("--llm-base-url")
+    p_nc.add_argument("--yes-llm-send", action="store_true")
+    p_nc.set_defaults(func=cmd_negotiate_counter)
+
+    p_na = neg_sub.add_parser("accept", help="Accept the current text, signing convergence on your side")
+    p_na.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_na.add_argument("--state", required=True)
+    p_na.add_argument("--out")
+    p_na.add_argument("--as", dest="as_party", choices=["a", "b"])
+    p_na.set_defaults(func=cmd_negotiate_accept)
+
+    p_ns = neg_sub.add_parser("status", help="Show negotiation rounds, per-clause status, signatures")
+    p_ns.add_argument("--state", required=True)
+    p_ns.set_defaults(func=cmd_negotiate_status)
+
+    p_nf = neg_sub.add_parser("finalize", help="Emit final .md + .docx; optionally hand off to docx2pdf + sign-CLI hooks")
+    p_nf.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_nf.add_argument("--state", required=True)
+    p_nf.add_argument("--out-md", required=True)
+    p_nf.add_argument("--out-docx", required=True)
+    p_nf.add_argument("--to-pdf", action="store_true", help="Run config/integrations.json `docx2pdf_cmd` to convert docx → pdf")
+    p_nf.add_argument("--sign", action="store_true", help="Run config/integrations.json `sign_cli_cmd` to sign the pdf (implies --to-pdf)")
+    p_nf.set_defaults(func=cmd_negotiate_finalize)
 
     p_tutorial = sub.add_parser("tutorial", help="Interactive primer that explains policy/profile/playbook and runs a sample review")
     p_tutorial.add_argument("--base", help="Sandbox directory for the sample run (defaults to a fresh temp dir)")

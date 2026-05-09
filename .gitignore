@@ -13,6 +13,9 @@ config/org-policy.json
 config/llm.json
 config/quickstart-answers.json
 
+# Local integration hooks (paths to docx2pdf, sign-CLI, etc.)
+config/integrations.json
+
 # env/OS
 .DS_Store
 *.log

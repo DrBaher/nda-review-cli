@@ -290,6 +290,43 @@ Important:
 - Sending NDA text to a third-party provider may breach the NDA itself. Use Ollama or a local OpenAI-compatible server (vLLM, LM Studio) when on-prem inference matters.
 - See [SECURITY.md → LLM data flow](SECURITY.md#llm-data-flow-opt-in) for the full list of what's sent and to whom.
 
+### Scenario H — Negotiating an NDA between two parties
+
+Both parties have their own CLI install. They exchange a single state file by any channel they prefer.
+
+```bash
+# === Party A's machine ===
+./nda_review_cli.py quickstart                              # set Acme's policy
+./nda_review_cli.py negotiate init \
+  --template mutual \
+  --party-a-name "Acme" --party-a-address "1 Main" \
+  --party-b-name "Beta" --party-b-address "2 Side" \
+  --purpose "evaluating a partnership" \
+  --out negotiation.json
+# Send negotiation.json to Party B (email / Drive / Git)
+
+# === Party B's machine ===
+./nda_review_cli.py quickstart                              # set Beta's policy
+./nda_review_cli.py negotiate review --state negotiation.json
+./nda_review_cli.py negotiate counter --state negotiation.json --as b \
+  --agent --llm ollama --yes-llm-send                       # local LLM agent drafts counter
+# Review the resulting amendments in `negotiate status` before sending back
+./nda_review_cli.py negotiate status --state negotiation.json
+# Send updated negotiation.json back to Party A
+
+# === Party A's machine ===
+./nda_review_cli.py negotiate review --state negotiation.json
+./nda_review_cli.py negotiate accept --state negotiation.json --as a
+# Status: converged → finalize
+./nda_review_cli.py negotiate finalize \
+  --state negotiation.json \
+  --out-md output/agreed.md \
+  --out-docx output/agreed.docx \
+  --to-pdf --sign                                           # uses config/integrations.json hooks
+```
+
+Set up `config/integrations.json` (gitignored) once per machine to wire in your own `docx2pdf` and `sign-CLI` tools — see `config/integrations.json.example` for placeholders. Every round is signed and hash-chained; tampering is detected on load.
+
 ## Where to go next
 
 - **How the CLI is structured:** [ARCHITECTURE.md](ARCHITECTURE.md)

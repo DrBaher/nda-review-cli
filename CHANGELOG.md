@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added `negotiate` subcommand suite for two-party turn-taking NDA negotiation. File-based protocol — no networking, state lives in a single JSON document exchanged via any channel (email/Drive/Git). `negotiate init / review / counter / accept / status / finalize` cover the full flow. The `--agent --llm` option on `counter` repurposes the LLM-augmented review as a negotiation agent that drafts amendments aligned with each party's policy; humans always sign each round. Per-round SHA-256 hash chain detects tampering on load. `negotiate finalize --to-pdf --sign` invokes user-configured external commands (`docx2pdf_cmd`, `sign_cli_cmd` in `config/integrations.json`) to hand off to your own PDF and signing tooling. New `config/integrations.json.example` ships with the schema and worked examples (incl. LibreOffice and Pandoc fallbacks).
 - Added `pyproject.toml` and a `nda-review-cli` console-script entry point — `pipx install .` (or `pipx install git+https://...`) gives you `nda-review-cli` on `$PATH`. Bundled assets (config seeds, templates, fixture NDA) ship inside the wheel.
 - Added `__version__` and a `--version` flag on the root parser.
 - Bare invocation (`./nda_review_cli.py` with no args) now prints a friendly first-run hint pointing at `tutorial`, `quickstart`, and `setup --quick --yes`.

@@ -61,6 +61,7 @@ All subcommands live here. Roughly grouped:
 | Knowledge | `ingest`, `build-playbook` | Turn raw contracts into a playbook |
 | Review | `review`, `profile-learn`, `calibrate-scoring` | Score NDAs against the playbook |
 | Authoring | `draft` | Generate outgoing NDAs (mutual / one-way-out) in `.md` + `.docx` |
+| Negotiation | `negotiate init/review/counter/accept/status/finalize` | Two-party turn-taking negotiation with optional LLM agent and external `docx2pdf` + `sign-CLI` hooks |
 | Output | `generate-redlines`, `generate-office-script`, `quality-gate` | Produce Word-ready amendments |
 | Versioning | `playbook-snapshot`, `playbook-diff`, `playbook-lock` | Track playbook changes |
 | Meta | `policy-validate`, `release-helper`, `create-manifest` | Schema/version/release plumbing |
