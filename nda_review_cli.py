@@ -2719,19 +2719,39 @@ TUTORIAL_STEPS = [
         ],
     },
     {
+        "title": "Concept 4 — Two-party negotiation",
+        "body": [
+            "If both sides have this CLI, you can co-negotiate an NDA without",
+            "any third-party service. The protocol is file-based: a single",
+            "JSON state file bounces between parties (email/Drive/Git — your",
+            "choice). Each round is signed by exactly one party.",
+            "",
+            "Each agent uses three policy fields to decide what to counter:",
+            "  • negotiation_stance: conservative / middleground / compromising",
+            "  • clause_priorities:  ranked top-to-bottom",
+            "  • non_negotiable_clauses: hard floor — never conceded",
+            "",
+            "Stuck clauses are auto-resolved by `fatigue concession` after K",
+            "bounces; truly non-negotiable conflicts surface as `blocked` for",
+            "human escalation. Sign-off step gives you the key-points review",
+            "before the agreed text is finalized.",
+        ],
+    },
+    {
         "title": "What's next",
         "body": [
             "After this primer, the commands you'll use most:",
-            "  • quickstart  — 14-question guided setup that wires answers into",
-            "                  clause rules (replayable via --answers-file).",
-            "  • review      — score an NDA; add --why for evidence,",
-            "                  --counterparty <name> --learn-profile for memory,",
-            "                  --llm <provider> for second-pass adjudication.",
-            "  • draft       — generate outgoing NDAs (mutual / one-way-out)",
-            "                  in .md + .docx using your house clause language.",
+            "  • quickstart  — 16-question guided setup (stance, priorities, etc.).",
+            "  • review      — score an NDA; --why for evidence, --llm for LLM pass.",
+            "  • draft       — generate outgoing NDAs in .md + .docx.",
+            "  • negotiate   — two-party turn-taking flow:",
+            "                    init → counter [--auto/--agent/--dry-run] → accept",
+            "                    → diff → sign-off → finalize  (or  withdraw)",
+            "                    + simulate / analyze for game-theoretic dashboards.",
             "  • doctor      — sanity-check first-run readiness.",
             "",
-            "Read GETTING_STARTED.md for the scenarios that match your setup.",
+            "Read GETTING_STARTED.md (Scenarios A-H) for the path that matches you.",
+            "Read examples/negotiate-cheatsheet.md for a one-page negotiate reference.",
         ],
     },
 ]
@@ -3137,13 +3157,20 @@ NEGOTIATE_STANCE_DESCRIPTORS = {
 
 NEGOTIATE_LLM_AGENT_SYSTEM = (
     "You are an NDA negotiation agent representing one party. You receive: "
-    "(1) the current full NDA text, (2) your party's house policy (clause-by-clause "
-    "preferred language and red flags), (3) your party's negotiation stance, "
-    "(4) the latest round of amendments proposed by the other party. "
-    "Your job is to propose your party's response: which other-party amendments to "
-    "accept, which to counter, and any new amendments your policy requires. "
-    "Apply your party's stance literally — it is the most important behavioural input. "
-    "Be concise and align language with your party's preferred clause text where possible. "
+    "(1) the current full NDA text, "
+    "(2) your party's house policy (clause-by-clause preferred language and red flags), "
+    "(3) your party's negotiation stance, "
+    "(4) your party's clause priority ranking (1=most important), "
+    "(5) any clauses your party has marked as NON-NEGOTIABLE (hard floor — never accept differing text on these), "
+    "(6) per-clause bounce counts (clauses that have been amended in N consecutive alternating-proposer rounds), "
+    "(7) the latest round of amendments proposed by the other party. "
+    "Your job is to propose your party's response: which other-party amendments to accept, which to counter, "
+    "and any new amendments your policy requires. "
+    "RULES (in order of strictness):\n"
+    " 1. NON-NEGOTIABLE clauses: counter unless the current text exactly matches your preferred. Never accept a differing text on these.\n"
+    " 2. Stance: apply literally. Conservative = hold firm; middleground = compromise on non-red-flag items; compromising = accept most things, push back on red flags only.\n"
+    " 3. Priority + concession zone: bottom 30% (conservative), 60% (middleground), or 85% (compromising) by priority can be conceded. Inside your insistence zone, follow stance logic.\n"
+    " 4. Bounce count: if a clause has bounced >= 4 rounds, consider conceding it to break the deadlock — UNLESS it's non-negotiable.\n"
     "Reply ONLY with a JSON object matching this schema:\n"
     "{\n"
     '  "accept_clauses": [string],            # clauses where the other side\'s proposal is acceptable\n'
@@ -3181,6 +3208,7 @@ def _negotiate_auto_propose(state: dict, party: str, org_policy: dict, stance: s
 
     priorities = org_policy.get("clause_priorities") or list(rules.keys())
     concession_zone = _negotiate_concession_zone(rules, priorities, stance)
+    non_negotiable = set(org_policy.get("non_negotiable_clauses") or [])
 
     counter_amendments = []
     accept_clauses = []
@@ -3198,12 +3226,26 @@ def _negotiate_auto_propose(state: dict, party: str, org_policy: dict, stance: s
         if not current_block or not preferred:
             continue
 
+        differs = preferred not in current_block
+
+        # Non-negotiable hard floor: always counter if text differs, regardless
+        # of stance, priority, or concession zone. These are the user's
+        # declared absolute redlines.
+        if clause in non_negotiable and differs:
+            counter_amendments.append({
+                "clause": clause,
+                "old_text": current_block,
+                "new_text": preferred,
+                "rationale": rationale_prefix + "non-negotiable clause — text must match preferred.",
+            })
+            countered_clauses.add(clause)
+            continue
+
         if clause in concession_zone:
             accept_clauses.append(clause)
             continue
 
         red_flags_fired = bool(red_flag_hits(current_block.lower(), clause))
-        differs = preferred not in current_block
 
         will_counter = False
         rationale = ""
@@ -3266,17 +3308,35 @@ def _negotiate_resolve_stance(org_policy: dict, override: Optional[str]) -> str:
 def _negotiate_agent_propose(state: dict, party: str, org_policy: dict, llm_cfg: dict, stance: str) -> dict:
     """Run the LLM agent against the current state to propose the next round's amendments."""
     rules = org_policy.get("clause_rules", {}) or {}
-    pref_lines = "\n".join(
-        f"- {clause}: {cfg.get('preferred','')}"
-        for clause, cfg in rules.items()
-    )
+    priorities = org_policy.get("clause_priorities") or list(rules.keys())
+    non_negotiable = org_policy.get("non_negotiable_clauses") or []
+
+    # Build a rich per-clause context: rank, red flags, bounce count.
+    pref_lines = []
+    for clause, cfg in rules.items():
+        rank = _negotiate_priority_rank(priorities, clause)
+        bounces = _negotiate_clause_bounce_count(state, clause)
+        markers = []
+        if clause in non_negotiable:
+            markers.append("NON_NEGOTIABLE")
+        if bounces >= 1:
+            markers.append(f"bounce_count={bounces}")
+        marker_str = f" [{', '.join(markers)}]" if markers else ""
+        pref_lines.append(
+            f"- {clause} (rank {rank}){marker_str}: {cfg.get('preferred','')}"
+        )
+
     last_round = state["rounds"][-1]
     last_amendments = last_round.get("amendments") or []
     stance_text = NEGOTIATE_STANCE_DESCRIPTORS.get(stance, NEGOTIATE_STANCE_DESCRIPTORS["middleground"])
+
     user_prompt = (
         f"## Your party: {state['parties'][party]['name']} ({state['parties'][party].get('role','')})\n\n"
         f"## {stance_text}\n\n"
-        f"## Your house policy preferred language by clause\n\n{pref_lines}\n\n"
+        f"## Your priority order (top = most important): {', '.join(priorities) or '(default policy order)'}\n\n"
+        f"## Your non-negotiable clauses (hard floor): {non_negotiable or '(none)'}\n\n"
+        f"## Your house policy by clause (rank, markers, preferred language)\n\n"
+        f"{chr(10).join(pref_lines)}\n\n"
         f"## Current full NDA text\n\n{last_round['text']}\n\n"
         f"## Latest amendments proposed by the other party (round {last_round['round']})\n\n"
         f"{json.dumps(last_amendments, ensure_ascii=False, indent=2)}\n\n"
@@ -3373,12 +3433,18 @@ def _negotiate_clause_bounce_count(state: dict, clause: str) -> int:
     return count
 
 
-def _apply_fatigue(proposal: dict, state: dict, max_bounces: int) -> dict:
+def _apply_fatigue(proposal: dict, state: dict, max_bounces: int, non_negotiable: list = None) -> dict:
     """Apply fatigue concession: any clause that's bouncing >= max_bounces
     times consecutively is force-conceded by the current proposer regardless
     of stance / priority / red flags. Mutates proposal in place: clauses move
     from counter_amendments → accept_clauses, and a `fatigue_concessions`
-    list is added so the round can be tagged auto:<stance>+fatigue."""
+    list is added so the round can be tagged auto:<stance>+fatigue.
+
+    Clauses listed in `non_negotiable` are NEVER fatigue-conceded — they're
+    hard floors the user has declared as absolute redlines. If a non-negotiable
+    clause keeps bouncing, the stalemate detector will eventually block the
+    negotiation rather than force-concede a redline."""
+    non_negotiable_set = set(non_negotiable or [])
     if max_bounces <= 0:
         proposal["fatigue_concessions"] = []
         return proposal
@@ -3388,6 +3454,8 @@ def _apply_fatigue(proposal: dict, state: dict, max_bounces: int) -> dict:
         clause = am.get("clause")
         if not clause:
             continue
+        if clause in non_negotiable_set:
+            continue  # Hard floor — never fatigue-concede a non-negotiable clause.
         if _negotiate_clause_bounce_count(state, clause) >= max_bounces:
             fatigued.append(clause)
 
@@ -3475,6 +3543,10 @@ def _negotiate_check_blocked(state: dict, rules: dict, threshold: int = DEFAULT_
     if no_progress >= threshold:
         cs = state.get("clause_status", {})
         stuck = sorted(c for c, s in cs.items() if s.get("status") == "disputed")
+        # Non-negotiable conflicts get a more specific diagnosis: these clauses
+        # were intentionally protected from fatigue concession by one or both
+        # parties, so the deadlock is by design and needs human escalation,
+        # not a stance change.
         state["status"] = "blocked"
         state["block_diagnosis"] = {
             "rounds_without_progress": no_progress,
@@ -3483,8 +3555,11 @@ def _negotiate_check_blocked(state: dict, rules: dict, threshold: int = DEFAULT_
             "note": (
                 "No new clause has reached `agreed` status for several consecutive "
                 "rounds. Likely cause: both parties' stances are too rigid for the "
-                "rules-engine to resolve. Try `--stance compromising` for one side, "
-                "switch to `--agent --llm`, or escalate to humans."
+                "rules-engine to resolve, or one or both sides marked some of the "
+                "stuck clauses as non-negotiable. Try `--stance compromising` for "
+                "one side, switch to `--agent --llm`, escalate to humans, or — if "
+                "stuck on non-negotiable clauses — accept that this deal cannot "
+                "close on those terms."
             ),
         }
     return state
@@ -3661,6 +3736,8 @@ def cmd_negotiate_counter(args):
     org_policy = _negotiate_load_org_policy(base)
     rules = org_policy.get("clause_rules", {}) or {}
     party = _negotiate_resolve_party(state, args.as_party, base)
+    if state.get("status") in ("withdrawn", "finalized"):
+        raise SystemExit(f"Negotiation is in terminal state `{state.get('status')}`; further counters are not allowed.")
     if state.get("status") == "blocked" and not getattr(args, "force_unblock", False):
         diag = state.get("block_diagnosis", {})
         raise SystemExit(
@@ -3709,10 +3786,28 @@ def cmd_negotiate_counter(args):
     # Apply fatigue concession uniformly across all proposal modes — clauses
     # bouncing >= max_bounces times consecutively get force-conceded by the
     # current proposer regardless of how the proposal was generated.
-    proposal = _apply_fatigue(proposal, state, max_bounces)
+    non_negotiable = org_policy.get("non_negotiable_clauses") or []
+    proposal = _apply_fatigue(proposal, state, max_bounces, non_negotiable=non_negotiable)
     fatigue_concessions = proposal.get("fatigue_concessions") or []
     if fatigue_concessions:
         proposal_source = proposal_source + "+fatigue"
+
+    # Dry-run: preview the proposal without writing the round to the state file.
+    if getattr(args, "dry_run", False):
+        preview = {
+            "dry_run": True,
+            "would_be_round": last["round"] + 1,
+            "proposer": party,
+            "stance": stance,
+            "amendment_source": proposal_source,
+            "amendments": proposal.get("counter_amendments") or [],
+            "accept_clauses": proposal.get("accept_clauses") or [],
+            "fatigue_concessions": fatigue_concessions,
+            "summary": proposal.get("summary") or "",
+            "state_unchanged": True,
+        }
+        print(json.dumps(preview, indent=2, ensure_ascii=False))
+        return
 
     accept_clauses = proposal.get("accept_clauses") or []
     counter_amendments = proposal.get("counter_amendments") or []
@@ -4106,6 +4201,241 @@ def _negotiate_key_points(state: dict, org_policy: dict) -> list:
         {"kind": "applied_amendments", "items": applied_amendments},
         {"kind": "fatigue_concessions", "items": fatigue_concessions},
     ]
+
+
+def cmd_negotiate_diff(args):
+    """Show clause-by-clause changes between two rounds. Defaults to comparing
+    the most recent two rounds; pass --from N --to M for a specific range.
+    Output mirrors review/draft style: JSON to stdout, optional --md for human-friendly markdown."""
+    state = _negotiate_load(Path(args.state))
+    rounds = state["rounds"]
+    if len(rounds) < 2:
+        raise SystemExit("Need at least 2 rounds for a diff.")
+
+    to_idx = (args.to_round - 1) if args.to_round is not None else len(rounds) - 1
+    from_idx = (args.from_round - 1) if args.from_round is not None else to_idx - 1
+    if from_idx < 0 or to_idx >= len(rounds) or from_idx >= to_idx:
+        raise SystemExit(f"Invalid round range: from={from_idx + 1} to={to_idx + 1}.")
+    from_r, to_r = rounds[from_idx], rounds[to_idx]
+
+    # Walk policy clauses (or any extracted clause) to find per-clause diffs.
+    repo_base = Path(args.base)
+    org_policy = _negotiate_load_org_policy(repo_base) if (repo_base / "config" / "org-policy.json").exists() else {}
+    rules = (org_policy.get("clause_rules") or {}) or {}
+    clauses = list(rules.keys()) if rules else sorted(set(
+        am.get("clause") for r in rounds for am in (r.get("amendments") or []) if am.get("clause")
+    ))
+
+    diff_items = []
+    for clause in clauses:
+        old_block = _negotiate_extract_clause_text(from_r["text"], clause)
+        new_block = _negotiate_extract_clause_text(to_r["text"], clause)
+        if old_block != new_block and (old_block or new_block):
+            # Locate the amendment that introduced this change, if any.
+            amendment = next(
+                (am for am in (to_r.get("amendments") or []) if am.get("clause") == clause),
+                None,
+            )
+            diff_items.append({
+                "clause": clause,
+                "old_text": old_block,
+                "new_text": new_block,
+                "proposed_by": to_r["proposer"] if amendment else None,
+                "rationale": (amendment or {}).get("rationale", "(text changed without explicit amendment record)"),
+            })
+
+    accepted_in_to = to_r.get("accept_clauses") or []
+
+    payload = {
+        "ok": True,
+        "from_round": from_r["round"],
+        "to_round": to_r["round"],
+        "to_round_proposer": to_r["proposer"],
+        "to_round_source": to_r.get("amendment_source"),
+        "to_round_stance": to_r.get("stance"),
+        "changes": diff_items,
+        "accepted_clauses_in_to_round": accepted_in_to,
+        "fatigue_concessions_in_to_round": to_r.get("fatigue_concessions") or [],
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    if args.out_md:
+        lines = [
+            f"# Negotiation diff — round {from_r['round']} → round {to_r['round']}",
+            "",
+            f"- Round {to_r['round']} proposer: **Party {to_r['proposer'].upper()}**",
+            f"- Source: `{to_r.get('amendment_source')}` (stance: {to_r.get('stance')})",
+            "",
+        ]
+        if diff_items:
+            lines.append(f"## Clause changes ({len(diff_items)})")
+            lines.append("")
+            for d in diff_items:
+                lines.append(f"### {d['clause']}")
+                lines.append(f"- _Proposed by_: Party {(d['proposed_by'] or '?').upper()}")
+                lines.append(f"- _Rationale_: {d['rationale']}")
+                lines.append("```diff")
+                for old_line in (d["old_text"] or "").splitlines():
+                    lines.append(f"- {old_line}")
+                for new_line in (d["new_text"] or "").splitlines():
+                    lines.append(f"+ {new_line}")
+                lines.append("```")
+                lines.append("")
+        else:
+            lines.append("_No clause-text changes detected between these rounds._")
+            lines.append("")
+        if accepted_in_to:
+            lines.append(f"## Clauses accepted in round {to_r['round']}")
+            lines.append("")
+            lines.extend(f"- {c}" for c in accepted_in_to)
+        if to_r.get("fatigue_concessions"):
+            lines.append("")
+            lines.append("## Fatigue concessions")
+            lines.append("")
+            lines.extend(f"- {c}" for c in to_r["fatigue_concessions"])
+        Path(args.out_md).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out_md).write_text("\n".join(lines))
+
+
+def cmd_negotiate_withdraw(args):
+    """Mark the negotiation as withdrawn by one party. Blocks further commands."""
+    base = Path(args.base)
+    state = _negotiate_load(Path(args.state))
+    if state.get("status") in ("withdrawn", "finalized"):
+        raise SystemExit(f"Negotiation already in terminal state: {state.get('status')!r}.")
+    party = _negotiate_resolve_party(state, args.as_party, base)
+    state["status"] = "withdrawn"
+    state["withdrawal"] = {
+        "withdrawn_by": party,
+        "withdrawn_at": datetime.now(timezone.utc).isoformat(),
+        "reason": args.reason or "(no reason given)",
+    }
+    _negotiate_save(Path(args.state), state)
+    print(json.dumps({"ok": True, "status": "withdrawn", "withdrawn_by": party, "reason": state["withdrawal"]["reason"]}, ensure_ascii=False))
+    _print_friendly(
+        title=f"Negotiation withdrawn (Party {party.upper()})",
+        lines=[
+            f"Reason: {state['withdrawal']['reason']}",
+            f"State file marked terminal — no further counter/sign-off/finalize allowed.",
+        ],
+        next_steps=["Notify the other party out-of-band that you've withdrawn."],
+    )
+
+
+def cmd_negotiate_analyze(args):
+    """Read-only post-hoc dashboard for any state file. Shows the negotiation's
+    trajectory, source breakdown (manual / auto / agent / fatigue), per-clause
+    winner, fatigue summary, and a lightweight game-theoretic interpretation
+    of the outcome."""
+    state = _negotiate_load(Path(args.state))
+    rounds = state.get("rounds", [])
+    if not rounds:
+        raise SystemExit("State file has no rounds — nothing to analyze.")
+
+    # Trajectory: per-round agreed/disputed/proposed counts. We recompute
+    # from policy if available, else from amendment history.
+    base = Path(args.base)
+    org_policy = _negotiate_load_org_policy(base) if (base / "config" / "org-policy.json").exists() else {}
+    rules = (org_policy.get("clause_rules") or {}) or {}
+
+    trajectory = []
+    for i in range(len(rounds)):
+        truncated = {**state, "rounds": rounds[: i + 1]}
+        cs = _negotiate_recompute_clause_status(truncated, rules)
+        trajectory.append({
+            "round": rounds[i]["round"],
+            "proposer": rounds[i]["proposer"],
+            "amendment_source": rounds[i].get("amendment_source", "?"),
+            "stance": rounds[i].get("stance"),
+            "agreed": sum(1 for v in cs.values() if v.get("status") == "agreed"),
+            "disputed": sum(1 for v in cs.values() if v.get("status") == "disputed"),
+            "proposed": sum(1 for v in cs.values() if v.get("status") == "proposed"),
+        })
+
+    # Source breakdown across all rounds
+    src_counter = Counter(r.get("amendment_source", "?") for r in rounds)
+
+    # Winner per agreed clause
+    final_status = state.get("clause_status") or _negotiate_recompute_clause_status(state, rules)
+    winners = {c: s.get("last_proposer") for c, s in final_status.items() if s.get("status") == "agreed"}
+    winner_count = Counter(winners.values())
+
+    # Fatigue / non-negotiable summary
+    fatigue_clauses = []
+    for r in rounds:
+        for c in r.get("fatigue_concessions") or []:
+            fatigue_clauses.append({"round": r["round"], "conceded_by": r["proposer"], "clause": c})
+
+    # Concession trajectory: per-round count of accept_clauses by proposer
+    concession_trajectory = [
+        {"round": r["round"], "proposer": r["proposer"], "accepted": len(r.get("accept_clauses") or [])}
+        for r in rounds
+    ]
+
+    # Game-theoretic interpretation
+    outcome_interpretation = _negotiate_interpret_outcome(state, trajectory, src_counter)
+
+    payload = {
+        "negotiation_id": state.get("negotiation_id"),
+        "status": state.get("status"),
+        "rounds_total": len(rounds),
+        "stances": {
+            "a_initial": rounds[0].get("stance"),  # round 1 is the initial draft (stance may be None)
+            "observed_per_round": [{"round": r["round"], "proposer": r["proposer"], "stance": r.get("stance")} for r in rounds],
+        },
+        "trajectory": trajectory,
+        "source_breakdown": dict(src_counter),
+        "winner_per_clause": winners,
+        "wins_by_party": {"a": winner_count.get("a", 0), "b": winner_count.get("b", 0)},
+        "fatigue_concessions": fatigue_clauses,
+        "concession_trajectory": concession_trajectory,
+        "outcome_interpretation": outcome_interpretation,
+        "block_diagnosis": state.get("block_diagnosis"),
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _negotiate_interpret_outcome(state: dict, trajectory: list, src_counter: Counter) -> dict:
+    """Lightweight game-theoretic interpretation of the negotiation."""
+    status = state.get("status", "unknown")
+    rounds = state.get("rounds", [])
+    if not rounds:
+        return {"label": "empty", "note": "No rounds."}
+
+    fatigue_used = any("+fatigue" in s for s in src_counter)
+    agent_used = any(s.startswith("agent") for s in src_counter)
+    auto_used = any(s.startswith("auto") for s in src_counter)
+    final_agreed = trajectory[-1]["agreed"] if trajectory else 0
+    final_disputed = trajectory[-1]["disputed"] if trajectory else 0
+
+    if status == "finalized":
+        label = "finalized"
+    elif status == "signed_off":
+        label = "signed-off, awaiting finalize"
+    elif status == "converged":
+        label = "converged via fatigue" if fatigue_used else "converged organically"
+    elif status == "blocked":
+        label = "blocked (deadlock detected)"
+    elif status == "withdrawn":
+        label = "withdrawn by one party"
+    else:
+        label = "in progress"
+
+    notes = []
+    if fatigue_used:
+        notes.append("Fatigue concession was triggered — at least one clause was force-resolved after bouncing past the threshold. Review carefully.")
+    if agent_used and auto_used:
+        notes.append("Mixed counter modes (LLM agent and deterministic auto). Source breakdown has details.")
+    elif agent_used:
+        notes.append("LLM agent drove the negotiation. Verify rationales in the round-by-round amendments.")
+    elif auto_used:
+        notes.append("Pure deterministic mode — no LLM was used.")
+    if final_disputed > 0:
+        notes.append(f"{final_disputed} clause(s) remain disputed in the final state.")
+    if final_agreed == 0 and rounds:
+        notes.append("No clauses ever reached `agreed` status — the negotiation never produced shared ground.")
+
+    return {"label": label, "notes": notes}
 
 
 def cmd_negotiate_signoff(args):
@@ -4744,6 +5074,7 @@ def main():
     p_nc.add_argument("--as", dest="as_party", choices=["a", "b"])
     p_nc.add_argument("--amendments-file", help="Manual amendments JSON file: {accept_clauses, counter_amendments, summary}")
     p_nc.add_argument("--auto", action="store_true", help="Deterministic stance-driven amendment generator (no LLM). Uses your policy + negotiation_stance.")
+    p_nc.add_argument("--dry-run", action="store_true", help="Generate the proposal and print it as JSON, but do NOT write to the state file. Useful for previewing what --agent or --auto will do before committing.")
     p_nc.add_argument("--force-unblock", action="store_true", help="Continue countering even if status is `blocked` (rarely useful)")
     p_nc.add_argument("--stance", choices=sorted(NEGOTIATE_STANCE_DESCRIPTORS.keys()), help="Override negotiation_stance from policy for this round only")
     p_nc.add_argument("--agent", action="store_true", help="Use the configured LLM as a negotiation agent to draft amendments")
@@ -4774,6 +5105,26 @@ def main():
     p_sim.add_argument("--state", help="Where to write the simulation state file (default: <party_a_base>/_simulate_state.json)")
     p_sim.add_argument("--out", help="Where to write the simulation report JSON")
     p_sim.set_defaults(func=cmd_negotiate_simulate)
+
+    p_ndiff = neg_sub.add_parser("diff", help="Show clause-by-clause changes between two rounds (defaults to last two)")
+    p_ndiff.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_ndiff.add_argument("--state", required=True)
+    p_ndiff.add_argument("--from-round", dest="from_round", type=int, help="Round number to diff from (default: round before --to-round)")
+    p_ndiff.add_argument("--to-round", dest="to_round", type=int, help="Round number to diff to (default: most recent)")
+    p_ndiff.add_argument("--out-md", help="Optional markdown output with redline-style code blocks")
+    p_ndiff.set_defaults(func=cmd_negotiate_diff)
+
+    p_nw = neg_sub.add_parser("withdraw", help="Withdraw from a negotiation; flips status to `withdrawn` and blocks further commands")
+    p_nw.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_nw.add_argument("--state", required=True)
+    p_nw.add_argument("--as", dest="as_party", choices=["a", "b"])
+    p_nw.add_argument("--reason", help="Free-text reason for the withdrawal (recorded in state.withdrawal.reason)")
+    p_nw.set_defaults(func=cmd_negotiate_withdraw)
+
+    p_na = neg_sub.add_parser("analyze", help="Read-only post-hoc dashboard for any state file (trajectory, winners, source breakdown, fatigue summary, outcome interpretation)")
+    p_na.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_na.add_argument("--state", required=True)
+    p_na.set_defaults(func=cmd_negotiate_analyze)
 
     p_nso = neg_sub.add_parser("sign-off", help="Review key points (changed clauses, applied amendments, red flags) and approve before finalize")
     p_nso.add_argument("--base", default=str(Path(__file__).resolve().parent))

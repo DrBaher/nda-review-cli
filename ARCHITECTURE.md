@@ -61,7 +61,7 @@ All subcommands live here. Roughly grouped:
 | Knowledge | `ingest`, `build-playbook` | Turn raw contracts into a playbook |
 | Review | `review`, `profile-learn`, `calibrate-scoring` | Score NDAs against the playbook |
 | Authoring | `draft` | Generate outgoing NDAs (mutual / one-way-out) in `.md` + `.docx` |
-| Negotiation | `negotiate init/review/counter/accept/status/sign-off/finalize` | Two-party turn-taking negotiation with stance-driven LLM or deterministic `--auto` agent, mandatory key-points sign-off, and external `docx2pdf` + `sign-CLI` finalize hooks |
+| Negotiation | `negotiate init/review/counter/accept/diff/status/sign-off/finalize/analyze/simulate/withdraw` | Two-party turn-taking negotiation. Three counter modes (manual / `--auto` deterministic / `--agent --llm`), all stance-aware; non-negotiable clauses as hard floor; fatigue concession to break stalemates; mandatory key-points sign-off; external `docx2pdf` + `sign-CLI` finalize hooks; `simulate` for game-theoretic validation; `analyze` for post-hoc dashboards; `diff` for round-by-round redline view; `withdraw` for graceful exit |
 | Output | `generate-redlines`, `generate-office-script`, `quality-gate` | Produce Word-ready amendments |
 | Versioning | `playbook-snapshot`, `playbook-diff`, `playbook-lock` | Track playbook changes |
 | Meta | `policy-validate`, `release-helper`, `create-manifest` | Schema/version/release plumbing |

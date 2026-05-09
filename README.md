@@ -268,6 +268,16 @@ The report includes per-round trajectory (agreed/disputed counts), winner-per-cl
 - Humans always run `negotiate accept` / `negotiate counter` to advance a round; the LLM agent never signs.
 - `--agent` requires `--yes-llm-send` (or `NDA_LLM_NO_CONFIRM=1` env) in non-interactive contexts to prevent accidental contract leaks to a provider.
 - The hash chain is verified on every load — tampering between rounds is detected.
+- **Non-negotiable clauses**: list any clause name in `config/org-policy.json` `non_negotiable_clauses` to declare an absolute redline. Those clauses are **never** fatigue-conceded by your agent; they get force-countered any time the text differs from your preferred. If both sides have overlapping non-negotiables that conflict, the negotiation goes `blocked` rather than auto-resolving — the clear signal that this deal can't close.
+- **`--dry-run`**: `negotiate counter --auto --dry-run` (or `--agent --dry-run`) shows you exactly what amendments the agent will propose **before** committing the round. Especially valuable when using `--agent` with an aggressive stance.
+
+**Helper commands:**
+- `negotiate diff [--from-round N] [--to-round M]` — clause-by-clause redline view of what changed between rounds, with `--out-md` for a human-friendly markdown output.
+- `negotiate analyze` — read-only post-hoc dashboard for any state file: round-by-round trajectory, source breakdown (manual / auto / agent / fatigue), winner-per-clause, fatigue summary, and a game-theoretic interpretation of the outcome.
+- `negotiate withdraw --reason "..."` — graceful exit if you decide to walk away. Flips status to `withdrawn` and blocks further commands.
+- `negotiate simulate --party-a-base X --party-b-base Y --stance-a Z --stance-b W` — run both sides on one machine with configurable stances; useful for validating that a stance combination will converge before committing to a real exchange.
+
+See [`examples/negotiate-cheatsheet.md`](examples/negotiate-cheatsheet.md) for a one-page reference covering every command and flag.
 
 ## Drafting an NDA to send out
 
