@@ -45,6 +45,36 @@ jobs:
       - name: Doctor smoke (informational)
         run: ./nda_review_cli.py doctor --base "${RUNNER_TEMP}/nda-tutorial" || echo "doctor reported issues (expected for sandbox)"
 
+  build-and-install-smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Build wheel and sdist
+        run: |
+          python3 -m pip install --upgrade pip build
+          python3 -m build --wheel --sdist
+          ls -la dist/
+      - name: Install wheel into a fresh venv and exercise CLI
+        run: |
+          python3 -m venv /tmp/nda-runtime
+          /tmp/nda-runtime/bin/pip install --quiet dist/nda_review_cli-*.whl
+          /tmp/nda-runtime/bin/nda-review-cli --version
+          /tmp/nda-runtime/bin/nda-review-cli quickstart --base "${RUNNER_TEMP}/nda-installed" --no-prompt --yes
+          /tmp/nda-runtime/bin/nda-review-cli draft \
+            --base "${RUNNER_TEMP}/nda-installed" \
+            --template mutual \
+            --party-a "Acme" --party-a-address "1 Way" \
+            --party-b "Beta" --party-b-address "2 Way" \
+            --purpose "test" \
+            --out "${RUNNER_TEMP}/nda-installed/draft.md" \
+            --out-docx "${RUNNER_TEMP}/nda-installed/draft.docx"
+          test -s "${RUNNER_TEMP}/nda-installed/draft.docx"
+
   quickstart-and-draft-smoke:
     runs-on: ubuntu-latest
     needs: test

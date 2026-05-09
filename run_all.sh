@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# run_all.sh — full review + redline pipeline (Pass 1 + hybrid pack + step3 + step5,
+# plus step4 for .docx input). For simpler one-off use, prefer:
+#   ./nda_review_cli.py review --file <nda> --why
+#   ./nda_review_cli.py draft --template mutual ...
+# This script forwards COUNTERPARTY, REVIEWER positional args and an optional
+# LLM=<provider> env var to enable second-pass LLM review.
 set -euo pipefail
 
 BASE="$(cd "$(dirname "$0")" && pwd)"
@@ -8,6 +14,7 @@ REVIEWER="${3:-NDA Reviewer}"
 
 if [[ -z "$INPUT" || ! -f "$INPUT" ]]; then
   echo "Usage: $0 /path/to/nda.txt-or-docx 'Counterparty Name' ['Reviewer Name']"
+  echo "  Optional env: LLM=<anthropic|openai|ollama|openai-compatible>"
   exit 1
 fi
 
@@ -18,8 +25,8 @@ if [[ "$INPUT" == *.docx ]]; then
   textutil -convert txt -stdout "$INPUT" > "$WORK_INPUT"
 fi
 
-# 1) deterministic review
-"$BASE/review_nda.sh" "$WORK_INPUT" >/tmp/nda_run_all_det.out
+# 1) deterministic review (with --why; optional LLM second pass via $LLM env var)
+COUNTERPARTY="$COUNTERPARTY" LLM="${LLM:-}" "$BASE/review_nda.sh" "$WORK_INPUT" >/tmp/nda_run_all_det.out
 
 # 2) hybrid pack
 "$BASE/hybrid_review.sh" "$WORK_INPUT" >/tmp/nda_run_all_hybrid.out

@@ -17,6 +17,8 @@ from typing import Optional
 from xml.etree import ElementTree as ET
 from rule_engine import clause_hit, red_flag_hits
 
+__version__ = "0.5.0"
+
 NDA_PAT = re.compile(r"\b(nda|non[-\s]?disclosure|confidentiality agreement|confidential disclosure agreement|cda|mutual nda|geheimhaltungsvereinbarung|vertraulich|vertrauliche informationen)\b", re.I)
 
 FALLBACK_CLAUSE_RULES = {
@@ -1621,16 +1623,33 @@ def cmd_doctor(args):
         args.gmail_paths,
         args.drive_paths,
     )
+    # Corpus-free flow: if data/raw_strict doesn't exist at all, the user is on
+    # Scenario A (no historical corpus). Don't flag missing gmail/drive inputs
+    # as hard failures — those paths are only meaningful when corpus exists.
+    raw_strict = base / "data" / "raw_strict"
+    corpus_mode = raw_strict.exists() and any(raw_strict.iterdir()) if raw_strict.exists() else False
     data_checks = []
     for group, paths in expected.items():
         for p in paths:
             exists = p.exists()
-            item = {"path": str(p), "exists": exists, "group": group}
+            item = {"path": str(p), "exists": exists, "group": group, "corpus_mode": corpus_mode}
             if not exists:
-                hard_failures.append(f"Missing build-playbook input: {p}")
-                fixes.append(f"Create or point `{group}` to a JSON export file with `./nda_review_cli.py build-playbook --base {base} --{'gmail-paths' if group == 'gmail_paths' else 'drive-paths'} ...`.")
+                if corpus_mode:
+                    hard_failures.append(f"Missing build-playbook input: {p}")
+                    fixes.append(f"Create or point `{group}` to a JSON export file with `./nda_review_cli.py build-playbook --base {base} --{'gmail-paths' if group == 'gmail_paths' else 'drive-paths'} ...`.")
+                # else: corpus-free flow — silent, no warning needed
             data_checks.append(item)
-    checks.append({"name": "build_playbook_paths", "status": "ok" if not [x for x in data_checks if not x["exists"]] else "fail", "details": data_checks})
+    if corpus_mode:
+        check_status = "ok" if not [x for x in data_checks if not x["exists"]] else "fail"
+    else:
+        check_status = "skip"
+    checks.append({
+        "name": "build_playbook_paths",
+        "status": check_status,
+        "corpus_mode": corpus_mode,
+        "details": data_checks,
+        "note": None if corpus_mode else "Corpus-free setup detected (no data/raw_strict). Skipping gmail/drive path checks — review still works against config/org-policy.json clause rules.",
+    })
 
     ingest_candidates = discover_ingest_files(base)
     ingest_checks = []
@@ -1666,9 +1685,13 @@ def cmd_doctor(args):
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     status_lines = []
+    status_label = {"ok": "OK", "warn": "WARN", "fail": "FAIL", "skip": "SKIP"}
     for check in checks:
-        emoji = "ok" if check["status"] == "ok" else ("warn" if check["status"] == "warn" else "fail")
-        status_lines.append(f"[{emoji.upper():4}] {check['name']}")
+        label = status_label.get(check["status"], check["status"].upper())
+        suffix = ""
+        if check["status"] == "skip" and check.get("note"):
+            suffix = f" — {check['note']}"
+        status_lines.append(f"[{label:4}] {check['name']}{suffix}")
     if not hard_failures and not warnings:
         status_lines.append("All onboarding checks passed.")
     next_steps = []
@@ -3155,8 +3178,31 @@ def cmd_wizard(args):
         cmd_review(review_args)
 
 
+FIRST_RUN_HINT = (
+    "\nNDA Review CLI — local-first NDA review and drafting.\n\n"
+    "First time? Try one of:\n"
+    "  ./nda_review_cli.py tutorial            # interactive primer + sample review\n"
+    "  ./nda_review_cli.py quickstart          # 14-question guided setup\n"
+    "  ./nda_review_cli.py setup --quick --yes # zero-friction defaults\n"
+    "\nCommon commands:\n"
+    "  review --file <nda>                     # score an NDA against your playbook\n"
+    "  draft --template mutual ...             # generate an outgoing NDA\n"
+    "  doctor                                  # diagnose first-run readiness\n"
+    "\nSee `--help` for the full list, or read GETTING_STARTED.md.\n"
+)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="NDA Review CLI")
+    parser = argparse.ArgumentParser(
+        prog="nda-review-cli",
+        description="Local-first NDA review and drafting CLI (deterministic + optional LLM augmentation).",
+    )
+    parser.add_argument("--version", action="version", version=f"nda-review-cli {__version__}")
+    # `cmd` is technically required, but we want a friendlier message than argparse's
+    # default when the user runs the tool with no args at all.
+    if len(sys.argv) == 1:
+        print(FIRST_RUN_HINT, file=sys.stderr)
+        raise SystemExit(0)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_build = sub.add_parser("build-playbook", help="Build NDA playbook from extracted Gmail/Drive corpus")

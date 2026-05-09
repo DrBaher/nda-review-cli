@@ -20,13 +20,25 @@ which pdftotext   # optional
 
 ## Install
 
+Two equivalent options.
+
+### A. Clone and run (no install)
+
 ```bash
-git clone <this-repo-url> nda-review-cli
+git clone https://github.com/DrBaher/nda-review-cli.git
 cd nda-review-cli
 chmod +x nda_review_cli.py review_nda.sh run_all.sh step*.sh
+./nda_review_cli.py --version
 ```
 
-There is nothing to `pip install`. The CLI is a single self-contained Python file.
+### B. pipx-install for system-wide use
+
+```bash
+pipx install git+https://github.com/DrBaher/nda-review-cli.git
+nda-review-cli --version
+```
+
+Either way, there are no runtime dependencies — the CLI is stdlib-only Python (`>=3.9`). The pipx form gives you `nda-review-cli` on `$PATH`; the cloned form uses `./nda_review_cli.py`. Examples below use the cloned form.
 
 ## Mental model
 

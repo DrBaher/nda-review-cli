@@ -9,7 +9,15 @@
 
 The CLI ingests your past contracts, extracts your negotiation style into a versioned playbook, and applies it as a deterministic, explainable policy to every new NDA — with clause-by-clause findings, severity scoring, and Word-ready redlines.
 
-📚 **[Quick start](#quick-start-3-commands)** · **[Getting Started guide](GETTING_STARTED.md)** · **[Architecture](ARCHITECTURE.md)** · **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)**
+📚 **[Quick start](#quick-start-3-commands)** · **[60-second demo](examples/demo.md)** · **[Getting Started guide](GETTING_STARTED.md)** · **[Architecture](ARCHITECTURE.md)** · **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)**
+
+<!--
+  To regenerate the asciinema cast:
+    asciinema rec --command "./scripts/record-demo.sh" demo.cast
+    asciinema upload demo.cast
+  Then paste the URL above this comment as `[![asciicast](URL.svg)](URL)`.
+-->
+
 
 ## Why it exists
 
@@ -43,11 +51,27 @@ Past contracts ──► ingest ──► playbook ──► review NDA ──�
 
 For the deep dive — components, file layout, scoring weights, determinism guarantees — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
+## Install
+
+```bash
+# Option A: clone and run (no install)
+git clone https://github.com/DrBaher/nda-review-cli.git
+cd nda-review-cli
+./nda_review_cli.py --version
+
+# Option B: pipx-install for system-wide use
+pipx install git+https://github.com/DrBaher/nda-review-cli.git
+nda-review-cli --version
+```
+
+The pipx install gives you `nda-review-cli` on `$PATH` everywhere; the cloned form is identical apart from the script name (`./nda_review_cli.py` vs `nda-review-cli`). Examples below use the cloned form for portability.
+
 ## Quick start (3 commands)
 
 ```bash
 # 1. Clone and enter the repo
-git clone <this-repo-url> nda-review-cli && cd nda-review-cli
+git clone https://github.com/DrBaher/nda-review-cli.git
+cd nda-review-cli
 
 # 2. One-shot setup — creates config + profile, auto-discovers any contracts in the repo, builds the playbook
 ./nda_review_cli.py setup --quick --yes

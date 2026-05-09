@@ -19,3 +19,8 @@ config/quickstart-answers.json
 
 __pycache__/
 *.pyc
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
