@@ -374,6 +374,77 @@ class LLMPromptParityTests(unittest.TestCase):
         self.assertIn("bounce_count=1", user_msg)  # term_and_survival bounced once in round 2
 
 
+class ValidateTests(unittest.TestCase):
+    def setUp(self):
+        self.workdir = Path(tempfile.mkdtemp(prefix="nda-validate-"))
+        self.party_a = self.workdir / "a"
+        self.party_b = self.workdir / "b"
+        quickstart(self.party_a, "Acme")
+        quickstart(self.party_b, "Beta")
+        self.state = self.workdir / "state.json"
+        init_negotiation(self.party_a, self.state)
+
+    def test_validate_passes_on_clean_state(self):
+        result = run([
+            "negotiate", "validate",
+            "--state", str(self.state),
+        ])
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["hash_chain_verified"])
+        self.assertEqual(payload["structural_issues"], [])
+        self.assertEqual(payload["rounds_total"], 1)
+
+    def test_validate_fails_on_tampered_text(self):
+        # Tamper with round 1 text but leave hash unchanged → load() detects it
+        state = json.loads(self.state.read_text())
+        state["rounds"][0]["text"] = state["rounds"][0]["text"] + "\n\nINSERTED CLAUSE."
+        self.state.write_text(json.dumps(state))
+        result = run([
+            "negotiate", "validate",
+            "--state", str(self.state),
+        ], expect_code=2)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("Hash-chain mismatch", payload.get("error", ""))
+
+    def test_validate_fails_on_proposer_alternation_violation(self):
+        # Append a fake round with the same proposer as round 1 (a). Since
+        # round 1 is the initial draft signed by A, round 2 with proposer=a
+        # would violate alternation. We must also chain the hash correctly so
+        # we hit the structural check rather than the hash-chain check.
+        state = json.loads(self.state.read_text())
+        prev_hash = state["rounds"][0]["text_hash"]
+        new_text = state["rounds"][0]["text"] + "\n\n## extra\n\nadded\n"
+        # Re-derive the hash so the chain itself remains intact.
+        import hashlib
+        h = hashlib.sha256()
+        h.update(prev_hash.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(new_text.encode("utf-8"))
+        state["rounds"].append({
+            "round": 2,
+            "proposer": "a",  # SAME as round 1 — alternation violated
+            "timestamp": "2026-05-09T00:00:00+00:00",
+            "text": new_text,
+            "text_hash": h.hexdigest(),
+            "amendments": [],
+            "accept_clauses": [],
+            "summary": "",
+            "signature": {"signer": "a", "signed_at": "2026-05-09T00:00:00+00:00", "method": "json_flag"},
+            "amendment_source": "manual",
+        })
+        self.state.write_text(json.dumps(state))
+        result = run([
+            "negotiate", "validate",
+            "--state", str(self.state),
+        ], expect_code=2)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        issues = " ".join(payload["structural_issues"])
+        self.assertIn("alternation", issues)
+
+
 class _FakeResponse:
     def __init__(self, data: bytes):
         self._data = data

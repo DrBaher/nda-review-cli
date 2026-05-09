@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Added **`negotiate validate`** — standalone integrity check (schema version + hash-chain verification + per-round structural shape: round numbering, proposer alternation, signer-matches-proposer, text/text_hash present). Exits 0 on success, 2 on any failure with the specific issue listed. Useful when receiving a state file from another party or after hand-editing.
+- CI: added a **`negotiate-smoke`** job that runs the full negotiate flow end-to-end (init → counter → accept → sign-off → finalize → analyze → validate → simulate) on every push/PR. Catches packaging regressions in the negotiate code path.
+
 ## [0.5.0] - 2026-05-09
 
 - Added **`non_negotiable_clauses`** in policy: hard floor — clauses in this list are NEVER fatigue-conceded by your agent and are always force-countered when text differs from your preferred, regardless of stance/priority/concession-zone. Provides absolute-redline semantics for clauses you're unwilling to compromise on. Surfaces in the LLM agent's system prompt and the `block_diagnosis` text when the negotiation deadlocks on a non-negotiable conflict.

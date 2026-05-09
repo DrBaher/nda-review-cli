@@ -120,3 +120,89 @@ jobs:
                       ET.fromstring(zf.read(name))
                   print(f'OK: {path}')
           " "${RUNNER_TEMP}/nda-quick/out/mutual.docx" "${RUNNER_TEMP}/nda-quick/out/oneway.docx"
+
+  negotiate-smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Set up two distinct workspaces
+        run: |
+          mkdir -p "${RUNNER_TEMP}/neg"
+          ./nda_review_cli.py quickstart --base "${RUNNER_TEMP}/neg/a" --no-prompt --yes
+          ./nda_review_cli.py quickstart --base "${RUNNER_TEMP}/neg/b" --no-prompt --yes
+          python3 -c "
+          import json
+          for d, name in [('${RUNNER_TEMP}/neg/a', 'Acme'), ('${RUNNER_TEMP}/neg/b', 'Beta')]:
+              p = f'{d}/config/org-policy.json'
+              o = json.load(open(p))
+              o['org_name'] = name
+              json.dump(o, open(p, 'w'))
+          "
+      - name: Run a full negotiate flow (init → counter → accept → sign-off → finalize)
+        run: |
+          STATE="${RUNNER_TEMP}/neg/state.json"
+          ./nda_review_cli.py negotiate init \
+            --base "${RUNNER_TEMP}/neg/a" \
+            --template mutual \
+            --party-a-name "Acme" --party-a-address "1 Main" \
+            --party-b-name "Beta" --party-b-address "2 Side" \
+            --purpose "ci smoke test" --effective-date "2026-01-01" \
+            --out "$STATE"
+          ./nda_review_cli.py negotiate counter --base "${RUNNER_TEMP}/neg/b" --state "$STATE" --auto
+          ./nda_review_cli.py negotiate accept  --base "${RUNNER_TEMP}/neg/a" --state "$STATE" --as a
+          ./nda_review_cli.py negotiate sign-off --base "${RUNNER_TEMP}/neg/a" --state "$STATE" --as a --yes
+          ./nda_review_cli.py negotiate sign-off --base "${RUNNER_TEMP}/neg/b" --state "$STATE" --as b --yes
+          ./nda_review_cli.py negotiate finalize \
+            --base "${RUNNER_TEMP}/neg/a" --state "$STATE" \
+            --out-md  "${RUNNER_TEMP}/neg/agreed.md" \
+            --out-docx "${RUNNER_TEMP}/neg/agreed.docx"
+          test -s "${RUNNER_TEMP}/neg/agreed.md"
+          test -s "${RUNNER_TEMP}/neg/agreed.docx"
+          python3 -c "
+          import json
+          state = json.load(open('${RUNNER_TEMP}/neg/state.json'))
+          assert state['status'] == 'finalized', f'expected finalized, got {state[\"status\"]}'
+          assert 'a' in state['signoffs'] and 'b' in state['signoffs']
+          print('finalized state OK')
+          "
+      - name: Run negotiate analyze + validate
+        run: |
+          STATE="${RUNNER_TEMP}/neg/state.json"
+          ./nda_review_cli.py negotiate analyze --base "${RUNNER_TEMP}/neg/a" --state "$STATE" \
+            | python3 -c "
+          import json, sys
+          d = json.loads(sys.stdin.read())
+          assert d['status'] == 'finalized'
+          assert d['outcome_interpretation']['label'] in ('finalized', 'converged organically', 'converged via fatigue')
+          assert d['rounds_total'] >= 3
+          print('analyze OK')
+          "
+          ./nda_review_cli.py negotiate validate --state "$STATE" \
+            | python3 -c "
+          import json, sys
+          d = json.loads(sys.stdin.read())
+          assert d['ok'] is True
+          assert d['hash_chain_verified'] is True
+          assert not d['structural_issues']
+          print('validate OK')
+          "
+      - name: Run negotiate simulate (game-theoretic check)
+        run: |
+          ./nda_review_cli.py negotiate simulate \
+            --party-a-base "${RUNNER_TEMP}/neg/a" \
+            --party-b-base "${RUNNER_TEMP}/neg/b" \
+            --stance-a compromising --stance-b compromising \
+            --mode auto --max-rounds 5 \
+            --out "${RUNNER_TEMP}/neg/sim-report.json" \
+            --state "${RUNNER_TEMP}/neg/sim-state.json"
+          python3 -c "
+          import json
+          r = json.load(open('${RUNNER_TEMP}/neg/sim-report.json'))
+          assert r['outcome'] == 'converged', f'expected converged, got {r[\"outcome\"]}'
+          print('simulate OK')
+          "

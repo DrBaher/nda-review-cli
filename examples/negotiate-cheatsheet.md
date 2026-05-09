@@ -36,6 +36,7 @@ nda-review-cli quickstart                # answers Q1..Q16 incl. stance, priorit
 | `negotiate diff` | Show clause-by-clause changes between two rounds | `--state`, `--from-round`, `--to-round`, `--out-md` |
 | `negotiate status` | Show round history, per-clause status, signatures | `--state` |
 | `negotiate analyze` | Post-hoc dashboard: trajectory, winners, source breakdown, fatigue summary | `--state` |
+| `negotiate validate` | Standalone integrity check: schema + hash-chain + per-round structural shape | `--state` (exits 2 on failure) |
 | `negotiate sign-off` | Required human gate: review key points, batch-confirm | `--state`, `--as`, `--yes` |
 | `negotiate finalize` | Emit agreed `.md` + `.docx`; optional PDF + sign hooks | `--state`, `--out-md`, `--out-docx`, `--to-pdf`, `--sign`, `--skip-signoff` (testing) |
 | `negotiate withdraw` | Graceful exit; flips status to `withdrawn` | `--state`, `--as`, `--reason` |

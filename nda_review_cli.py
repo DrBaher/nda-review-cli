@@ -4438,6 +4438,57 @@ def _negotiate_interpret_outcome(state: dict, trajectory: list, src_counter: Cou
     return {"label": label, "notes": notes}
 
 
+def cmd_negotiate_validate(args):
+    """Standalone integrity check on a negotiation state file. Verifies the
+    schema version, the per-round SHA-256 hash chain end-to-end, and the
+    structural shape of every round. Exits 0 on success, 2 on any failure.
+
+    Useful when you receive a state file from another party and want to
+    confirm it hasn't been tampered with before processing it, or after
+    hand-editing the JSON to catch mistakes."""
+    state_path = Path(args.state)
+    try:
+        state = _negotiate_load(state_path)
+    except SystemExit as e:
+        print(json.dumps({
+            "ok": False,
+            "state_file": str(state_path),
+            "error": str(e),
+        }, indent=2, ensure_ascii=False))
+        raise SystemExit(2)
+
+    rounds = state.get("rounds", [])
+    issues = []
+    expected_alternation = None
+    for i, r in enumerate(rounds):
+        if not isinstance(r.get("round"), int) or r["round"] != i + 1:
+            issues.append(f"Round {i}: 'round' field {r.get('round')!r} doesn't match index {i + 1}")
+        if r.get("proposer") not in ("a", "b"):
+            issues.append(f"Round {r.get('round')}: proposer {r.get('proposer')!r} not in ('a', 'b')")
+        if expected_alternation is not None and r.get("proposer") == expected_alternation:
+            issues.append(f"Round {r.get('round')}: same proposer as previous round (no alternation)")
+        expected_alternation = r.get("proposer")
+        sig = r.get("signature") or {}
+        if sig.get("signer") != r.get("proposer"):
+            issues.append(f"Round {r.get('round')}: signature.signer {sig.get('signer')!r} != proposer {r.get('proposer')!r}")
+        if "text" not in r or "text_hash" not in r:
+            issues.append(f"Round {r.get('round')}: missing text or text_hash")
+
+    payload = {
+        "ok": not issues,
+        "state_file": str(state_path),
+        "schema_version": state.get("schema_version"),
+        "negotiation_id": state.get("negotiation_id"),
+        "status": state.get("status"),
+        "rounds_total": len(rounds),
+        "hash_chain_verified": True,  # _negotiate_load already verified or raised
+        "structural_issues": issues,
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    if issues:
+        raise SystemExit(2)
+
+
 def cmd_negotiate_signoff(args):
     base = Path(args.base)
     state = _negotiate_load(Path(args.state))
@@ -5125,6 +5176,10 @@ def main():
     p_na.add_argument("--base", default=str(Path(__file__).resolve().parent))
     p_na.add_argument("--state", required=True)
     p_na.set_defaults(func=cmd_negotiate_analyze)
+
+    p_nv = neg_sub.add_parser("validate", help="Standalone integrity check: schema version + hash-chain verification + per-round structural shape (exits 2 on any failure)")
+    p_nv.add_argument("--state", required=True)
+    p_nv.set_defaults(func=cmd_negotiate_validate)
 
     p_nso = neg_sub.add_parser("sign-off", help="Review key points (changed clauses, applied amendments, red flags) and approve before finalize")
     p_nso.add_argument("--base", default=str(Path(__file__).resolve().parent))
