@@ -49,6 +49,17 @@ No strict prefix taxonomy is required, but `feat`, `fix`, `docs`, `chore`, `refa
 - Match surrounding style. The codebase prefers small focused functions over heavy abstraction.
 - No unnecessary comments — let identifiers tell the story.
 
+## Why a single file?
+
+`nda_review_cli.py` is now ~5000 lines in one file. That looks unusual for an OSS project of this size, and we get asked about it. The single-file structure is deliberate:
+
+1. **End-to-end auditability.** Anyone reviewing what the CLI does — especially security-sensitive behavior like LLM data flow, the hash chain, or the determinism guarantees — can read one file and have the full picture. No jumping between modules to trace a code path.
+2. **Zero install complexity.** `pipx install .` works, `git clone && ./nda_review_cli.py ...` works, `python3 -m nda_review_cli` works. No package layout, no namespace conflicts, no relative-import gotchas.
+3. **Stdlib-only stays honest.** When everything is in one file, it's hard to sneak in a dependency. The "no third-party runtime imports" rule is enforceable by `grep`.
+4. **Trivial vendoring.** A user wanting to fork for an adjacent contract type can copy one file plus `rule_engine.py` plus `config/` plus `templates/` and have a working tool.
+
+If you'd like to refactor into a package, please open an issue first — we'd want to discuss whether the gains (clearer module boundaries, easier IDE navigation) outweigh the costs (auditability, install simplicity). Not an automatic "no", but it's a meaningful structural shift, not a routine cleanup.
+
 ## Testing additions
 
 - Place new tests under `tests/` named `test_<area>.py`.
