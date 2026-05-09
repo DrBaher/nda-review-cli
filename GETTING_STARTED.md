@@ -140,10 +140,90 @@ Outputs land under `output/reviews/` and `output/tracked-redline/`.
 
 Run `./nda_review_cli.py doctor` whenever something feels off — it prints the suggested fix for each detected issue.
 
+## Onboarding scenarios
+
+Pick the path that matches your situation.
+
+### Scenario A — Solo lawyer, no historical corpus
+
+You just want to review NDAs against a sensible default policy.
+
+```bash
+./nda_review_cli.py setup --quick --yes
+./nda_review_cli.py review --file /path/to/nda.txt --why \
+  --out-md output/reviews/nda.md
+```
+
+You'll lean on `config/default-policy.json` (the committed seed). Edit `config/org-policy.json` whenever you want to override a clause rule. Skip ingest entirely.
+
+### Scenario B — In-house legal, large contracts archive
+
+You have a folder of past NDAs and want the playbook to reflect your house style.
+
+```bash
+./nda_review_cli.py setup --quick --yes \
+  --org-name "Acme Legal" \
+  --template enterprise \
+  --contracts-dir ~/Documents/nda-archive
+
+./nda_review_cli.py build-playbook
+./nda_review_cli.py doctor
+
+./nda_review_cli.py review --file /path/to/incoming-nda.docx --why \
+  --counterparty "Vendor Co" --learn-profile \
+  --out-json output/reviews/vendor-co-2025q2.json \
+  --out-md output/reviews/vendor-co-2025q2.md
+```
+
+Run this once per new counterparty; the profile improves over time.
+
+### Scenario C — Migrating from manual Word redlines
+
+You already have redline `.docx` files and want the CLI to learn from them.
+
+```bash
+mkdir -p knowledge/redlines knowledge/contracts
+cp ~/redlines/*.docx knowledge/redlines/
+cp ~/contracts/*.docx knowledge/contracts/
+
+./nda_review_cli.py ingest --yes
+./nda_review_cli.py build-playbook
+```
+
+If `pdftotext` isn't installed and you have PDFs, either install `poppler-utils` or pre-convert with `textutil` (macOS) / `pdftotext` (Linux).
+
+### Scenario D — Google Drive Takeout export
+
+```bash
+# Download a Google Takeout for your Drive, unzip it under ~/Downloads/Takeout
+./nda_review_cli.py setup --quick --yes \
+  --drive-export-dir ~/Downloads/Takeout
+
+./nda_review_cli.py build-playbook
+```
+
+The CLI handles `My Drive/`, `Shared drives/`, and Takeout folder layouts.
+
+### Scenario E — SaaS team rolling this out internally
+
+Use a template + scoring profile per team:
+
+```bash
+./nda_review_cli.py setup --quick --yes \
+  --org-name "Acme SaaS" \
+  --template saas \
+  --scoring-profile balanced \
+  --contracts-dir /shared/contracts/nda-archive
+```
+
+Commit a sanitized `config/default-policy.json` to the repo. Keep `config/org-policy.json` and `profiles/` per-user (already gitignored).
+
 ## Where to go next
 
+- **How the CLI is structured:** [ARCHITECTURE.md](ARCHITECTURE.md)
 - **Concepts deep-dive:** [README.md → Core concepts](README.md#core-concepts)
 - **Wizard flow:** `./nda_review_cli.py wizard --quick --yes --review-file tests/fixtures/sample_nda.txt`
 - **Counterparty learning:** [README.md → Review explainability and profile learning](README.md#review-explainability-and-profile-learning)
 - **Scoring profiles & calibration:** [README.md → Scoring profiles and calibration](README.md#scoring-profiles-and-calibration)
+- **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md)
 - **Run the test suite:** `python3 -m unittest discover -s tests -p 'test_*.py' -v`

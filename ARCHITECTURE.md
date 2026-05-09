@@ -1,0 +1,157 @@
+# Architecture
+
+A short tour of how the CLI is structured, why it's structured that way, and where to look when changing behaviour.
+
+## Design principles
+
+1. **Local-first.** The tool never sends contract text, policies, or profiles over the network. There is no model call in the hot path. Anyone can audit what runs by reading one Python file.
+2. **Deterministic.** Same input + same policy = same output, every time. No timestamps in review bodies, no random tie-breakers, no LLM outputs that drift between versions.
+3. **Rules-first, not model-first.** Patterns and configs do the work. The corpus only provides signals (frequency counts, example matches) used to seed the playbook.
+4. **Single-file CLI.** `nda_review_cli.py` is intentionally one large file with stdlib only. Easier to ship, audit, and hack on.
+5. **Friendly defaults, opt-in complexity.** `setup --quick --yes` produces something useful in seconds. Every flag has a sensible default.
+
+## High-level data flow
+
+```
+                ┌────────────────────┐
+                │  Past contracts    │   (Gmail/Drive corpus, contracts dir,
+                │  + policy seed     │    or Drive Takeout export)
+                └─────────┬──────────┘
+                          │  ingest / build-playbook
+                          ▼
+   ┌────────────────────────────────────────────────────────┐
+   │   PLAYBOOK   output/nda_playbook.json + .md            │
+   │   (clause rules, signal frequencies, preferred lang)   │
+   └─────────┬──────────────────────────────────────────────┘
+             │  review
+             ▼
+   ┌─────────────────────────────────────────────────────────┐
+   │   REVIEW     output/reviews/<name>.json + .md           │
+   │   (clause-by-clause findings, severity, evidence)       │
+   └────┬───────┬───────────────┬──────────────────────────┘
+        │       │               │
+        │       │               └─►  generate-redlines (clause-ready amendments)
+        │       │
+        │       └─► profile-learn / --learn-profile
+        │            updates profiles/<counterparty>.json
+        │
+        ▼
+   hybrid_review.sh ─► step3_redline_pack.sh ─► step4_prepare_tracked_redline.sh
+                                          └──► step5_find_replace_pack.sh
+                                               (Word-ready outputs)
+```
+
+Three ground-truth artefacts, three operations:
+
+| Artefact | What it is | Edit cadence |
+|---|---|---|
+| **Policy** (`config/*.json`) | House rules: clause keywords, preferred language, red flags, risk weights | Manual, rare |
+| **Profile** (`profiles/<name>.json`) | Per-counterparty memory | Auto (`--learn-profile`) or manual |
+| **Playbook** (`output/nda_playbook.json`) | Compiled artefact used by review | Regenerate on demand |
+
+## Components
+
+### `nda_review_cli.py` — the single-file CLI
+
+All subcommands live here. Roughly grouped:
+
+| Group | Commands | Purpose |
+|---|---|---|
+| Onboarding | `init`, `setup`, `wizard`, `tutorial`, `doctor` | First-run config + sanity checks |
+| Knowledge | `ingest`, `build-playbook` | Turn raw contracts into a playbook |
+| Review | `review`, `profile-learn`, `calibrate-scoring` | Score NDAs against the playbook |
+| Output | `generate-redlines`, `generate-office-script`, `quality-gate` | Produce Word-ready amendments |
+| Versioning | `playbook-snapshot`, `playbook-diff`, `playbook-lock` | Track playbook changes |
+| Meta | `policy-validate`, `release-helper`, `create-manifest` | Schema/version/release plumbing |
+
+### `rule_engine.py` — deterministic clause matching
+
+Tiny module exporting `clause_hit()` and `red_flag_hits()`. Holds the regex pattern catalogue per clause. Imported by `nda_review_cli.py`. Kept separate so it can be unit-tested in isolation (`tests/test_rule_engine.py`).
+
+### Shell orchestration scripts
+
+The `.sh` scripts wire the Python building blocks into common workflows. They exist because legal users often live in shell, not Python.
+
+| Script | Wraps | Purpose |
+|---|---|---|
+| `review_nda.sh` | `nda_review_cli.py review` | Sensible defaults for one-shot review |
+| `hybrid_review.sh` | review + post-processing | Produces a "hybrid approval pack" markdown |
+| `step3_redline_pack.sh` | `generate_redline_instructions.py` | Step 3: clause-numbered redline instruction set |
+| `step4_prepare_tracked_redline.sh` | step3 output + Word | Step 4: builds `.docx` tracked-changes runbook |
+| `step5_find_replace_pack.sh` | step3 output | Step 5: anchor-safe find/replace pack |
+| `run_all.sh` | all of the above | End-to-end pipeline from `.txt`/`.docx` to redline pack |
+
+### `step2_pass2_review.py` — interactive triage
+
+Standalone Python tool for the human-in-the-loop pass-2 step. Reads a hybrid approval pack and lets a reviewer confirm/downgrade/drop each finding before redlines are generated. Supports `--mode interactive`, `--mode defaults`, and `--decisions-json`.
+
+### `generate_redline_instructions.py` — pack → instruction set
+
+Parses a hybrid approval pack and produces clause-numbered redline instructions. Invoked by `step3_redline_pack.sh`.
+
+### `config/`
+
+- `default-policy.json` — committed seed policy (generic).
+- `scoring-profiles.json` — committed scoring profile presets (`balanced`, `strict`, `commercial`).
+- `org-policy.json` — gitignored. User overrides live here.
+
+### `tests/`
+
+| Test | What it covers |
+|---|---|
+| `test_rule_engine.py` | Pattern catalogue determinism |
+| `test_review_golden.py` | Locked review output for a fixture NDA — fail loudly if anything drifts |
+| `test_review_explainability.py` | `--why` evidence shape and profile-learn determinism |
+| `test_onboarding_ingest.py` | `init` + `ingest` non-interactive flow |
+| `test_onboarding_e2e_smoke.py` | Full `setup --quick → build → review` happy path |
+| `test_wizard_flow.py` | End-to-end wizard run with autodiscovered files |
+| `test_manifest_cli.py` | Audit manifest output shape |
+
+## Review pipeline (deep dive)
+
+```
+NDA text  ─►  paragraph/sentence segmentation
+            ─►  clause classification (rule_engine.clause_hit)
+            ─►  red-flag detection (rule_engine.red_flag_hits)
+            ─►  severity scoring (scoring profile weights)
+            ─►  decision (approve / escalate / block) per thresholds
+            ─►  optional: explainability evidence (--why)
+            ─►  optional: profile update (--learn-profile)
+            ─►  JSON + Markdown output
+```
+
+The scoring profile decides:
+
+- **Risk weights** per category (legal/commercial/operational)
+- **Severity weights** for high/low findings
+- **Decision thresholds** for `approve_max` and `escalate_max`
+
+Tweaking these is the cleanest way to retune output without rewriting rules.
+
+## Where to make common changes
+
+| You want to... | Edit |
+|---|---|
+| Change clause keywords / red flags | `config/default-policy.json` (or `org-policy.json` locally) |
+| Add a new clause type | `default-policy.json` + extend `RED_FLAG_PATTERNS` in `rule_engine.py` |
+| Tweak severity / decision thresholds | `config/scoring-profiles.json` |
+| Change review output structure | `cmd_review` in `nda_review_cli.py` |
+| Change ingest discovery roots | `_build_ingest_roots` and `discover_ingest_files` |
+| Add a new subcommand | Define `cmd_<name>`, register a parser in `main()` |
+
+## Determinism guarantees
+
+The CLI promises:
+
+- **No clocks in review output.** Any timestamp in a review file lives in a clearly labelled `reviewed_at` field at the top level, never inside a finding body.
+- **Stable iteration order.** All dicts that flow into output are sorted or constructed in a fixed order.
+- **No randomness.** Nothing in the review pipeline calls `random` or makes a network request.
+
+If you find a determinism bug — same input producing different output across runs — that's a high-priority issue. Please open one with reproducer.
+
+## Non-goals
+
+- Replacing a lawyer's judgement. The CLI flags issues; humans decide.
+- Drafting NDAs from scratch. It reviews and redlines what's already in front of you.
+- Multi-tenant SaaS. Single-user, single-machine, by design.
+- Cloud sync of policies/profiles. Use git or your own backup story.

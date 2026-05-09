@@ -4,18 +4,43 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        python-version: ['3.9', '3.10', '3.11', '3.12']
     runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Compile
+        run: python3 -m py_compile nda_review_cli.py step2_pass2_review.py generate_redline_instructions.py rule_engine.py
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+  tutorial-smoke:
+    runs-on: ubuntu-latest
+    needs: test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Compile
-        run: python3 -m py_compile nda_review_cli.py step2_pass2_review.py generate_redline_instructions.py rule_engine.py
-      - name: Run tests
-        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+          cache: pip
+      - name: Tutorial end-to-end smoke
+        run: |
+          ./nda_review_cli.py tutorial --base "${RUNNER_TEMP}/nda-tutorial" --no-prompt --run-sample
+          test -f "${RUNNER_TEMP}/nda-tutorial/output/nda_playbook.json"
+          test -f "${RUNNER_TEMP}/nda-tutorial/output/reviews/tutorial-review.json"
+      - name: Doctor smoke (informational)
+        run: ./nda_review_cli.py doctor --base "${RUNNER_TEMP}/nda-tutorial" || echo "doctor reported issues (expected for sandbox)"

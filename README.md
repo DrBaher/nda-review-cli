@@ -1,6 +1,19 @@
 # NDA Review CLI
 
-Review NDAs against your own house playbook — without sending them to a third-party service. The CLI ingests your past contracts, extracts your negotiation style, and applies it as a deterministic, explainable policy to every new NDA.
+> Review NDAs against your own house playbook — locally, deterministically, and without sending a single clause to a third-party service.
+
+[![CI](https://github.com/DrBaher/nda-review-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/DrBaher/nda-review-cli/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
+[![Local-first](https://img.shields.io/badge/local--first-yes-brightgreen.svg)](#why-it-exists)
+
+The CLI ingests your past contracts, extracts your negotiation style into a versioned playbook, and applies it as a deterministic, explainable policy to every new NDA — with clause-by-clause findings, severity scoring, and Word-ready redlines.
+
+📚 **[Quick start](#quick-start-3-commands)** · **[Getting Started guide](GETTING_STARTED.md)** · **[Architecture](ARCHITECTURE.md)** · **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)**
+
+## Why it exists
+
+Sending NDAs to a SaaS reviewer means leaking your counterparty list, your fallback positions, and the wording of every contract you touch. This tool runs entirely on your machine, has no telemetry, and is auditable in a single Python file.
 
 ## What it does
 
@@ -10,6 +23,24 @@ Review NDAs against your own house playbook — without sending them to a third-
 - **Learns counterparty profiles** deterministically so repeat parties get a consistent stance.
 
 Everything runs locally. No model calls, no data leaves the box.
+
+## How it works
+
+```
+Past contracts ──► ingest ──► playbook ──► review NDA ──► redline pack
+                              ▲                      │
+                              └── policy (your rules)│
+                                                     ▼
+                                       counterparty profile (learns)
+```
+
+1. **You curate a policy** (`config/org-policy.json`) — clause keywords, preferred language, red flags, risk weights.
+2. **The CLI ingests** your historical contracts and emits a versioned **playbook** that captures your house style.
+3. **For each new NDA**, the review engine matches clauses, flags red-flag patterns, scores severity, and emits a decision (approve / escalate / block) with explainability evidence.
+4. **Output is deterministic** — same input + same policy = same output, every time. Audit trails and golden tests guarantee it.
+5. **Word-ready redlines** flow out via the `step3` → `step4`/`step5` shell pipeline.
+
+For the deep dive — components, file layout, scoring weights, determinism guarantees — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ## Quick start (3 commands)
 
@@ -165,6 +196,21 @@ You can override these paths:
 - This is a rules-first MVP generated from corpus signals.
 - Use the output playbook as a living policy file and refine clause positions over time.
 - Keep user/org-specific policies, extracted email/Drive data, and review outputs local.
+
+## Documentation map
+
+| File | When to read it |
+|---|---|
+| [`README.md`](README.md) | You're here. Overview + command reference. |
+| [`GETTING_STARTED.md`](GETTING_STARTED.md) | First-run walkthrough, scenarios, troubleshooting. |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | How the CLI is structured, data flow, where to make changes. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Dev setup, branch model, testing conventions. |
+| [`SECURITY.md`](SECURITY.md) | Threat model and how to report a vulnerability. |
+| [`CHANGELOG.md`](CHANGELOG.md) | Per-release user-facing notes. |
+
+## License
+
+[MIT](LICENSE) © Baher Al Hakim. Use it, fork it, ship it — just keep the copyright notice.
 
 ## One-command pipeline
 
