@@ -281,11 +281,15 @@ You can override these paths:
 | File | When to read it |
 |---|---|
 | [`README.md`](README.md) | You're here. Overview + command reference. |
-| [`GETTING_STARTED.md`](GETTING_STARTED.md) | First-run walkthrough, scenarios, troubleshooting. |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | How the CLI is structured, data flow, where to make changes. |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Dev setup, branch model, testing conventions. |
-| [`SECURITY.md`](SECURITY.md) | Threat model and how to report a vulnerability. |
+| [`GETTING_STARTED.md`](GETTING_STARTED.md) | First-run walkthrough, scenario-based onboarding (solo / in-house / migration / Drive Takeout / SaaS team / drafting / LLM-augmented), troubleshooting. |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | How the CLI is structured, data flow, where to make changes, determinism guarantees, optional LLM augmentation design. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Dev setup, branch model, testing conventions, network-I/O rules. |
+| [`SECURITY.md`](SECURITY.md) | Threat model, LLM data flow disclosure, how to report a vulnerability. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Per-release user-facing notes. |
+| [`config/default-policy.json`](config/default-policy.json) | Committed seed policy — generic clause rules and red flags. Edit `config/org-policy.json` for your overrides. |
+| [`config/scoring-profiles.json`](config/scoring-profiles.json) | Scoring weights + decision thresholds for `balanced` / `strict` / `commercial`. |
+| [`config/llm.json.example`](config/llm.json.example) | Schema for `config/llm.json` (gitignored): provider, model, API key, base URL. Used by `review --llm`. |
+| [`templates/`](templates/) | Bundled NDA templates used by `draft` (mutual + one-way disclosing). Each uses `{{placeholders}}` filled from CLI args + policy clause text. |
 
 ## License
 

@@ -173,7 +173,8 @@ Architectural rules:
 
 ## Non-goals
 
-- Replacing a lawyer's judgement. The CLI flags issues; humans decide.
-- Drafting NDAs from scratch. It reviews and redlines what's already in front of you.
+- Replacing a lawyer's judgement. The CLI flags issues and proposes language; humans decide.
 - Multi-tenant SaaS. Single-user, single-machine, by design.
 - Cloud sync of policies/profiles. Use git or your own backup story.
+- Built-in legal-database lookups, e-signature integration, or matter-management features. Out of scope.
+- Always-on LLM behaviour. The model only runs when you explicitly pass `--llm` and confirm the send. There is no implicit "AI mode".

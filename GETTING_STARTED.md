@@ -223,6 +223,61 @@ Use a template + scoring profile per team:
 
 Commit a sanitized `config/default-policy.json` to the repo. Keep `config/org-policy.json` and `profiles/` per-user (already gitignored).
 
+### Scenario F — Drafting an outgoing NDA
+
+After `quickstart` (or any `setup`), generate a fresh NDA in your house language:
+
+```bash
+# Mutual NDA
+./nda_review_cli.py draft \
+  --template mutual \
+  --party-a "Acme Inc." --party-a-address "123 Main St" \
+  --party-b "Beta LLC"  --party-b-address "10 Market Way" \
+  --purpose "evaluating a strategic partnership" \
+  --out output/drafts/mutual.md \
+  --out-docx output/drafts/mutual.docx
+
+# One-way disclosing — you share, the other side does not
+./nda_review_cli.py draft \
+  --template one-way-out \
+  --disclosing-party "Acme Inc." --disclosing-party-address "123 Main St" \
+  --receiving-party "Vendor Co"  --receiving-party-address "100 Lake Rd" \
+  --purpose "vendor onboarding diligence" \
+  --out output/drafts/oneway.md \
+  --out-docx output/drafts/oneway.docx \
+  --review-after
+```
+
+Clause text is pulled from `config/org-policy.json` `clause_rules[*].preferred`, so anything tuned via `quickstart` (term length, return-vs-destroy, residual stance, trade-secret carve-out, affiliate scope) flows in automatically. `--review-after` round-trips the draft through `review --why` so you see your own outgoing language scored by the same lens.
+
+### Scenario G — Adding a second-pass LLM (Anthropic / OpenAI / local Ollama)
+
+The deterministic review is enough on its own. If you want a model to vote on findings, add ones the rules missed, and suggest replacement clause language, opt in with `--llm`.
+
+```bash
+# Bootstrap: copy the example, fill in provider + model + key
+cp config/llm.json.example config/llm.json
+$EDITOR config/llm.json
+
+# Fully on-prem with Ollama (no cloud, no key)
+./nda_review_cli.py review --file /path/to/nda.txt --why \
+  --llm ollama --llm-model qwen2.5:14b --yes-llm-send \
+  --out-md output/reviews/with-llm.md
+
+# Anthropic Claude
+NDA_LLM_API_KEY=sk-ant-... ./nda_review_cli.py review --file /path/to/nda.txt --why \
+  --llm anthropic --llm-model claude-sonnet-4-6 --yes-llm-send \
+  --out-md output/reviews/with-llm.md
+
+# Once configured in config/llm.json, just `--llm`
+./nda_review_cli.py review --file /path/to/nda.txt --why --llm --yes-llm-send
+```
+
+Important:
+- The CLI prints the destination (provider + base URL + model) and waits for Enter before sending. Pass `--yes-llm-send` or set `NDA_LLM_NO_CONFIRM=1` to skip the prompt in CI.
+- Sending NDA text to a third-party provider may breach the NDA itself. Use Ollama or a local OpenAI-compatible server (vLLM, LM Studio) when on-prem inference matters.
+- See [SECURITY.md → LLM data flow](SECURITY.md#llm-data-flow-opt-in) for the full list of what's sent and to whom.
+
 ## Where to go next
 
 - **How the CLI is structured:** [ARCHITECTURE.md](ARCHITECTURE.md)

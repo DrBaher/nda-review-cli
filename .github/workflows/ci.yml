@@ -44,3 +44,49 @@ jobs:
           test -f "${RUNNER_TEMP}/nda-tutorial/output/reviews/tutorial-review.json"
       - name: Doctor smoke (informational)
         run: ./nda_review_cli.py doctor --base "${RUNNER_TEMP}/nda-tutorial" || echo "doctor reported issues (expected for sandbox)"
+
+  quickstart-and-draft-smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Quickstart non-interactive
+        run: |
+          ./nda_review_cli.py quickstart --base "${RUNNER_TEMP}/nda-quick" --no-prompt --yes
+          test -f "${RUNNER_TEMP}/nda-quick/config/org-policy.json"
+          test -f "${RUNNER_TEMP}/nda-quick/config/quickstart-answers.json"
+          test -f "${RUNNER_TEMP}/nda-quick/profiles/default.json"
+      - name: Draft mutual + one-way-out (md + docx)
+        run: |
+          ./nda_review_cli.py draft \
+            --base "${RUNNER_TEMP}/nda-quick" \
+            --template mutual \
+            --party-a "Acme Inc." --party-a-address "123 Main St" \
+            --party-b "Beta LLC" --party-b-address "10 Market Way" \
+            --purpose "evaluating a partnership" \
+            --out "${RUNNER_TEMP}/nda-quick/out/mutual.md" \
+            --out-docx "${RUNNER_TEMP}/nda-quick/out/mutual.docx"
+          ./nda_review_cli.py draft \
+            --base "${RUNNER_TEMP}/nda-quick" \
+            --template one-way-out \
+            --disclosing-party "Acme Inc." --disclosing-party-address "123 Main St" \
+            --receiving-party "Vendor Co" --receiving-party-address "100 Lake Rd" \
+            --purpose "vendor diligence" \
+            --out "${RUNNER_TEMP}/nda-quick/out/oneway.md" \
+            --out-docx "${RUNNER_TEMP}/nda-quick/out/oneway.docx"
+          test -s "${RUNNER_TEMP}/nda-quick/out/mutual.docx"
+          test -s "${RUNNER_TEMP}/nda-quick/out/oneway.docx"
+      - name: Verify generated docx zips are well-formed
+        run: |
+          python3 -c "
+          import zipfile, xml.etree.ElementTree as ET, sys
+          for path in sys.argv[1:]:
+              with zipfile.ZipFile(path) as zf:
+                  for name in zf.namelist():
+                      ET.fromstring(zf.read(name))
+                  print(f'OK: {path}')
+          " "${RUNNER_TEMP}/nda-quick/out/mutual.docx" "${RUNNER_TEMP}/nda-quick/out/oneway.docx"

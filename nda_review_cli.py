@@ -2613,8 +2613,10 @@ TUTORIAL_STEPS = [
     {
         "title": "Welcome",
         "body": [
-            "NDA Review CLI helps you review NDAs against your own house playbook.",
-            "Everything runs locally — no model calls, no data leaves the box.",
+            "NDA Review CLI helps you review and draft NDAs against your own",
+            "house policy. Deterministic by default; an opt-in second-pass LLM",
+            "(--llm) can vote on findings, add missed ones, and suggest clause",
+            "language. Without --llm, no contract text leaves the box.",
             "",
             "We'll walk through the three core artifacts and run a sample review.",
         ],
@@ -2658,6 +2660,22 @@ TUTORIAL_STEPS = [
             "  tests/fixtures/sample_nda.txt",
             "",
             "This won't touch your existing config/ or profiles/.",
+        ],
+    },
+    {
+        "title": "What's next",
+        "body": [
+            "After this primer, the commands you'll use most:",
+            "  • quickstart  — 14-question guided setup that wires answers into",
+            "                  clause rules (replayable via --answers-file).",
+            "  • review      — score an NDA; add --why for evidence,",
+            "                  --counterparty <name> --learn-profile for memory,",
+            "                  --llm <provider> for second-pass adjudication.",
+            "  • draft       — generate outgoing NDAs (mutual / one-way-out)",
+            "                  in .md + .docx using your house clause language.",
+            "  • doctor      — sanity-check first-run readiness.",
+            "",
+            "Read GETTING_STARTED.md for the scenarios that match your setup.",
         ],
     },
 ]
