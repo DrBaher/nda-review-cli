@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Added **Common Paper Mutual NDA Version 1.0** as a bundled draft template. Use `./nda_review_cli.py draft --template common-paper-mutual` to render the CC BY 4.0–licensed industry standard with parameterised Cover Page (parties, purpose, dates, governing law) and verbatim Standard Terms. Source pulled from the official [`CommonPaper/Mutual-NDA`](https://github.com/CommonPaper/Mutual-NDA) repo. Required attribution line preserved at the foot of every rendered draft.
+- `_fill_template` now strips HTML comments (`<!-- ... -->`) before substitution so source files can carry developer-facing metadata (provenance, license, adaptation notes) without it bleeding into rendered `.md` or `.docx` output. Existing house templates are unaffected (they don't use HTML comments).
+
 ## [0.5.0] - 2026-05-10
 
 - Added **`negotiate analyze --out-md`** for human-readable markdown post-mortems alongside the JSON dashboard. Includes outcome label + notes, per-round trajectory table, wins-by-party, winner-per-clause, source breakdown, fatigue concessions (flagged for human review), and block diagnosis.

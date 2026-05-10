@@ -29,7 +29,7 @@ Sending NDAs to a SaaS reviewer means leaking your counterparty list, your fallb
 
 - **Builds a playbook** from your historical Gmail/Drive corpus (or any folder of contracts).
 - **Reviews NDAs** clause-by-clause against that playbook with severity-scored findings and explainability evidence.
-- **Drafts NDAs to send out** using your house clause language — mutual or one-way disclosing — straight to `.md` + `.docx`.
+- **Drafts NDAs to send out** in your house language (mutual or one-way disclosing) or against the [Common Paper Mutual NDA Standard Terms](https://commonpaper.com/standards/mutual-nda/1.0) (industry standard, CC BY 4.0) — straight to `.md` + `.docx`.
 - **Negotiates between two parties** turn by turn, each side running their own CLI + policy + optional LLM agent, with a tamper-evident state file passed by any channel (email, Drive, Git).
 - **Generates redlines** ready to drop into Word, plus tracked-changes packs and Office Script bridges.
 - **Learns counterparty profiles** deterministically so repeat parties get a consistent stance.
@@ -304,12 +304,23 @@ Draft a fresh NDA in your house language. Clause text is pulled directly from `c
   --out output/drafts/oneway.md \
   --out-docx output/drafts/oneway.docx \
   --review-after
+
+# Common Paper Mutual NDA Version 1.0 (CC BY 4.0) — closest thing to a tech-industry standard
+./nda_review_cli.py draft \
+  --template common-paper-mutual \
+  --party-a "Acme Inc." --party-a-address "123 Main St" \
+  --party-b "Beta LLC"  --party-b-address "10 Market Way" \
+  --purpose "evaluating a partnership" \
+  --governing-law "California" \
+  --out output/drafts/cp-mutual.md \
+  --out-docx output/drafts/cp-mutual.docx
 ```
 
 Notes:
 - `--out` writes the canonical markdown source; `--out-docx` writes a Word `.docx` (stdlib-only, no `python-docx` needed).
 - `--template` defaults to one suggested by your `profile.nda_direction` — `disclosing` → `one-way-out`, anything else → `mutual`.
 - `--template-file path/to/your-template.md` lets you bring your own template with `{{placeholders}}`. Missing placeholders fail loudly with exit code 2.
+- `common-paper-mutual` reproduces the [Common Paper Mutual NDA Standard Terms Version 1.0](https://commonpaper.com/standards/mutual-nda/1.0) verbatim and parameterises only the Cover Page (parties, purpose, dates, governing law). Use this when your counterparty wants a recognisable industry standard rather than your house language. Defaults to a 1-year MNDA Term and Term of Confidentiality — edit the rendered output before signing if you need different terms. Free to use under CC BY 4.0.
 - `--review-after` round-trips the generated draft through `review --why` so you see the same lens applied to your own outgoing language.
 - A "starting point, not legal advice" disclaimer header is prepended by default; pass `--no-disclaimer` to omit.
 
@@ -457,7 +468,7 @@ You can override these paths:
 | [`config/default-policy.json`](config/default-policy.json) | Committed seed policy — generic clause rules and red flags. Edit `config/org-policy.json` for your overrides. |
 | [`config/scoring-profiles.json`](config/scoring-profiles.json) | Scoring weights + decision thresholds for `balanced` / `strict` / `commercial`. |
 | [`config/llm.json.example`](config/llm.json.example) | Schema for `config/llm.json` (gitignored): provider, model, API key, base URL. Used by `review --llm`. |
-| [`templates/`](templates/) | Bundled NDA templates used by `draft` (mutual + one-way disclosing). Each uses `{{placeholders}}` filled from CLI args + policy clause text. |
+| [`templates/`](templates/) | Bundled NDA templates used by `draft`: `mutual_nda.md` (house mutual), `one_way_out_nda.md` (house one-way disclosing), and `common_paper_mutual_nda.md` (Common Paper Mutual NDA Version 1.0, CC BY 4.0 — verbatim Standard Terms with only the Cover Page parameterised). House templates use `{{placeholders}}` filled from CLI args + policy clause text. |
 
 ## License
 

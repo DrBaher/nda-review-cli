@@ -29,7 +29,7 @@ nda-review-cli quickstart                # answers Q1..Q16 incl. stance, priorit
 
 | Command | Purpose | Key flags |
 |---|---|---|
-| `negotiate init` | Round 1, signed by Party A | `--template mutual\|one-way-out`, `--purpose`, `--out`, party name/address fields |
+| `negotiate init` | Round 1, signed by Party A | `--template mutual\|one-way-out\|common-paper-mutual`, `--purpose`, `--out`, party name/address fields |
 | `negotiate review` | Read-only; score current text vs your policy | `--state`, `--as a\|b` |
 | `negotiate counter` | Sign next round with amendments | `--state`, `--as`, one of: `--amendments-file <path>` / `--auto` / `--agent --llm <provider>`, plus `--dry-run`, `--stance` (override) |
 | `negotiate accept` | Sign next round accepting current text wholesale | `--state`, `--as` |
