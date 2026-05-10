@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy this file to config/integrations.json (gitignored) and point each command at your local tooling. `negotiate finalize --to-pdf --sign` will run them in order: docx2pdf_cmd → sign_cli_cmd.",
+  "_placeholders": {
+    "docx2pdf_cmd": ["{input_docx}", "{output_pdf}"],
+    "sign_cli_cmd": ["{input_pdf}", "{output_pdf}", "{party_a_name}", "{party_b_name}", "{negotiation_id}"]
+  },
+
+  "docx2pdf_cmd": "/path/to/docx2pdf {input_docx} --out {output_pdf}",
+  "sign_cli_cmd": "/path/to/sign-cli sign --in {input_pdf} --out {output_pdf} --negotiation {negotiation_id}",
+
+  "_alternative_examples": {
+    "libreoffice_headless": {
+      "docx2pdf_cmd": "libreoffice --headless --convert-to pdf --outdir $(dirname {output_pdf}) {input_docx} && mv $(dirname {output_pdf})/$(basename {input_docx} .docx).pdf {output_pdf}"
+    },
+    "pandoc": {
+      "docx2pdf_cmd": "pandoc {input_docx} -o {output_pdf}"
+    }
+  }
+}

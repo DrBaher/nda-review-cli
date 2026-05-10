@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or how-do-I
+    url: https://github.com/DrBaher/nda-review-cli/discussions
+    about: Open-ended questions belong in Discussions, not Issues.
+  - name: Security vulnerability
+    url: https://github.com/DrBaher/nda-review-cli/security/advisories/new
+    about: Please file privately via GitHub Security Advisories instead of a public issue. See SECURITY.md.
+  - name: Read the docs first
+    url: https://github.com/DrBaher/nda-review-cli/blob/main/GETTING_STARTED.md
+    about: GETTING_STARTED, ARCHITECTURE, and the negotiate cheatsheet cover most setup questions.

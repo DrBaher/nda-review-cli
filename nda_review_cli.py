@@ -17,6 +17,8 @@ from typing import Optional
 from xml.etree import ElementTree as ET
 from rule_engine import clause_hit, red_flag_hits
 
+__version__ = "0.5.0"
+
 NDA_PAT = re.compile(r"\b(nda|non[-\s]?disclosure|confidentiality agreement|confidential disclosure agreement|cda|mutual nda|geheimhaltungsvereinbarung|vertraulich|vertrauliche informationen)\b", re.I)
 
 FALLBACK_CLAUSE_RULES = {
@@ -1162,6 +1164,28 @@ def cmd_create_manifest(args):
     print(out)
 
 
+def _print_friendly(title, lines, next_steps=None):
+    """Write a human-readable summary to stderr.
+
+    Stdout stays machine-parseable (JSON). Suppressed when NDA_CLI_QUIET=1
+    or stderr is not a tty and NDA_CLI_FORCE_FRIENDLY is unset.
+    """
+    if os.environ.get("NDA_CLI_QUIET") == "1":
+        return
+    if not sys.stderr.isatty() and os.environ.get("NDA_CLI_FORCE_FRIENDLY") != "1":
+        return
+    bar = "─" * max(len(title) + 4, 32)
+    print(f"\n  {title}", file=sys.stderr)
+    print(f"  {bar}", file=sys.stderr)
+    for line in lines:
+        print(f"  {line}", file=sys.stderr)
+    if next_steps:
+        print(f"\n  Next steps:", file=sys.stderr)
+        for i, step in enumerate(next_steps, 1):
+            print(f"    {i}. {step}", file=sys.stderr)
+    print("", file=sys.stderr)
+
+
 def _prompt_with_default(label, default):
     raw = input(f"{label} [{default}]: ").strip()
     return raw or default
@@ -1249,6 +1273,21 @@ def cmd_init(args):
     org_out.write_text(json.dumps(org_policy, indent=2, ensure_ascii=False))
     prof_out.write_text(json.dumps(profile, indent=2, ensure_ascii=False))
     print(json.dumps({"ok": True, "org_policy": str(org_out), "default_profile": str(prof_out)}, ensure_ascii=False))
+    _print_friendly(
+        title=f"Initialized NDA Review CLI for {org_name}",
+        lines=[
+            f"Org policy:      {org_out}",
+            f"Default profile: {prof_out}",
+            f"Risk posture:    {posture}   |   Scoring profile: {scoring_profile['name']}",
+            f"Template:        {getattr(args, 'template', None) or '(none)'}",
+        ],
+        next_steps=[
+            "Edit `config/org-policy.json` to refine clause rules for your house style.",
+            "Run `./nda_review_cli.py ingest` to feed in past contracts (or use `--contracts-dir`).",
+            "Run `./nda_review_cli.py build-playbook` to compile your playbook.",
+            "Run `./nda_review_cli.py doctor` if anything seems off.",
+        ],
+    )
 
 
 def discover_ingest_files(base: Path):
@@ -1396,6 +1435,29 @@ def cmd_ingest(args):
         "skipped_for_approval": resolution["skipped_for_approval"],
         "connector_inputs": payload["connector_inputs"],
     }, ensure_ascii=False))
+    failed = [s for s in sources if s.get("extraction_status") == "failed"]
+    summary_lines = [
+        f"Sources ingested: {len(sources)}",
+        f"Clause suggestions emitted: {len(suggestions)}",
+        f"Suggestions file: {out}",
+    ]
+    if resolution["skipped_for_approval"]:
+        summary_lines.append("Some auto-discovered files were skipped pending approval (re-run with --yes to accept).")
+    if failed:
+        summary_lines.append(f"Extraction failed for {len(failed)} file(s) — install pdftotext or convert to .txt/.md.")
+    next_steps = ["Review suggestions in `knowledge/proposed/` before promoting them to active policy."]
+    if not sources:
+        next_steps = [
+            "Drop contracts into `knowledge/inbox/` or pass `--contracts-dir <dir>` and re-run ingest.",
+            "Or run `./nda_review_cli.py doctor` to see what was discovered.",
+        ]
+    else:
+        next_steps.append("Run `./nda_review_cli.py build-playbook` to compile a fresh playbook.")
+    _print_friendly(
+        title="Ingest complete",
+        lines=summary_lines,
+        next_steps=next_steps,
+    )
 
 
 def cmd_setup(args):
@@ -1480,6 +1542,30 @@ def cmd_setup(args):
         "build_ran": should_build,
         "playbook_json": build_output,
     }, ensure_ascii=False))
+    summary = [
+        f"Base directory:  {base}",
+        f"Org policy:      {base / 'config' / 'org-policy.json'}",
+        f"Default profile: {base / 'profiles' / 'default.json'}",
+        f"Ingest files:    {len(ingest_files)}",
+        f"Build ran:       {'yes — ' + str(build_output) if build_output else 'no (rerun with --build to compile)'}",
+    ]
+    next_steps = [
+        "Review a sample NDA: `./nda_review_cli.py review --file tests/fixtures/sample_nda.txt --why`",
+        "Customize defaults: edit `config/org-policy.json`",
+    ]
+    if not ingest_files:
+        next_steps.insert(
+            0,
+            "Add past contracts via `./nda_review_cli.py ingest --contracts-dir <dir>` for richer playbook signals.",
+        )
+    if not build_output:
+        next_steps.append("Run `./nda_review_cli.py build-playbook` once you have ingest data.")
+    next_steps.append("Run `./nda_review_cli.py doctor` to validate first-run readiness.")
+    _print_friendly(
+        title="Setup complete — you're ready to review",
+        lines=summary,
+        next_steps=next_steps,
+    )
 
 
 def cmd_policy_validate(args):
@@ -1537,16 +1623,33 @@ def cmd_doctor(args):
         args.gmail_paths,
         args.drive_paths,
     )
+    # Corpus-free flow: if data/raw_strict doesn't exist at all, the user is on
+    # Scenario A (no historical corpus). Don't flag missing gmail/drive inputs
+    # as hard failures — those paths are only meaningful when corpus exists.
+    raw_strict = base / "data" / "raw_strict"
+    corpus_mode = raw_strict.exists() and any(raw_strict.iterdir()) if raw_strict.exists() else False
     data_checks = []
     for group, paths in expected.items():
         for p in paths:
             exists = p.exists()
-            item = {"path": str(p), "exists": exists, "group": group}
+            item = {"path": str(p), "exists": exists, "group": group, "corpus_mode": corpus_mode}
             if not exists:
-                hard_failures.append(f"Missing build-playbook input: {p}")
-                fixes.append(f"Create or point `{group}` to a JSON export file with `./nda_review_cli.py build-playbook --base {base} --{'gmail-paths' if group == 'gmail_paths' else 'drive-paths'} ...`.")
+                if corpus_mode:
+                    hard_failures.append(f"Missing build-playbook input: {p}")
+                    fixes.append(f"Create or point `{group}` to a JSON export file with `./nda_review_cli.py build-playbook --base {base} --{'gmail-paths' if group == 'gmail_paths' else 'drive-paths'} ...`.")
+                # else: corpus-free flow — silent, no warning needed
             data_checks.append(item)
-    checks.append({"name": "build_playbook_paths", "status": "ok" if not [x for x in data_checks if not x["exists"]] else "fail", "details": data_checks})
+    if corpus_mode:
+        check_status = "ok" if not [x for x in data_checks if not x["exists"]] else "fail"
+    else:
+        check_status = "skip"
+    checks.append({
+        "name": "build_playbook_paths",
+        "status": check_status,
+        "corpus_mode": corpus_mode,
+        "details": data_checks,
+        "note": None if corpus_mode else "Corpus-free setup detected (no data/raw_strict). Skipping gmail/drive path checks — review still works against config/org-policy.json clause rules.",
+    })
 
     ingest_candidates = discover_ingest_files(base)
     ingest_checks = []
@@ -1581,6 +1684,32 @@ def cmd_doctor(args):
         "suggested_fixes": sorted(set(fixes)),
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
+    status_lines = []
+    status_label = {"ok": "OK", "warn": "WARN", "fail": "FAIL", "skip": "SKIP"}
+    for check in checks:
+        label = status_label.get(check["status"], check["status"].upper())
+        suffix = ""
+        if check["status"] == "skip" and check.get("note"):
+            suffix = f" — {check['note']}"
+        status_lines.append(f"[{label:4}] {check['name']}{suffix}")
+    if not hard_failures and not warnings:
+        status_lines.append("All onboarding checks passed.")
+    next_steps = []
+    if hard_failures:
+        next_steps.extend(payload["suggested_fixes"][:5])
+    elif warnings:
+        next_steps.extend(payload["suggested_fixes"][:3])
+        next_steps.append("Optional: drop contracts into `knowledge/inbox/` to enrich the playbook.")
+    else:
+        next_steps = [
+            "Run `./nda_review_cli.py review --file tests/fixtures/sample_nda.txt --why` to verify the review pipeline.",
+            "Run `./nda_review_cli.py build-playbook` whenever you change policy or ingest new contracts.",
+        ]
+    _print_friendly(
+        title="Doctor report" + ("" if not hard_failures else " (issues found)"),
+        lines=status_lines,
+        next_steps=next_steps if next_steps else None,
+    )
     if hard_failures:
         raise SystemExit(2)
 
@@ -1636,6 +1765,284 @@ def cmd_build(args):
     print(json.dumps({"ok": True, "policy_path": policy_cfg.get("path"), "playbook_json": str(out_json), "playbook_md": str(out_md)}, indent=2))
 
 
+# ----------------------------------------------------------------------------
+# Optional LLM augmentation (opt-in via --llm).
+# Adapters use stdlib urllib only — no anthropic/openai SDK dependency.
+# ----------------------------------------------------------------------------
+
+import urllib.request
+import urllib.error
+
+LLM_PROVIDER_PRESETS = {
+    "anthropic": {
+        "base_url": "https://api.anthropic.com/v1",
+        "default_model": "claude-sonnet-4-6",
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4o-mini",
+    },
+    "ollama": {
+        "base_url": "http://localhost:11434/v1",
+        "default_model": "qwen2.5:14b",
+        "default_api_key": "ollama",
+    },
+    "openai-compatible": {
+        "base_url": None,
+        "default_model": None,
+    },
+}
+
+
+def load_llm_config(base: Path, args) -> dict:
+    """Resolution order: CLI args > env vars > config/llm.json > preset defaults."""
+    cfg = {"provider": None, "model": None, "base_url": None, "api_key": None}
+    cfg_path = base / "config" / "llm.json"
+    if cfg_path.exists():
+        try:
+            file_cfg = json.loads(cfg_path.read_text())
+            for k in ("provider", "model", "base_url", "api_key"):
+                if file_cfg.get(k):
+                    cfg[k] = file_cfg[k]
+        except Exception as e:
+            raise SystemExit(f"Could not parse {cfg_path}: {e}")
+
+    env_map = {
+        "provider": "NDA_LLM_PROVIDER",
+        "model": "NDA_LLM_MODEL",
+        "base_url": "NDA_LLM_BASE_URL",
+        "api_key": "NDA_LLM_API_KEY",
+    }
+    for cfg_key, env_key in env_map.items():
+        v = os.environ.get(env_key)
+        if v:
+            cfg[cfg_key] = v
+
+    cli_provider = getattr(args, "llm", None)
+    if cli_provider and cli_provider != "auto":
+        if cfg.get("provider") and cfg["provider"] != cli_provider:
+            # Switching provider on the CLI: clear provider-specific fields so
+            # the new provider's preset fills them in (avoids sending an
+            # Anthropic model name to Ollama, etc.).
+            cfg["model"] = None
+            cfg["base_url"] = None
+        cfg["provider"] = cli_provider
+    if getattr(args, "llm_model", None):
+        cfg["model"] = args.llm_model
+    if getattr(args, "llm_base_url", None):
+        cfg["base_url"] = args.llm_base_url
+
+    provider = cfg.get("provider")
+    if provider in LLM_PROVIDER_PRESETS:
+        preset = LLM_PROVIDER_PRESETS[provider]
+        if not cfg["base_url"] and preset.get("base_url"):
+            cfg["base_url"] = preset["base_url"]
+        if not cfg["model"] and preset.get("default_model"):
+            cfg["model"] = preset["default_model"]
+        if not cfg["api_key"] and preset.get("default_api_key"):
+            cfg["api_key"] = preset["default_api_key"]
+
+    return cfg
+
+
+def _llm_http_post(url: str, body: dict, headers: dict, timeout: int = 120) -> dict:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", **headers},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body_txt = e.read().decode("utf-8", errors="replace")[:500]
+        raise SystemExit(f"LLM HTTP {e.code}: {body_txt}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"LLM transport error: {e.reason}")
+
+
+def llm_call_anthropic(cfg: dict, system: str, user: str, max_tokens: int = 4096) -> dict:
+    if not cfg.get("api_key"):
+        raise SystemExit("Anthropic provider requires api_key (env NDA_LLM_API_KEY or config/llm.json).")
+    url = cfg["base_url"].rstrip("/") + "/messages"
+    headers = {
+        "x-api-key": cfg["api_key"],
+        "anthropic-version": "2023-06-01",
+    }
+    body = {
+        "model": cfg["model"],
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    raw = _llm_http_post(url, body, headers)
+    text = "".join(part.get("text", "") for part in raw.get("content", []) if part.get("type") == "text")
+    usage = raw.get("usage", {}) or {}
+    return {
+        "text": text,
+        "model": raw.get("model"),
+        "usage": {
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+        },
+    }
+
+
+def llm_call_openai_compatible(cfg: dict, system: str, user: str, max_tokens: int = 4096) -> dict:
+    if not cfg.get("base_url"):
+        raise SystemExit("OpenAI-compatible providers require base_url (env NDA_LLM_BASE_URL or config/llm.json).")
+    url = cfg["base_url"].rstrip("/") + "/chat/completions"
+    headers = {}
+    if cfg.get("api_key"):
+        headers["Authorization"] = f"Bearer {cfg['api_key']}"
+    body = {
+        "model": cfg["model"],
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    raw = _llm_http_post(url, body, headers)
+    choices = raw.get("choices") or []
+    text = ""
+    if choices:
+        msg = choices[0].get("message") or {}
+        text = msg.get("content") or ""
+    usage = raw.get("usage", {}) or {}
+    return {
+        "text": text,
+        "model": raw.get("model"),
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens"),
+            "output_tokens": usage.get("completion_tokens"),
+        },
+    }
+
+
+def llm_call(cfg: dict, system: str, user: str, max_tokens: int = 4096) -> dict:
+    provider = (cfg.get("provider") or "").lower()
+    if provider == "anthropic":
+        return llm_call_anthropic(cfg, system, user, max_tokens)
+    if provider in ("openai", "ollama", "openai-compatible"):
+        return llm_call_openai_compatible(cfg, system, user, max_tokens)
+    raise SystemExit(
+        f"Unknown LLM provider: {provider!r}. "
+        "Supported: anthropic, openai, ollama, openai-compatible."
+    )
+
+
+LLM_REVIEW_SYSTEM_PROMPT = (
+    "You are an experienced NDA reviewer assisting a deterministic rule engine. "
+    "Your job is to (1) vote on each rule-engine finding, (2) add findings the rules missed, "
+    "and (3) suggest replacement clause language for high-severity issues. "
+    "Reply ONLY with a single JSON object matching this schema:\n"
+    "{\n"
+    '  "votes": [{"finding_index": int, "vote": "agree"|"soften"|"escalate"|"drop", "rationale": str}],\n'
+    '  "additional_findings": [{"clause": str, "severity": "high"|"low", "concern": str, "evidence": str}],\n'
+    '  "clause_suggestions": [{"clause": str, "suggested_text": str, "reason": str}]\n'
+    "}\n"
+    "Do not include any commentary outside the JSON object."
+)
+
+
+def _build_llm_review_user_prompt(text: str, result: dict, max_chars: int = 50000) -> str:
+    nda = text if len(text) <= max_chars else (text[:max_chars] + "\n[...truncated for length...]")
+    findings_summary = []
+    for i, f in enumerate(result.get("findings", [])):
+        findings_summary.append({
+            "finding_index": i,
+            "clause": f.get("clause"),
+            "severity": f.get("severity"),
+            "concern": f.get("concern") or f.get("preferred_position"),
+            "snippet": (f.get("clause_snippet") or "")[:300],
+        })
+    return (
+        "## NDA TEXT\n\n"
+        f"{nda}\n\n"
+        "## DETERMINISTIC FINDINGS (from rule engine)\n\n"
+        f"{json.dumps(findings_summary, ensure_ascii=False, indent=2)}\n\n"
+        "Reply with the JSON schema described in the system prompt."
+    )
+
+
+def _parse_llm_review_response(text: str) -> dict:
+    """Defensive JSON parse: tolerate code fences and surrounding prose."""
+    if not text:
+        return {"votes": [], "additional_findings": [], "clause_suggestions": [], "_parse_error": "empty response"}
+    candidate = text.strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, re.S)
+    if fence:
+        candidate = fence.group(1)
+    else:
+        first = candidate.find("{")
+        last = candidate.rfind("}")
+        if first != -1 and last != -1 and last > first:
+            candidate = candidate[first : last + 1]
+    try:
+        parsed = json.loads(candidate)
+    except Exception as e:
+        return {
+            "votes": [],
+            "additional_findings": [],
+            "clause_suggestions": [],
+            "_parse_error": f"json decode failed: {e}",
+            "_raw_text": text[:1000],
+        }
+    return {
+        "votes": parsed.get("votes") or [],
+        "additional_findings": parsed.get("additional_findings") or [],
+        "clause_suggestions": parsed.get("clause_suggestions") or [],
+    }
+
+
+def _confirm_llm_send(cfg: dict, yes: bool) -> None:
+    if yes or os.environ.get("NDA_LLM_NO_CONFIRM") == "1":
+        return
+    if not sys.stderr.isatty() or not sys.stdin.isatty():
+        # Non-interactive without explicit consent — fail closed.
+        raise SystemExit(
+            "Refusing to send NDA text to an LLM in a non-interactive context "
+            "without explicit consent. Pass --yes-llm-send or set NDA_LLM_NO_CONFIRM=1."
+        )
+    print(
+        f"\n  About to send NDA text to provider={cfg.get('provider')} "
+        f"base_url={cfg.get('base_url')} model={cfg.get('model')}.",
+        file=sys.stderr,
+    )
+    print("  Press Enter to continue, or Ctrl-C to abort.", file=sys.stderr)
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit("Aborted by user.")
+
+
+def llm_augment_review(result: dict, source_text: str, cfg: dict, yes_send: bool) -> dict:
+    if not cfg.get("provider"):
+        raise SystemExit(
+            "--llm requires a provider. Set it in config/llm.json, env NDA_LLM_PROVIDER, "
+            "or pass --llm <anthropic|openai|ollama|openai-compatible>."
+        )
+    if not cfg.get("model"):
+        raise SystemExit("LLM model not set. Provide via config/llm.json, NDA_LLM_MODEL, or --llm-model.")
+    _confirm_llm_send(cfg, yes_send)
+    user_prompt = _build_llm_review_user_prompt(source_text, result)
+    raw = llm_call(cfg, LLM_REVIEW_SYSTEM_PROMPT, user_prompt)
+    parsed = _parse_llm_review_response(raw["text"])
+    return {
+        "provider": cfg.get("provider"),
+        "model": raw.get("model") or cfg.get("model"),
+        "base_url": cfg.get("base_url"),
+        "usage": raw.get("usage", {}),
+        "votes": parsed.get("votes", []),
+        "additional_findings": parsed.get("additional_findings", []),
+        "clause_suggestions": parsed.get("clause_suggestions", []),
+        "parse_error": parsed.get("_parse_error"),
+    }
+
+
 def cmd_review(args):
     playbook = json.loads(Path(args.playbook).read_text())
     base = Path(args.base)
@@ -1660,6 +2067,11 @@ def cmd_review(args):
         source_review_file = args.out_json or "(stdout-only-review)"
         learning_result = learn_profile_from_review(base, args.counterparty, result, source_review_file)
         result["profile_learning"] = learning_result
+
+    if getattr(args, "llm", None):
+        llm_cfg = load_llm_config(base, args)
+        result["llm_annotations"] = llm_augment_review(result, text, llm_cfg, getattr(args, "yes_llm_send", False))
+        result["llm_used"] = True
 
     if args.out_json:
         out_json = Path(args.out_json)
@@ -1741,6 +2153,39 @@ def cmd_review(args):
             lines.append("")
         if learning_result:
             lines += ["", "## Profile Learning", "", f"- Profile updated: `{learning_result['profile_path']}`", f"- Changed fields: {', '.join(learning_result['changed_fields'])}"]
+        if result.get("llm_annotations"):
+            ann = result["llm_annotations"]
+            lines += [
+                "",
+                "## LLM Annotations (opt-in, second-pass)",
+                "",
+                f"- Provider: `{ann.get('provider')}` · model: `{ann.get('model')}`",
+                f"- Tokens: in={ann.get('usage', {}).get('input_tokens')} / out={ann.get('usage', {}).get('output_tokens')}",
+            ]
+            if ann.get("parse_error"):
+                lines.append(f"- _Parse error_: {ann['parse_error']} (raw text preserved in JSON)")
+            if ann.get("votes"):
+                lines += ["", "### Votes on rule-engine findings", ""]
+                for v in ann["votes"]:
+                    idx = v.get("finding_index")
+                    clause = ""
+                    if isinstance(idx, int) and 0 <= idx < len(result.get("findings", [])):
+                        clause = result["findings"][idx].get("clause", "")
+                    lines.append(f"- _(LLM)_ finding #{idx} `{clause}` → **{v.get('vote')}** — {v.get('rationale','')}")
+            if ann.get("additional_findings"):
+                lines += ["", "### Additional findings (LLM)", ""]
+                for af in ann["additional_findings"]:
+                    lines.append(f"- _(LLM)_ **{af.get('clause','')}** ({af.get('severity','')}): {af.get('concern','')}")
+                    if af.get("evidence"):
+                        lines.append(f"  - Evidence: {af['evidence']}")
+            if ann.get("clause_suggestions"):
+                lines += ["", "### Suggested replacement clause language (LLM)", ""]
+                for cs in ann["clause_suggestions"]:
+                    lines.append(f"- _(LLM)_ **{cs.get('clause','')}** — {cs.get('reason','')}")
+                    if cs.get("suggested_text"):
+                        lines.append(f"  ```")
+                        lines.append(f"  {cs['suggested_text']}")
+                        lines.append(f"  ```")
         out_md.write_text("\n".join(lines))
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -1844,6 +2289,2583 @@ def _prompt_yes_no(label, default=True):
     return raw in {"y", "yes"}
 
 
+QUICKSTART_DEFAULTS = {
+    "org_name": "Your Org",
+    "org_type": "other",
+    "org_type_label": "",
+    "role": "in-house",
+    "nda_direction": "mutual",
+    "risk_posture": "balanced",
+    "preferred_jurisdictions": "Austria",
+    "survival_years": 5,
+    "ai_policy": "guardrailed",
+    "nda_term_years": 2,
+    "return_or_destroy_pref": "either",
+    "residual_knowledge": "reject",
+    "trade_secret_indefinite": True,
+    "affiliate_disclosure": "advisors_only",
+    "negotiation_stance": "middleground",
+    "clause_priorities": [],
+}
+
+QUICKSTART_ORG_TYPES = ["saas", "healthcare", "enterprise", "other"]
+QUICKSTART_ROLES = ["in-house", "founder", "engineer", "ops", "external", "other"]
+QUICKSTART_DIRECTIONS = ["mutual", "disclosing", "receiving", "mixed"]
+QUICKSTART_POSTURES = ["strict", "balanced", "commercial"]
+QUICKSTART_AI = ["restricted", "guardrailed", "permissive"]
+QUICKSTART_RND = ["return", "destroy", "either", "either_with_certification"]
+QUICKSTART_RESIDUAL = ["accept", "reject"]
+QUICKSTART_AFFILIATE = ["advisors_only", "advisors_and_affiliates", "case_by_case"]
+QUICKSTART_STANCES = ["conservative", "middleground", "compromising"]
+
+
+def _apply_quickstart_to_clause_rules(clause_rules: dict, ans: dict) -> dict:
+    """Mutate a copy of clause_rules based on quickstart answers. Each branch
+    must change observable review output — no decorative metadata."""
+    out = json.loads(json.dumps(clause_rules))
+
+    # term_and_survival: term length + trade-secret indefinite carve-out
+    term_years = int(ans.get("nda_term_years", 2))
+    survival_years = int(ans.get("survival_years", 5))
+    trade_secret = bool(ans.get("trade_secret_indefinite", True))
+    if "term_and_survival" in out:
+        carve = " Trade-secret protection extends indefinitely." if trade_secret else " No indefinite carve-out for trade secrets."
+        out["term_and_survival"]["preferred"] = (
+            f"NDA term {term_years} year(s) with confidentiality survival of {survival_years} year(s)."
+            f"{carve}"
+        )
+        flags = list(out["term_and_survival"].get("red_flags", []))
+        if not trade_secret and "indefinite trade-secret protection" not in flags:
+            flags.append("indefinite trade-secret protection")
+        if "perpetual for all info" not in flags:
+            flags.append("perpetual for all info")
+        out["term_and_survival"]["red_flags"] = flags
+
+    # return_or_destroy: preference text drives review messaging
+    rnd = ans.get("return_or_destroy_pref", "either")
+    if "return_or_destroy" in out:
+        rnd_text = {
+            "return": "Prefer return of confidential materials on request, with limited backup/legal retention carve-out.",
+            "destroy": "Prefer destruction of confidential materials on request, with limited backup/legal retention carve-out.",
+            "either": "Allow return or destruction on request, with limited backup/legal retention carve-out.",
+            "either_with_certification": "Allow return or destruction on request, with written certification of destruction and limited backup/legal retention carve-out.",
+        }.get(rnd, out["return_or_destroy"]["preferred"])
+        out["return_or_destroy"]["preferred"] = rnd_text
+        flags = list(out["return_or_destroy"].get("red_flags", []))
+        if rnd == "either_with_certification" and "no destruction certification" not in flags:
+            flags.append("no destruction certification")
+        out["return_or_destroy"]["red_flags"] = flags
+
+    # residuals: stance flips red flags directly
+    residual = ans.get("residual_knowledge", "reject")
+    if "residuals" in out:
+        if residual == "reject":
+            out["residuals"]["preferred"] = "Reject residual-knowledge clauses; mental impressions used to compete still constitute a breach."
+            flags = list(out["residuals"].get("red_flags", []))
+            for trigger in ["residual knowledge", "retained in unaided memory", "residuals clause"]:
+                if trigger not in flags:
+                    flags.append(trigger)
+            out["residuals"]["red_flags"] = flags
+        else:
+            out["residuals"]["preferred"] = "Accept narrowly-scoped residual knowledge limited to information unintentionally retained in unaided memory."
+            out["residuals"]["red_flags"] = []
+
+    # assignment_and_affiliates: scope of permitted disclosure
+    affiliate = ans.get("affiliate_disclosure", "advisors_only")
+    if "assignment_and_affiliates" in out:
+        text = {
+            "advisors_only": "Permitted disclosure limited to advisors (legal, accounting, financial) bound by equivalent confidentiality.",
+            "advisors_and_affiliates": "Permitted disclosure to advisors and affiliates under equivalent confidentiality, with disclosing party remaining responsible.",
+            "case_by_case": "Permitted disclosure only with disclosing party's prior written consent on a case-by-case basis.",
+        }.get(affiliate, out["assignment_and_affiliates"]["preferred"])
+        out["assignment_and_affiliates"]["preferred"] = text
+        flags = list(out["assignment_and_affiliates"].get("red_flags", []))
+        if affiliate == "advisors_only" and "broad affiliate disclosure" not in flags:
+            flags.append("broad affiliate disclosure")
+        out["assignment_and_affiliates"]["red_flags"] = flags
+
+    return out
+
+
+def _quickstart_summary_lines(ans: dict) -> list:
+    org_label = ans["org_type"] if ans["org_type"] != "other" else f"other ({ans.get('org_type_label') or 'unspecified'})"
+    return [
+        f"Org name:                {ans['org_name']}",
+        f"Org type:                {org_label}",
+        f"Your role:               {ans['role']}",
+        f"NDA direction:           {ans['nda_direction']}",
+        f"Risk posture:            {ans['risk_posture']}",
+        f"Preferred jurisdictions: {ans['preferred_jurisdictions']}",
+        f"Confidentiality survival:{ans['survival_years']} year(s)",
+        f"AI/data stance:          {ans['ai_policy']}",
+        f"NDA term length:         {ans['nda_term_years']} year(s)",
+        f"Return-or-destroy pref:  {ans['return_or_destroy_pref']}",
+        f"Residual knowledge:      {ans['residual_knowledge']}",
+        f"Trade-secret indefinite: {'yes' if ans['trade_secret_indefinite'] else 'no'}",
+        f"Affiliate disclosure:    {ans['affiliate_disclosure']}",
+        f"Negotiation stance:      {ans['negotiation_stance']}",
+    ]
+
+
+def cmd_quickstart(args):
+    base = Path(args.base)
+    cfg_dir = base / "config"
+    prof_dir = base / "profiles"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    prof_dir.mkdir(parents=True, exist_ok=True)
+
+    interactive = sys.stdin.isatty() and not args.no_prompt
+
+    ans = dict(QUICKSTART_DEFAULTS)
+    if args.answers_file:
+        try:
+            ans.update(json.loads(Path(args.answers_file).read_text()))
+        except Exception as e:
+            print(f"Could not load answers file: {e}", file=sys.stderr)
+            raise SystemExit(2)
+
+    if interactive:
+        total = 16
+        def step(n, label):
+            print(f"\n  ({n}/{total}) {label}", file=sys.stderr)
+
+        step(1, "Organization name — appears in playbook + profile metadata.")
+        ans["org_name"] = _prompt_with_default("Org name", ans["org_name"])
+
+        step(2, "Org type — picks template clause_preferences (saas/healthcare/enterprise) or annotation only (other).")
+        ans["org_type"] = _prompt_choice("Org type", QUICKSTART_ORG_TYPES, ans["org_type"])
+        if ans["org_type"] == "other":
+            ans["org_type_label"] = _prompt_with_default("Describe your org type (free text, e.g. developer, agency)", ans.get("org_type_label", ""))
+
+        step(3, "Your role — surfaced in review headers so readers know the lens.")
+        ans["role"] = _prompt_choice("Role", QUICKSTART_ROLES, ans["role"])
+
+        step(4, "Typical NDA direction — review summary frames findings from your perspective.")
+        ans["nda_direction"] = _prompt_choice("NDA direction", QUICKSTART_DIRECTIONS, ans["nda_direction"])
+
+        step(5, "Risk posture — sets scoring profile + decision thresholds.")
+        ans["risk_posture"] = _prompt_choice("Risk posture", QUICKSTART_POSTURES, ans["risk_posture"])
+
+        step(6, "Preferred jurisdictions — comma-separated; review scores jurisdiction findings against this list.")
+        ans["preferred_jurisdictions"] = _prompt_with_default("Jurisdictions (comma-separated)", ans["preferred_jurisdictions"])
+
+        step(7, "Default confidentiality survival (years) — used in profile + term_and_survival preferred text.")
+        ans["survival_years"] = int(_prompt_with_default("Survival years", str(ans["survival_years"])))
+
+        step(8, "AI/data usage stance — weights AI-clause red flags during review.")
+        ans["ai_policy"] = _prompt_choice("AI policy", QUICKSTART_AI, ans["ai_policy"])
+
+        step(9, "NDA term length (years) — distinct from survival; how long the agreement itself runs.")
+        ans["nda_term_years"] = int(_prompt_with_default("NDA term years", str(ans["nda_term_years"])))
+
+        step(10, "Return vs destroy preference — drives return_or_destroy clause preferred text.")
+        ans["return_or_destroy_pref"] = _prompt_choice("Return/destroy", QUICKSTART_RND, ans["return_or_destroy_pref"])
+
+        step(11, "Residual knowledge stance — accept narrows the residuals clause; reject flips on red flags.")
+        ans["residual_knowledge"] = _prompt_choice("Residual knowledge", QUICKSTART_RESIDUAL, ans["residual_knowledge"])
+
+        step(12, "Trade-secret indefinite carve-out — adjusts term_and_survival preferred text.")
+        ans["trade_secret_indefinite"] = _prompt_yes_no("Indefinite carve-out for trade secrets?", ans["trade_secret_indefinite"])
+
+        step(13, "Affiliate/advisor disclosure scope — drives assignment_and_affiliates clause text + red flags.")
+        ans["affiliate_disclosure"] = _prompt_choice("Affiliate disclosure", QUICKSTART_AFFILIATE, ans["affiliate_disclosure"])
+
+        step(14, "Negotiation stance — shapes how your agent counters in `negotiate counter --agent` (and --auto deterministic mode).")
+        ans["negotiation_stance"] = _prompt_choice("Negotiation stance", QUICKSTART_STANCES, ans["negotiation_stance"])
+
+        step(15, "Clause priorities — list clauses from most-important (top) to least-important (bottom). Drives logrolling in negotiation: your agent will concede on bottom-K clauses by priority based on your stance.")
+        # Default ordering: load default-policy.json clause keys.
+        from pathlib import Path as _P
+        seed = load_policy_config(base, args.default_policy)
+        default_clauses = list((seed.get("clause_rules") or {}).keys())
+        print(f"  Default order ({len(default_clauses)} clauses): " + ", ".join(default_clauses))
+        raw = _prompt_with_default(
+            "Priority order (comma-separated, top-down) or blank to keep default",
+            "",
+        )
+        if raw.strip():
+            user_order = [c.strip() for c in raw.split(",") if c.strip()]
+            # Validate every entry is a known clause; preserve user order; append any missing in default order.
+            unknown = [c for c in user_order if c not in default_clauses]
+            if unknown:
+                print(f"  Warning: unknown clause(s) {unknown}; ignoring those.")
+                user_order = [c for c in user_order if c in default_clauses]
+            for c in default_clauses:
+                if c not in user_order:
+                    user_order.append(c)
+            ans["clause_priorities"] = user_order
+        else:
+            ans["clause_priorities"] = default_clauses
+
+        step(16, "Past contracts to ingest now? Enter a directory path or leave blank to skip. We can also run a sample review at the end.")
+        ans["contracts_dir"] = _prompt_with_default("Contracts dir (blank to skip)", ans.get("contracts_dir", "") or "").strip() or None
+        ans["run_sample"] = _prompt_yes_no("Run a sample review on the bundled NDA fixture?", True)
+    else:
+        ans.setdefault("contracts_dir", None)
+        ans.setdefault("run_sample", False)
+
+    print("\n  ━━ Summary ━━", file=sys.stderr)
+    for line in _quickstart_summary_lines(ans):
+        print(f"  {line}", file=sys.stderr)
+    if ans.get("contracts_dir"):
+        print(f"  Ingest from:             {ans['contracts_dir']}", file=sys.stderr)
+    if ans.get("run_sample"):
+        print(f"  Sample review:           yes (tests/fixtures/sample_nda.txt)", file=sys.stderr)
+
+    if interactive and not args.yes:
+        if not _prompt_yes_no("\n  Apply this configuration?", True):
+            print("Aborted. No files written.", file=sys.stderr)
+            raise SystemExit(0)
+
+    # Persist answers for reproducibility / CI replay.
+    ans_out = cfg_dir / "quickstart-answers.json"
+    ans_out.write_text(json.dumps(ans, indent=2, sort_keys=True, ensure_ascii=False))
+
+    # Build org-policy from seed clause rules + quickstart augmentations.
+    seed = load_policy_config(base, args.default_policy)
+    augmented_rules = _apply_quickstart_to_clause_rules(seed["clause_rules"], ans)
+
+    scoring_profiles_out = cfg_dir / "scoring-profiles.json"
+    if not scoring_profiles_out.exists():
+        scoring_profiles_out.write_text(json.dumps({"profiles": DEFAULT_SCORING_PROFILES}, indent=2, ensure_ascii=False))
+    scoring_profile = scoring_profile_details(base, ans["risk_posture"], None)
+    weights = scoring_profile["weights"]
+
+    template_used = ans["org_type"] if ans["org_type"] in SUPPORTED_TEMPLATES else None
+    org_type_label = ans.get("org_type_label") or ans["org_type"]
+
+    org_policy = {
+        "version": "0.2.0",
+        "org_name": ans["org_name"],
+        "risk_posture": ans["risk_posture"],
+        "scoring_profile": scoring_profile["name"],
+        "preferred_jurisdictions": _parse_csv(ans["preferred_jurisdictions"]),
+        "defaults": {
+            "survival_years": int(ans["survival_years"]),
+            "ai_policy": ans["ai_policy"],
+            "retention_carveout": "Allow limited backup/legal retention under continuing confidentiality obligations.",
+            "nda_term_years": int(ans["nda_term_years"]),
+            "return_or_destroy_pref": ans["return_or_destroy_pref"],
+            "residual_knowledge": ans["residual_knowledge"],
+            "trade_secret_indefinite": bool(ans["trade_secret_indefinite"]),
+            "affiliate_disclosure": ans["affiliate_disclosure"],
+            "negotiation_stance": ans["negotiation_stance"],
+        },
+        "risk_weights": weights,
+        "clause_rules": augmented_rules,
+        "clause_priorities": ans["clause_priorities"] or list(augmented_rules.keys()),
+        "negotiation_signal_patterns": seed["negotiation_signal_patterns"],
+        "org_type": org_type_label,
+        "template": template_used,
+    }
+
+    profile = {
+        "profile_name": "default",
+        "fallback_posture": f"{ans['org_name']} prefers {ans['risk_posture']} posture as {ans['nda_direction']} party.",
+        "role": ans["role"],
+        "nda_direction": ans["nda_direction"],
+        "org_type": org_type_label,
+        "risk_weights": weights,
+        "decision_thresholds": scoring_profile["decision_thresholds"],
+        "scoring_profile": scoring_profile["name"],
+        "clause_preferences": {
+            "term_and_survival": augmented_rules.get("term_and_survival", {}).get("preferred", ""),
+            "return_or_destroy": augmented_rules.get("return_or_destroy", {}).get("preferred", ""),
+            "residuals": augmented_rules.get("residuals", {}).get("preferred", ""),
+            "assignment_and_affiliates": augmented_rules.get("assignment_and_affiliates", {}).get("preferred", ""),
+            "governing_law_jurisdiction": f"Prefer jurisdictions: {', '.join(_parse_csv(ans['preferred_jurisdictions'])) or 'neutral/favorable'}.",
+        },
+    }
+    if template_used:
+        profile["template"] = template_used
+        profile["clause_preferences"].update(SUPPORTED_TEMPLATES[template_used]["clause_preferences"])
+
+    org_out = cfg_dir / "org-policy.json"
+    prof_out = prof_dir / "default.json"
+    org_out.write_text(json.dumps(org_policy, indent=2, ensure_ascii=False))
+    prof_out.write_text(json.dumps(profile, indent=2, ensure_ascii=False))
+
+    result = {
+        "ok": True,
+        "org_policy": str(org_out),
+        "default_profile": str(prof_out),
+        "answers_file": str(ans_out),
+        "ingest_ran": False,
+        "sample_review_ran": False,
+    }
+
+    # Optional ingest from a directory.
+    if ans.get("contracts_dir"):
+        class Obj:
+            pass
+        ingest_args = Obj()
+        ingest_args.base = str(base)
+        ingest_args.policy = "config/org-policy.json"
+        ingest_args.files = []
+        ingest_args.contracts_dir = ans["contracts_dir"]
+        ingest_args.drive_export_dir = None
+        ingest_args.no_prompt = True
+        ingest_args.yes = True
+        cmd_ingest(ingest_args)
+        result["ingest_ran"] = True
+
+    # Optional sample review.
+    if ans.get("run_sample"):
+        sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample_nda.txt"
+        if sample.exists():
+            # Need a playbook first. Build one from any seeded data; falls back
+            # to clause_rules-only behavior when corpus is absent.
+            class Obj:
+                pass
+            build_args = Obj()
+            build_args.base = str(base)
+            build_args.policy = None
+            build_args.gmail_paths = ["data/raw_strict/gmail_primary.json", "data/raw_strict/gmail_secondary.json"]
+            build_args.drive_paths = ["data/raw_strict/drive_primary.json", "data/raw_strict/drive_secondary.json"]
+            build_args.out_json = "output/nda_playbook.json"
+            build_args.out_md = "output/nda_playbook.md"
+            cmd_build(build_args)
+
+            review_out_json = base / "output" / "reviews" / "quickstart-review.json"
+            review_out_md = base / "output" / "reviews" / "quickstart-review.md"
+            review_out_json.parent.mkdir(parents=True, exist_ok=True)
+            review_args = Obj()
+            review_args.base = str(base)
+            review_args.playbook = str(base / "output" / "nda_playbook.json")
+            review_args.counterparty = None
+            review_args.file = str(sample)
+            review_args.text = None
+            review_args.out_json = str(review_out_json)
+            review_args.out_md = str(review_out_md)
+            review_args.why = True
+            review_args.learn_profile = False
+            review_args.scoring_profile = None
+            review_args.scoring_profiles = None
+            cmd_review(review_args)
+            result["sample_review_ran"] = True
+            result["sample_review_json"] = str(review_out_json)
+            result["sample_review_md"] = str(review_out_md)
+
+    print(json.dumps(result, ensure_ascii=False))
+    _print_friendly(
+        title=f"Quickstart complete for {ans['org_name']}",
+        lines=[
+            f"Org policy:      {org_out}",
+            f"Default profile: {prof_out}",
+            f"Answers replay:  {ans_out}",
+            f"Ingest ran:      {'yes' if result['ingest_ran'] else 'no'}",
+            f"Sample review:   {'yes — ' + str(result.get('sample_review_md', '')) if result['sample_review_ran'] else 'no'}",
+        ],
+        next_steps=[
+            "Open `config/org-policy.json` to fine-tune any clause rule.",
+            "Replay non-interactively: `./nda_review_cli.py quickstart --no-prompt --yes --answers-file config/quickstart-answers.json`",
+            "Run `./nda_review_cli.py review --file /path/to/nda.txt --why` on a real NDA.",
+            "Run `./nda_review_cli.py doctor` to validate readiness.",
+        ],
+    )
+
+
+TUTORIAL_STEPS = [
+    {
+        "title": "Welcome",
+        "body": [
+            "NDA Review CLI helps you review and draft NDAs against your own",
+            "house policy. Deterministic by default; an opt-in second-pass LLM",
+            "(--llm) can vote on findings, add missed ones, and suggest clause",
+            "language. Without --llm, no contract text leaves the box.",
+            "",
+            "We'll walk through the three core artifacts and run a sample review.",
+        ],
+    },
+    {
+        "title": "Concept 1 — Policy",
+        "body": [
+            "The policy is your house rules: clause keywords, preferred language,",
+            "red flags, risk weights. It lives in:",
+            "  • config/default-policy.json   (committed seed, generic defaults)",
+            "  • config/org-policy.json       (your local override, gitignored)",
+            "",
+            "You edit the policy. The CLI never silently rewrites it.",
+        ],
+    },
+    {
+        "title": "Concept 2 — Profile",
+        "body": [
+            "A profile is per-counterparty memory under profiles/<name>.json.",
+            "It records typical positions, concessions, and escalation history.",
+            "",
+            "Pass `--counterparty \"Acme Corp\" --learn-profile` on review and the",
+            "CLI updates profiles/Acme Corp.json deterministically.",
+        ],
+    },
+    {
+        "title": "Concept 3 — Playbook",
+        "body": [
+            "The playbook is the compiled artifact at output/nda_playbook.json.",
+            "It's regenerated on demand from policy + corpus signals.",
+            "",
+            "Rule of thumb: edit the policy, let the profile learn,",
+            "regenerate the playbook.",
+        ],
+    },
+    {
+        "title": "Hands-on — Sample review",
+        "body": [
+            "We'll set up a fresh workspace under a temp directory and run a",
+            "review against the bundled sample NDA at:",
+            "  tests/fixtures/sample_nda.txt",
+            "",
+            "This won't touch your existing config/ or profiles/.",
+        ],
+    },
+    {
+        "title": "Concept 4 — Two-party negotiation",
+        "body": [
+            "If both sides have this CLI, you can co-negotiate an NDA without",
+            "any third-party service. The protocol is file-based: a single",
+            "JSON state file bounces between parties (email/Drive/Git — your",
+            "choice). Each round is signed by exactly one party.",
+            "",
+            "Each agent uses three policy fields to decide what to counter:",
+            "  • negotiation_stance: conservative / middleground / compromising",
+            "  • clause_priorities:  ranked top-to-bottom",
+            "  • non_negotiable_clauses: hard floor — never conceded",
+            "",
+            "Stuck clauses are auto-resolved by `fatigue concession` after K",
+            "bounces; truly non-negotiable conflicts surface as `blocked` for",
+            "human escalation. Sign-off step gives you the key-points review",
+            "before the agreed text is finalized.",
+        ],
+    },
+    {
+        "title": "What's next",
+        "body": [
+            "After this primer, the commands you'll use most:",
+            "  • quickstart  — 16-question guided setup (stance, priorities, etc.).",
+            "  • review      — score an NDA; --why for evidence, --llm for LLM pass.",
+            "  • draft       — generate outgoing NDAs in .md + .docx.",
+            "  • negotiate   — two-party turn-taking flow:",
+            "                    init → counter [--auto/--agent/--dry-run] → accept",
+            "                    → diff → sign-off → finalize  (or  withdraw)",
+            "                    + simulate / analyze for game-theoretic dashboards.",
+            "  • doctor      — sanity-check first-run readiness.",
+            "",
+            "Read GETTING_STARTED.md (Scenarios A-H) for the path that matches you.",
+            "Read examples/negotiate-cheatsheet.md for a one-page negotiate reference.",
+        ],
+    },
+]
+
+
+def _md_to_docx_xml(md_text: str) -> str:
+    """Convert a small subset of markdown (h1, h2, paragraphs, **bold**, --- rule)
+    to a Word `word/document.xml` body. No third-party deps."""
+    def esc(s: str) -> str:
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def runs(text: str) -> str:
+        parts = re.split(r"(\*\*[^*]+\*\*)", text)
+        chunks = []
+        for part in parts:
+            if not part:
+                continue
+            if part.startswith("**") and part.endswith("**"):
+                inner = esc(part[2:-2])
+                chunks.append(f'<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">{inner}</w:t></w:r>')
+            else:
+                chunks.append(f'<w:r><w:t xml:space="preserve">{esc(part)}</w:t></w:r>')
+        return "".join(chunks)
+
+    body_parts = []
+    for raw_line in md_text.splitlines():
+        line = raw_line.rstrip()
+        if not line.strip():
+            body_parts.append("<w:p/>")
+            continue
+        if line.strip() == "---":
+            body_parts.append('<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr></w:p>')
+            continue
+        if line.startswith("# "):
+            body_parts.append(f'<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>{runs(line[2:])}</w:p>')
+        elif line.startswith("## "):
+            body_parts.append(f'<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr>{runs(line[3:])}</w:p>')
+        else:
+            body_parts.append(f"<w:p>{runs(line)}</w:p>")
+
+    body = "".join(body_parts)
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body>{body}<w:sectPr/></w:body></w:document>"
+    )
+
+
+_DOCX_CONTENT_TYPES = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    '<Default Extension="xml" ContentType="application/xml"/>'
+    '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+    '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+    "</Types>"
+)
+_DOCX_RELS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+    "</Relationships>"
+)
+_DOCX_DOC_RELS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+    "</Relationships>"
+)
+_DOCX_STYLES = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+    '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/>'
+    '<w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style>'
+    '<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/>'
+    '<w:rPr><w:b/><w:sz w:val="26"/></w:rPr></w:style>'
+    "</w:styles>"
+)
+
+
+def md_to_docx(md_text: str, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    doc_xml = _md_to_docx_xml(md_text)
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", _DOCX_CONTENT_TYPES)
+        zf.writestr("_rels/.rels", _DOCX_RELS)
+        zf.writestr("word/_rels/document.xml.rels", _DOCX_DOC_RELS)
+        zf.writestr("word/document.xml", doc_xml)
+        zf.writestr("word/styles.xml", _DOCX_STYLES)
+
+
+DRAFT_TEMPLATES = {
+    "mutual": "templates/mutual_nda.md",
+    "one-way-out": "templates/one_way_out_nda.md",
+}
+
+DRAFT_DISCLAIMER_MD = (
+    "> **DRAFT — generated by nda-review-cli.** "
+    "This is a starting point based on your house policy, not legal advice. "
+    "Have qualified counsel review before signing.\n"
+)
+
+
+def _suggest_draft_template(profile: dict) -> str:
+    direction = (profile.get("nda_direction") or "").lower()
+    if direction in ("disclosing", "one-way-out", "out"):
+        return "one-way-out"
+    return "mutual"
+
+
+def _draft_clause_text(clause_rules: dict, key: str) -> str:
+    rule = clause_rules.get(key) or {}
+    text = (rule.get("preferred") or "").strip()
+    return text or f"[Insert preferred {key} language here.]"
+
+
+def _build_draft_substitutions(args, org_policy: dict, profile: dict) -> dict:
+    rules = org_policy.get("clause_rules", {}) or {}
+    governing = (
+        args.governing_law
+        or (org_policy.get("preferred_jurisdictions") or [None])[0]
+        or "the parties' chosen jurisdiction"
+    )
+    effective = args.effective_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    subs = {
+        "effective_date": effective,
+        "purpose": args.purpose,
+        "governing_law": governing,
+        "clause_definition_of_confidential_information": _draft_clause_text(rules, "definition_of_confidential_information"),
+        "clause_exceptions": _draft_clause_text(rules, "exceptions"),
+        "clause_use_restrictions": _draft_clause_text(rules, "use_restrictions"),
+        "clause_term_and_survival": _draft_clause_text(rules, "term_and_survival"),
+        "clause_return_or_destroy": _draft_clause_text(rules, "return_or_destroy"),
+        "clause_residuals": _draft_clause_text(rules, "residuals"),
+        "clause_assignment_and_affiliates": _draft_clause_text(rules, "assignment_and_affiliates"),
+        "clause_liability_and_remedies": _draft_clause_text(rules, "liability_and_remedies"),
+        "clause_non_solicit_non_compete": _draft_clause_text(rules, "non_solicit_non_compete"),
+    }
+
+    if args.template == "mutual":
+        subs.update({
+            "party_a": args.party_a or "",
+            "party_a_address": args.party_a_address or "",
+            "party_b": args.party_b or "",
+            "party_b_address": args.party_b_address or "",
+        })
+    else:
+        subs.update({
+            "disclosing_party": args.disclosing_party or args.party_a or org_policy.get("org_name") or "",
+            "disclosing_party_address": args.disclosing_party_address or args.party_a_address or "",
+            "receiving_party": args.receiving_party or args.party_b or "",
+            "receiving_party_address": args.receiving_party_address or args.party_b_address or "",
+        })
+    return subs
+
+
+def _fill_template(template_text: str, subs: dict):
+    placeholders = sorted(set(re.findall(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", template_text)))
+    missing = [p for p in placeholders if not str(subs.get(p, "")).strip()]
+    def repl(m):
+        key = m.group(1).strip()
+        val = subs.get(key, "")
+        return str(val) if val is not None else ""
+    filled = re.sub(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", repl, template_text)
+    return filled, missing
+
+
+def cmd_draft(args):
+    repo = Path(__file__).resolve().parent
+    base = Path(args.base)
+
+    org_policy_path = base / "config" / "org-policy.json"
+    if not org_policy_path.exists():
+        print(json.dumps({
+            "ok": False,
+            "error": "No org-policy.json found. Run `./nda_review_cli.py quickstart` or `setup --quick --yes` first.",
+        }, ensure_ascii=False))
+        raise SystemExit(2)
+    org_policy = json.loads(org_policy_path.read_text())
+
+    profile_path = base / "profiles" / "default.json"
+    profile = json.loads(profile_path.read_text()) if profile_path.exists() else {}
+
+    if not args.template:
+        args.template = _suggest_draft_template(profile)
+
+    if args.template not in DRAFT_TEMPLATES and not args.template_file:
+        print(json.dumps({
+            "ok": False,
+            "error": f"Unknown template '{args.template}'. Pick {sorted(DRAFT_TEMPLATES.keys())} or pass --template-file.",
+        }, ensure_ascii=False))
+        raise SystemExit(2)
+
+    if args.template_file:
+        template_path = Path(args.template_file)
+        if not template_path.exists():
+            print(json.dumps({"ok": False, "error": f"Template file not found: {template_path}"}, ensure_ascii=False))
+            raise SystemExit(2)
+        template_text = template_path.read_text()
+    else:
+        template_text = (repo / DRAFT_TEMPLATES[args.template]).read_text()
+
+    subs = _build_draft_substitutions(args, org_policy, profile)
+    filled, missing = _fill_template(template_text, subs)
+
+    if missing:
+        print(json.dumps({
+            "ok": False,
+            "missing_placeholders": missing,
+            "hint": "Pass corresponding flags (e.g. --party-a, --purpose) or extend --template-file values.",
+        }, indent=2, ensure_ascii=False))
+        raise SystemExit(2)
+
+    if not args.no_disclaimer:
+        filled = DRAFT_DISCLAIMER_MD + "\n" + filled
+
+    out_md = Path(args.out)
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+    out_md.write_text(filled)
+
+    out_docx = None
+    if args.out_docx:
+        out_docx = Path(args.out_docx)
+        md_to_docx(filled, out_docx)
+
+    review_summary = None
+    if args.review_after:
+        class Obj:
+            pass
+        review_args = Obj()
+        review_args.base = str(base)
+        review_args.playbook = str(base / "output" / "nda_playbook.json")
+        review_args.counterparty = args.counterparty
+        review_args.file = str(out_md)
+        review_args.text = None
+        review_args.out_json = str(out_md.with_suffix(".review.json"))
+        review_args.out_md = str(out_md.with_suffix(".review.md"))
+        review_args.why = True
+        review_args.learn_profile = False
+        review_args.scoring_profile = None
+        review_args.scoring_profiles = None
+        if not Path(review_args.playbook).exists():
+            review_summary = {"skipped": True, "reason": "no playbook found; run build-playbook first"}
+        else:
+            cmd_review(review_args)
+            review_summary = {
+                "review_json": review_args.out_json,
+                "review_md": review_args.out_md,
+            }
+
+    payload = {
+        "ok": True,
+        "template": args.template,
+        "template_file": args.template_file,
+        "out_md": str(out_md),
+        "out_docx": str(out_docx) if out_docx else None,
+        "review": review_summary,
+        "placeholders_used": sorted(set(re.findall(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", template_text))),
+        "policy_path": str(org_policy_path),
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    _print_friendly(
+        title=f"Draft generated ({args.template})",
+        lines=[
+            f"Markdown: {out_md}",
+            f"Word doc: {out_docx if out_docx else '(skipped)'}",
+            f"Review-after: {review_summary.get('review_md') if review_summary and not review_summary.get('skipped') else '(skipped)'}",
+        ],
+        next_steps=[
+            "Open the .docx in Word, fill in signatures, and run a final human review.",
+            "Re-run `./nda_review_cli.py review --file <out_md>` after any manual edits to sanity-check.",
+            "Tweak `config/org-policy.json` clause `preferred` text to change drafted language org-wide.",
+        ],
+    )
+
+
+# ----------------------------------------------------------------------------
+# Negotiate: two-party turn-taking NDA negotiation with LLM agent assistance.
+# File-based protocol — no networking. Each round is signed by exactly one
+# party. Tamper evidence via a per-round SHA-256 chain.
+# ----------------------------------------------------------------------------
+
+NEGOTIATE_SCHEMA_VERSION = "0.1"
+
+
+def _negotiate_hash(round_text: str, prev_hash: str) -> str:
+    h = hashlib.sha256()
+    h.update(prev_hash.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(round_text.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _negotiate_load(path: Path) -> dict:
+    if not path.exists():
+        raise SystemExit(f"Negotiation state file not found: {path}")
+    state = json.loads(path.read_text())
+    if state.get("schema_version") != NEGOTIATE_SCHEMA_VERSION:
+        raise SystemExit(
+            f"Unsupported negotiation schema version: {state.get('schema_version')!r}. "
+            f"Expected {NEGOTIATE_SCHEMA_VERSION}."
+        )
+    # Validate hash chain end-to-end.
+    prev = ""
+    for r in state.get("rounds", []):
+        expected = _negotiate_hash(r["text"], prev)
+        if r.get("text_hash") != expected:
+            raise SystemExit(
+                f"Hash-chain mismatch at round {r.get('round')}. "
+                "State file may have been tampered with."
+            )
+        prev = expected
+    return state
+
+
+def _negotiate_save(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False))
+
+
+def _negotiate_resolve_party(state: dict, override: Optional[str], base: Path) -> str:
+    """Returns 'a' or 'b'. Override wins; otherwise auto-match org_name from local policy."""
+    if override in ("a", "b"):
+        return override
+    org_policy_path = base / "config" / "org-policy.json"
+    if org_policy_path.exists():
+        org = json.loads(org_policy_path.read_text()).get("org_name", "")
+        for key in ("a", "b"):
+            party_name = (state["parties"].get(key) or {}).get("name", "")
+            if party_name and org.strip().lower() == party_name.strip().lower():
+                return key
+    raise SystemExit(
+        "Could not auto-detect which party you are. Pass `--as a` or `--as b`, "
+        "or set `org_name` in config/org-policy.json to match one of the negotiation parties."
+    )
+
+
+def _negotiate_other(party: str) -> str:
+    return "b" if party == "a" else "a"
+
+
+def _negotiate_clause_status_init(rules: dict) -> dict:
+    return {clause: {"status": "pending", "agreed_in_round": None, "last_proposer": None} for clause in rules}
+
+
+def _negotiate_apply_amendments(text: str, amendments: list) -> str:
+    """Replace clause text in the markdown body. Each amendment has clause / old_text / new_text.
+    Falls back to appending a clarifying note if old_text not found."""
+    out = text
+    for a in amendments:
+        old = a.get("old_text", "")
+        new = a.get("new_text", "")
+        if old and old in out:
+            out = out.replace(old, new, 1)
+        else:
+            # Couldn't find exact text — append a note so the change isn't silently lost.
+            out += f"\n\n<!-- amendment to {a.get('clause','?')}: {new} -->\n"
+    return out
+
+
+def _negotiate_extract_clause_text(full_text: str, clause: str) -> str:
+    """Best-effort extraction: find a ## section whose heading mentions clause keywords.
+    Returns the paragraph after the heading, or empty string."""
+    keyword_map = {
+        "definition_of_confidential_information": "Definition of Confidential",
+        "exceptions": "Exceptions",
+        "use_restrictions": "Use Restrictions",
+        "term_and_survival": "Term and Survival",
+        "return_or_destroy": "Return or Destruction",
+        "residuals": "Residual Knowledge",
+        "assignment_and_affiliates": "Permitted Disclosures",
+        "governing_law_jurisdiction": "Governing Law",
+        "liability_and_remedies": "Liability and Remedies",
+        "non_solicit_non_compete": "Non-Solicitation",
+    }
+    needle = keyword_map.get(clause)
+    if not needle:
+        return ""
+    pat = re.compile(rf"^##\s+\d*\.?\s*{re.escape(needle)}.*?$\n+(.*?)(?=^##\s|\Z)", re.M | re.S)
+    m = pat.search(full_text)
+    return m.group(1).strip() if m else ""
+
+
+NEGOTIATE_STANCE_DESCRIPTORS = {
+    "conservative": (
+        "STANCE: conservative. Hold firm to your party's preferred clause language. "
+        "Counter any amendment that materially differs from your preferred position. "
+        "Accept only when the other party's text is functionally equivalent to your preferred."
+    ),
+    "middleground": (
+        "STANCE: middleground. Compromise on low-severity items where the other party's text "
+        "is reasonable. Hold firm on high-severity items and clauses that trigger your red-flag "
+        "patterns (e.g. perpetual survival, broad residuals, uncapped liability)."
+    ),
+    "compromising": (
+        "STANCE: compromising. Accept most amendments unless they trigger one of your red-flag "
+        "patterns. Push back only on genuine dealbreakers (red flags, missing standard carve-outs, "
+        "broad residuals)."
+    ),
+}
+
+
+NEGOTIATE_LLM_AGENT_SYSTEM = (
+    "You are an NDA negotiation agent representing one party. You receive: "
+    "(1) the current full NDA text, "
+    "(2) your party's house policy (clause-by-clause preferred language and red flags), "
+    "(3) your party's negotiation stance, "
+    "(4) your party's clause priority ranking (1=most important), "
+    "(5) any clauses your party has marked as NON-NEGOTIABLE (hard floor — never accept differing text on these), "
+    "(6) per-clause bounce counts (clauses that have been amended in N consecutive alternating-proposer rounds), "
+    "(7) the latest round of amendments proposed by the other party. "
+    "Your job is to propose your party's response: which other-party amendments to accept, which to counter, "
+    "and any new amendments your policy requires. "
+    "RULES (in order of strictness):\n"
+    " 1. NON-NEGOTIABLE clauses: counter unless the current text exactly matches your preferred. Never accept a differing text on these.\n"
+    " 2. Stance: apply literally. Conservative = hold firm; middleground = compromise on non-red-flag items; compromising = accept most things, push back on red flags only.\n"
+    " 3. Priority + concession zone: bottom 30% (conservative), 60% (middleground), or 85% (compromising) by priority can be conceded. Inside your insistence zone, follow stance logic.\n"
+    " 4. Bounce count: if a clause has bounced >= 4 rounds, consider conceding it to break the deadlock — UNLESS it's non-negotiable.\n"
+    "Reply ONLY with a JSON object matching this schema:\n"
+    "{\n"
+    '  "accept_clauses": [string],            # clauses where the other side\'s proposal is acceptable\n'
+    '  "counter_amendments": [{"clause": str, "old_text": str, "new_text": str, "rationale": str}],\n'
+    '  "summary": string                      # one-paragraph negotiation note\n'
+    "}\n"
+    "Do not include any commentary outside the JSON object."
+)
+
+
+def _negotiate_auto_propose(state: dict, party: str, org_policy: dict, stance: str) -> dict:
+    """Deterministic stance-driven amendment generator. No LLM.
+
+    For each clause known to the policy:
+      - Compare the *clause's currently visible text* in the latest round to
+        the policy's preferred text.
+      - If red flags fire on the visible text, treat that clause as a dealbreaker.
+      - Per stance:
+          conservative — counter every clause where current != preferred.
+          middleground — counter only red-flag-firing clauses + accept other-party
+                         amendments that don't change preferred-aligned clauses.
+          compromising — counter only clauses where red flags currently fire.
+
+    Other-party amendments from the previous round:
+      conservative — reject all (do not list in accept_clauses).
+      middleground — accept amendments to clauses with no red-flag triggers
+                     in the new text.
+      compromising — accept everything that doesn't trigger a red flag.
+    """
+    rules = org_policy.get("clause_rules", {}) or {}
+    last_round = state["rounds"][-1]
+    text = last_round["text"]
+    last_amendments = last_round.get("amendments") or []
+    last_amendment_clauses = {a.get("clause") for a in last_amendments if a.get("clause")}
+
+    priorities = org_policy.get("clause_priorities") or list(rules.keys())
+    concession_zone = _negotiate_concession_zone(rules, priorities, stance)
+    non_negotiable = set(org_policy.get("non_negotiable_clauses") or [])
+
+    counter_amendments = []
+    accept_clauses = []
+    countered_clauses = set()
+    rationale_prefix = f"[auto:{stance}] "
+
+    # Pass 1: per-clause decision over the *current* text.
+    # If the clause is in this agent's concession zone (their bottom K% by
+    # priority), accept current text — this is the logrolling mechanism that
+    # breaks conservative × conservative deadlocks when priorities differ.
+    # Otherwise apply stance-driven counter logic.
+    for clause, cfg in rules.items():
+        current_block = _negotiate_extract_clause_text(text, clause)
+        preferred = (cfg.get("preferred") or "").strip()
+        if not current_block or not preferred:
+            continue
+
+        differs = preferred not in current_block
+
+        # Non-negotiable hard floor: always counter if text differs, regardless
+        # of stance, priority, or concession zone. These are the user's
+        # declared absolute redlines.
+        if clause in non_negotiable and differs:
+            counter_amendments.append({
+                "clause": clause,
+                "old_text": current_block,
+                "new_text": preferred,
+                "rationale": rationale_prefix + "non-negotiable clause — text must match preferred.",
+            })
+            countered_clauses.add(clause)
+            continue
+
+        if clause in concession_zone:
+            accept_clauses.append(clause)
+            continue
+
+        red_flags_fired = bool(red_flag_hits(current_block.lower(), clause))
+
+        will_counter = False
+        rationale = ""
+        if stance == "conservative" and differs:
+            will_counter = True
+            rationale = f"top-priority clause (rank {_negotiate_priority_rank(priorities, clause)}); text differs from preferred."
+        elif stance == "middleground" and red_flags_fired:
+            will_counter = True
+            rationale = "red-flag pattern fired on this clause; replacing with preferred language."
+        elif stance == "compromising" and red_flags_fired:
+            will_counter = True
+            rationale = "dealbreaker red flag in top-priority clause."
+
+        if will_counter:
+            counter_amendments.append({
+                "clause": clause,
+                "old_text": current_block,
+                "new_text": preferred,
+                "rationale": rationale_prefix + rationale,
+            })
+            countered_clauses.add(clause)
+        else:
+            accept_clauses.append(clause)
+
+    # Pass 2: explicit acceptance of other-party amendments from the previous
+    # round. Only adds clauses that aren't already in the lists from pass 1.
+    # Conservative still rejects all proposals.
+    if stance != "conservative":
+        for am in last_amendments:
+            clause = am.get("clause")
+            if not clause or clause in countered_clauses or clause in accept_clauses:
+                continue
+            proposed = (am.get("new_text") or "")
+            proposed_red_flags = bool(red_flag_hits(proposed.lower(), clause)) if clause in rules else False
+            if stance == "middleground" and not proposed_red_flags:
+                accept_clauses.append(clause)
+            elif stance == "compromising" and not proposed_red_flags:
+                accept_clauses.append(clause)
+
+    accept_clauses = sorted(set(accept_clauses))
+    return {
+        "accept_clauses": accept_clauses,
+        "counter_amendments": counter_amendments,
+        "summary": f"Deterministic auto-counter applied with stance={stance!r}. "
+                   f"{len(counter_amendments)} amendment(s) proposed, {len(accept_clauses)} clause(s) accepted.",
+    }
+
+
+def last_amendment_clauses_in_counters(counter_amendments: list) -> set:
+    return {a.get("clause") for a in counter_amendments if a.get("clause")}
+
+
+def _negotiate_resolve_stance(org_policy: dict, override: Optional[str]) -> str:
+    if override and override in NEGOTIATE_STANCE_DESCRIPTORS:
+        return override
+    stance = ((org_policy.get("defaults") or {}).get("negotiation_stance")) or org_policy.get("negotiation_stance") or "middleground"
+    return stance if stance in NEGOTIATE_STANCE_DESCRIPTORS else "middleground"
+
+
+def _negotiate_agent_propose(state: dict, party: str, org_policy: dict, llm_cfg: dict, stance: str) -> dict:
+    """Run the LLM agent against the current state to propose the next round's amendments."""
+    rules = org_policy.get("clause_rules", {}) or {}
+    priorities = org_policy.get("clause_priorities") or list(rules.keys())
+    non_negotiable = org_policy.get("non_negotiable_clauses") or []
+
+    # Build a rich per-clause context: rank, red flags, bounce count.
+    pref_lines = []
+    for clause, cfg in rules.items():
+        rank = _negotiate_priority_rank(priorities, clause)
+        bounces = _negotiate_clause_bounce_count(state, clause)
+        markers = []
+        if clause in non_negotiable:
+            markers.append("NON_NEGOTIABLE")
+        if bounces >= 1:
+            markers.append(f"bounce_count={bounces}")
+        marker_str = f" [{', '.join(markers)}]" if markers else ""
+        pref_lines.append(
+            f"- {clause} (rank {rank}){marker_str}: {cfg.get('preferred','')}"
+        )
+
+    last_round = state["rounds"][-1]
+    last_amendments = last_round.get("amendments") or []
+    stance_text = NEGOTIATE_STANCE_DESCRIPTORS.get(stance, NEGOTIATE_STANCE_DESCRIPTORS["middleground"])
+
+    user_prompt = (
+        f"## Your party: {state['parties'][party]['name']} ({state['parties'][party].get('role','')})\n\n"
+        f"## {stance_text}\n\n"
+        f"## Your priority order (top = most important): {', '.join(priorities) or '(default policy order)'}\n\n"
+        f"## Your non-negotiable clauses (hard floor): {non_negotiable or '(none)'}\n\n"
+        f"## Your house policy by clause (rank, markers, preferred language)\n\n"
+        f"{chr(10).join(pref_lines)}\n\n"
+        f"## Current full NDA text\n\n{last_round['text']}\n\n"
+        f"## Latest amendments proposed by the other party (round {last_round['round']})\n\n"
+        f"{json.dumps(last_amendments, ensure_ascii=False, indent=2)}\n\n"
+        f"Reply with the JSON schema described in the system prompt."
+    )
+    raw = llm_call(llm_cfg, NEGOTIATE_LLM_AGENT_SYSTEM, user_prompt)
+    parsed = _parse_llm_review_response(raw["text"])
+    # Reuse the same defensive parser; it tolerates extra keys.
+    try:
+        obj = json.loads(raw["text"]) if not parsed.get("_parse_error") else None
+    except Exception:
+        obj = None
+    if obj and isinstance(obj, dict):
+        return {
+            "accept_clauses": obj.get("accept_clauses") or [],
+            "counter_amendments": obj.get("counter_amendments") or [],
+            "summary": obj.get("summary") or "",
+            "model": raw.get("model") or llm_cfg.get("model"),
+            "usage": raw.get("usage", {}),
+        }
+    return {
+        "accept_clauses": [],
+        "counter_amendments": [],
+        "summary": "",
+        "parse_error": parsed.get("_parse_error"),
+        "raw_text": (raw.get("text") or "")[:1000],
+    }
+
+
+def _negotiate_recompute_clause_status(state: dict, rules: dict) -> dict:
+    """Walk all rounds, derive per-clause status.
+
+    Round 1 by Party A is the initial draft — all clauses are implicitly proposed by A.
+    Subsequent rounds may amend a clause (sets last_proposer to that round's proposer)
+    or accept it (counter-party agreement → status becomes 'agreed')."""
+    status = _negotiate_clause_status_init(rules)
+    if state.get("rounds"):
+        initial = state["rounds"][0]
+        for clause in status:
+            status[clause]["last_proposer"] = initial["proposer"]
+            status[clause]["status"] = "proposed"
+    for r in state["rounds"][1:]:
+        proposer = r["proposer"]
+        for clause in r.get("accept_clauses", []) or []:
+            if clause in status and status[clause]["last_proposer"] != proposer:
+                status[clause]["status"] = "agreed"
+                status[clause]["agreed_in_round"] = r["round"]
+        for am in r.get("amendments", []) or []:
+            clause = am.get("clause")
+            if clause and clause in status:
+                status[clause]["status"] = "disputed"
+                status[clause]["last_proposer"] = proposer
+                status[clause]["agreed_in_round"] = None
+    return status
+
+
+DEFAULT_STALEMATE_THRESHOLD = 4
+DEFAULT_MAX_CLAUSE_BOUNCES = 4
+
+# Per-stance concession-zone size: fraction of clauses (by priority rank,
+# bottom-up) that the agent is willing to concede when not stance-required to
+# push back. Conservative still concedes its 30% lowest-priority clauses;
+# compromising concedes 85% and only insists on its 15% top priorities.
+NEGOTIATE_CONCESSION_PCT = {
+    "conservative": 0.30,
+    "middleground": 0.60,
+    "compromising": 0.85,
+}
+
+
+def _negotiate_clause_bounce_count(state: dict, clause: str) -> int:
+    """Count consecutive most-recent rounds in which `clause` was amended,
+    with proposers strictly alternating each round. A clause that was amended
+    only once has bounce count 1. Two parties going back and forth on the
+    same clause increments the count every round; if either party amends
+    something else (or the same party amends twice in a row), the streak
+    breaks. Used by the fatigue-concession rule to detect deadlocks."""
+    rounds = state.get("rounds", [])
+    count = 0
+    last_proposer = None
+    for r in reversed(rounds):
+        amended = {a.get("clause") for a in (r.get("amendments") or []) if a.get("clause")}
+        if clause not in amended:
+            break
+        proposer = r["proposer"]
+        if last_proposer is None:
+            count = 1
+            last_proposer = proposer
+        elif proposer != last_proposer:
+            count += 1
+            last_proposer = proposer
+        else:
+            break
+    return count
+
+
+def _apply_fatigue(proposal: dict, state: dict, max_bounces: int, non_negotiable: list = None) -> dict:
+    """Apply fatigue concession: any clause that's bouncing >= max_bounces
+    times consecutively is force-conceded by the current proposer regardless
+    of stance / priority / red flags. Mutates proposal in place: clauses move
+    from counter_amendments → accept_clauses, and a `fatigue_concessions`
+    list is added so the round can be tagged auto:<stance>+fatigue.
+
+    Clauses listed in `non_negotiable` are NEVER fatigue-conceded — they're
+    hard floors the user has declared as absolute redlines. If a non-negotiable
+    clause keeps bouncing, the stalemate detector will eventually block the
+    negotiation rather than force-concede a redline."""
+    non_negotiable_set = set(non_negotiable or [])
+    if max_bounces <= 0:
+        proposal["fatigue_concessions"] = []
+        return proposal
+
+    fatigued = []
+    for am in list(proposal.get("counter_amendments") or []):
+        clause = am.get("clause")
+        if not clause:
+            continue
+        if clause in non_negotiable_set:
+            continue  # Hard floor — never fatigue-concede a non-negotiable clause.
+        if _negotiate_clause_bounce_count(state, clause) >= max_bounces:
+            fatigued.append(clause)
+
+    if fatigued:
+        fatigued_set = set(fatigued)
+        proposal["counter_amendments"] = [
+            am for am in (proposal.get("counter_amendments") or [])
+            if am.get("clause") not in fatigued_set
+        ]
+        proposal["accept_clauses"] = sorted(set(
+            list(proposal.get("accept_clauses") or []) + fatigued
+        ))
+        # Annotate the rationale on each fatigue concession so the audit trail
+        # explains why this party gave ground on a clause they were countering.
+        existing_summary = proposal.get("summary", "")
+        proposal["summary"] = (existing_summary + " " if existing_summary else "") + (
+            f"Fatigue: conceding {len(fatigued)} clause(s) after >= {max_bounces} consecutive amendment rounds: "
+            f"{', '.join(fatigued)}."
+        )
+    proposal["fatigue_concessions"] = fatigued
+    return proposal
+
+
+def _negotiate_priority_rank(priorities: list, clause: str) -> int:
+    """Return the 1-based rank of `clause` in the priority list. Clauses
+    not explicitly ranked are placed at the end (lowest priority)."""
+    if clause in priorities:
+        return priorities.index(clause) + 1
+    return len(priorities) + 1
+
+
+def _negotiate_concession_zone(rules: dict, priorities: list, stance: str) -> set:
+    """Return the set of clauses the agent should concede on (accept current
+    text rather than push back), based on the agent's own priority list and
+    stance. Concession zone = the bottom K clauses by priority where K is a
+    stance-driven percentage of |rules|."""
+    clauses = list(rules.keys())
+    if not clauses:
+        return set()
+    # Build ranking — explicit priorities first (in order), then any
+    # un-ranked policy clauses appended in their original order.
+    ranked = [c for c in priorities if c in rules]
+    for c in clauses:
+        if c not in ranked:
+            ranked.append(c)
+    pct = NEGOTIATE_CONCESSION_PCT.get(stance, NEGOTIATE_CONCESSION_PCT["middleground"])
+    n_concede = max(0, round(len(ranked) * pct))
+    return set(ranked[len(ranked) - n_concede:]) if n_concede else set()
+
+
+def _negotiate_agreed_count_at_round(state: dict, round_index: int, rules: dict) -> int:
+    """How many clauses are 'agreed' if we look at state up to and including round_index."""
+    truncated = {**state, "rounds": state["rounds"][: round_index + 1]}
+    cs = _negotiate_recompute_clause_status(truncated, rules)
+    return sum(1 for s in cs.values() if s.get("status") == "agreed")
+
+
+def _negotiate_rounds_without_progress(state: dict, rules: dict) -> int:
+    """Number of consecutive most-recent rounds during which the count of
+    `agreed` clauses did not strictly increase. Used by the stalemate detector.
+
+    Round 1 is the initial draft and has no "previous" agreed count, so we
+    measure progress starting from round 2."""
+    rounds = state.get("rounds", [])
+    if len(rounds) < 2:
+        return 0
+    # Pre-compute agreed_count at each round.
+    counts = [_negotiate_agreed_count_at_round(state, i, rules) for i in range(len(rounds))]
+    # Walk backwards from the most recent round, counting "no increase" rounds.
+    no_progress = 0
+    for i in range(len(counts) - 1, 0, -1):
+        if counts[i] > counts[i - 1]:
+            break
+        no_progress += 1
+    return no_progress
+
+
+def _negotiate_check_blocked(state: dict, rules: dict, threshold: int = DEFAULT_STALEMATE_THRESHOLD) -> dict:
+    """If `rounds_without_progress >= threshold`, flips status to `blocked` and
+    attaches a diagnostic. Idempotent — once blocked, leaves the state alone.
+    Returns the (possibly-modified) state."""
+    if state.get("status") in ("converged", "signed_off", "finalized", "blocked"):
+        return state
+    no_progress = _negotiate_rounds_without_progress(state, rules)
+    if no_progress >= threshold:
+        cs = state.get("clause_status", {})
+        stuck = sorted(c for c, s in cs.items() if s.get("status") == "disputed")
+        # Non-negotiable conflicts get a more specific diagnosis: these clauses
+        # were intentionally protected from fatigue concession by one or both
+        # parties, so the deadlock is by design and needs human escalation,
+        # not a stance change.
+        state["status"] = "blocked"
+        state["block_diagnosis"] = {
+            "rounds_without_progress": no_progress,
+            "threshold": threshold,
+            "stuck_clauses": stuck,
+            "note": (
+                "No new clause has reached `agreed` status for several consecutive "
+                "rounds. Likely cause: both parties' stances are too rigid for the "
+                "rules-engine to resolve, or one or both sides marked some of the "
+                "stuck clauses as non-negotiable. Try `--stance compromising` for "
+                "one side, switch to `--agent --llm`, escalate to humans, or — if "
+                "stuck on non-negotiable clauses — accept that this deal cannot "
+                "close on those terms."
+            ),
+        }
+    return state
+
+
+def _negotiate_is_converged(state: dict) -> bool:
+    """Converged when no clause is currently `disputed` and the latest two rounds were
+    signed by alternating parties (one drafted/countered, the other accepted)."""
+    cs = state.get("clause_status", {})
+    if not cs:
+        return False
+    if any(s.get("status") == "disputed" for s in cs.values()):
+        return False
+    if not any(s.get("status") == "agreed" for s in cs.values()):
+        return False  # No clauses have been agreed by both sides yet.
+    last_two = state["rounds"][-2:]
+    if len(last_two) < 2:
+        return False
+    return last_two[0]["proposer"] != last_two[1]["proposer"]
+
+
+def _negotiate_load_org_policy(base: Path) -> dict:
+    p = base / "config" / "org-policy.json"
+    if not p.exists():
+        raise SystemExit(
+            "config/org-policy.json not found. Run `nda-review-cli quickstart` or `setup --quick --yes` first."
+        )
+    return json.loads(p.read_text())
+
+
+def cmd_negotiate_init(args):
+    base = Path(args.base)
+    org_policy = _negotiate_load_org_policy(base)
+    rules = org_policy.get("clause_rules", {}) or {}
+
+    # Build the initial draft using the existing draft pipeline.
+    repo = Path(__file__).resolve().parent
+    template_text = (repo / DRAFT_TEMPLATES[args.template]).read_text()
+    profile_path = base / "profiles" / "default.json"
+    profile = json.loads(profile_path.read_text()) if profile_path.exists() else {}
+
+    class _A: pass
+    da = _A()
+    da.template = args.template
+    da.party_a = args.party_a_name if args.template == "mutual" else args.disclosing_party
+    da.party_a_address = args.party_a_address if args.template == "mutual" else args.disclosing_party_address
+    da.party_b = args.party_b_name if args.template == "mutual" else args.receiving_party
+    da.party_b_address = args.party_b_address if args.template == "mutual" else args.receiving_party_address
+    da.disclosing_party = args.disclosing_party
+    da.disclosing_party_address = args.disclosing_party_address
+    da.receiving_party = args.receiving_party
+    da.receiving_party_address = args.receiving_party_address
+    da.purpose = args.purpose
+    da.effective_date = args.effective_date
+    da.governing_law = args.governing_law
+    subs = _build_draft_substitutions(da, org_policy, profile)
+    text, missing = _fill_template(template_text, subs)
+    if missing:
+        raise SystemExit(f"Missing template values: {missing}. Pass corresponding flags.")
+
+    party_a_name = da.party_a or da.disclosing_party or org_policy.get("org_name") or "Party A"
+    party_b_name = da.party_b or da.receiving_party or "Party B"
+    parties = {
+        "a": {
+            "name": party_a_name,
+            "address": da.party_a_address or da.disclosing_party_address or "",
+            "role": "mutual" if args.template == "mutual" else "disclosing",
+        },
+        "b": {
+            "name": party_b_name,
+            "address": da.party_b_address or da.receiving_party_address or "",
+            "role": "mutual" if args.template == "mutual" else "receiving",
+        },
+    }
+
+    initial_hash = _negotiate_hash(text, "")
+    state = {
+        "schema_version": NEGOTIATE_SCHEMA_VERSION,
+        "negotiation_id": hashlib.sha256(f"{datetime.now(timezone.utc).isoformat()}::{party_a_name}::{party_b_name}".encode()).hexdigest()[:16],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "parties": parties,
+        "purpose": da.purpose,
+        "template": args.template,
+        "rounds": [
+            {
+                "round": 1,
+                "proposer": "a",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "text": text,
+                "text_hash": initial_hash,
+                "amendments": [],
+                "accept_clauses": [],
+                "summary": "Initial draft.",
+                "signature": {"signer": "a", "signed_at": datetime.now(timezone.utc).isoformat(), "method": "json_flag"},
+                "amendment_source": "initial",
+            }
+        ],
+        "clause_status": _negotiate_clause_status_init(rules),
+        "status": "in_progress",
+        "finalized": None,
+    }
+    out = Path(args.out)
+    _negotiate_save(out, state)
+    print(json.dumps({"ok": True, "negotiation_id": state["negotiation_id"], "state_file": str(out), "round": 1, "proposer": "a"}, ensure_ascii=False))
+    _print_friendly(
+        title=f"Negotiation initialized ({args.template})",
+        lines=[
+            f"State file: {out}",
+            f"Party A: {party_a_name}",
+            f"Party B: {party_b_name}",
+            f"Round 1 signed by Party A.",
+        ],
+        next_steps=[
+            f"Send {out.name} to the other party (email, Drive, Git — any channel).",
+            "Other party runs `negotiate review --state <file>` to see findings against their policy.",
+            "Other party runs `negotiate counter [--agent --llm] --state <file> --as b` to propose round 2.",
+        ],
+    )
+
+
+def cmd_negotiate_review(args):
+    base = Path(args.base)
+    state = _negotiate_load(Path(args.state))
+    org_policy = _negotiate_load_org_policy(base)
+    party = _negotiate_resolve_party(state, args.as_party, base)
+
+    last = state["rounds"][-1]
+    # Run a deterministic review of the current text against your policy.
+    playbook_path = base / "output" / "nda_playbook.json"
+    playbook = json.loads(playbook_path.read_text()) if playbook_path.exists() else {"policy": [
+        {"clause": k, "preferred": v.get("preferred", ""), "red_flags": v.get("red_flags", [])}
+        for k, v in (org_policy.get("clause_rules") or {}).items()
+    ]}
+    profile = load_counterparty_profile(base, None)
+    scoring = scoring_profile_details(base, None, None)
+    review = review_text(last["text"], playbook, profile=profile, scoring_profile=scoring, explainability=True)
+
+    payload = {
+        "ok": True,
+        "negotiation_id": state["negotiation_id"],
+        "you_are": party,
+        "current_round": last["round"],
+        "current_round_proposer": last["proposer"],
+        "your_turn": last["proposer"] != party,
+        "review": {
+            "decision": review.get("decision"),
+            "risk_score": review.get("risk_score"),
+            "findings_count": len(review.get("findings", [])),
+            "high_severity_clauses": [f["clause"] for f in review.get("findings", []) if f.get("severity") == "high"],
+        },
+        "clause_status": state.get("clause_status", {}),
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    _print_friendly(
+        title=f"Negotiation review (round {last['round']})",
+        lines=[
+            f"Your role: Party {party.upper()} ({state['parties'][party]['name']})",
+            f"Current round proposed by: Party {last['proposer'].upper()}",
+            f"Your turn? {'yes' if last['proposer'] != party else 'no — you proposed the latest round'}",
+            f"Decision (your policy): {review.get('decision','?').upper()}  risk={review.get('risk_score')}",
+            f"High-severity clauses: {', '.join(payload['review']['high_severity_clauses']) or '(none)'}",
+        ],
+        next_steps=[
+            "Run `negotiate counter --agent --llm` to draft amendments via your LLM agent.",
+            "Or `negotiate counter --amendments-file <my-edits.json>` to hand-write amendments.",
+            "Or `negotiate accept` to accept the current text and trigger convergence.",
+        ],
+    )
+
+
+def cmd_negotiate_counter(args):
+    base = Path(args.base)
+    state = _negotiate_load(Path(args.state))
+    org_policy = _negotiate_load_org_policy(base)
+    rules = org_policy.get("clause_rules", {}) or {}
+    party = _negotiate_resolve_party(state, args.as_party, base)
+    if state.get("status") in ("withdrawn", "finalized"):
+        raise SystemExit(f"Negotiation is in terminal state `{state.get('status')}`; further counters are not allowed.")
+    if state.get("status") == "blocked" and not getattr(args, "force_unblock", False):
+        diag = state.get("block_diagnosis", {})
+        raise SystemExit(
+            f"Negotiation is `blocked` (no progress for {diag.get('rounds_without_progress','?')} rounds). "
+            f"Stuck clauses: {diag.get('stuck_clauses')}. "
+            "Pass `--force-unblock` to keep going at your own risk, or change stance / switch to --agent."
+        )
+    last = state["rounds"][-1]
+    if last["proposer"] == party:
+        raise SystemExit(
+            f"Round {last['round']} was proposed by you (Party {party.upper()}). "
+            "It's the other party's turn — wait for their counter, or use `negotiate accept` to converge on the current text."
+        )
+
+    stance = _negotiate_resolve_stance(org_policy, getattr(args, "stance", None))
+
+    max_bounces = int((org_policy.get("defaults") or {}).get("max_clause_bounces", DEFAULT_MAX_CLAUSE_BOUNCES))
+
+    if args.amendments_file:
+        proposal = json.loads(Path(args.amendments_file).read_text())
+        proposal_source = "manual"
+    elif args.auto:
+        proposal = _negotiate_auto_propose(state, party, org_policy, stance)
+        proposal_source = f"auto:{stance}"
+    elif args.agent:
+        llm_cfg = load_llm_config(base, args)
+        if not llm_cfg.get("provider") or not llm_cfg.get("model"):
+            raise SystemExit("--agent requires LLM provider/model. Configure config/llm.json or pass --llm/--llm-model.")
+        if not args.yes_llm_send and not (sys.stderr.isatty() and sys.stdin.isatty()):
+            raise SystemExit("Refusing non-interactive LLM call without --yes-llm-send.")
+        if not args.yes_llm_send:
+            print(f"\n  Agent ({stance}) will call provider={llm_cfg['provider']} model={llm_cfg['model']}.", file=sys.stderr)
+            print("  Press Enter to continue, or Ctrl-C to abort.", file=sys.stderr)
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                raise SystemExit("Aborted by user.")
+        proposal = _negotiate_agent_propose(state, party, org_policy, llm_cfg, stance)
+        proposal_source = f"agent:{stance}"
+    else:
+        raise SystemExit(
+            "Pass one of: --amendments-file <path> (manual), --auto (deterministic stance-driven), "
+            "or --agent --llm <provider> (LLM-driven)."
+        )
+
+    # Apply fatigue concession uniformly across all proposal modes — clauses
+    # bouncing >= max_bounces times consecutively get force-conceded by the
+    # current proposer regardless of how the proposal was generated.
+    non_negotiable = org_policy.get("non_negotiable_clauses") or []
+    proposal = _apply_fatigue(proposal, state, max_bounces, non_negotiable=non_negotiable)
+    fatigue_concessions = proposal.get("fatigue_concessions") or []
+    if fatigue_concessions:
+        proposal_source = proposal_source + "+fatigue"
+
+    # Dry-run: preview the proposal without writing the round to the state file.
+    if getattr(args, "dry_run", False):
+        preview = {
+            "dry_run": True,
+            "would_be_round": last["round"] + 1,
+            "proposer": party,
+            "stance": stance,
+            "amendment_source": proposal_source,
+            "amendments": proposal.get("counter_amendments") or [],
+            "accept_clauses": proposal.get("accept_clauses") or [],
+            "fatigue_concessions": fatigue_concessions,
+            "summary": proposal.get("summary") or "",
+            "state_unchanged": True,
+        }
+        print(json.dumps(preview, indent=2, ensure_ascii=False))
+        return
+
+    accept_clauses = proposal.get("accept_clauses") or []
+    counter_amendments = proposal.get("counter_amendments") or []
+    summary = proposal.get("summary") or ""
+    new_text = _negotiate_apply_amendments(last["text"], counter_amendments)
+    new_round = {
+        "round": last["round"] + 1,
+        "proposer": party,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "text": new_text,
+        "text_hash": _negotiate_hash(new_text, last["text_hash"]),
+        "amendments": counter_amendments,
+        "accept_clauses": accept_clauses,
+        "summary": summary,
+        "signature": {"signer": party, "signed_at": datetime.now(timezone.utc).isoformat(), "method": "json_flag"},
+        "amendment_source": proposal_source,
+        "stance": stance,
+        "fatigue_concessions": fatigue_concessions,
+    }
+    if proposal.get("parse_error"):
+        new_round["agent_parse_error"] = proposal["parse_error"]
+    state["rounds"].append(new_round)
+    state["clause_status"] = _negotiate_recompute_clause_status(state, rules)
+    if _negotiate_is_converged(state):
+        state["status"] = "converged"
+    else:
+        state = _negotiate_check_blocked(state, rules)
+
+    out = Path(args.out or args.state)
+    _negotiate_save(out, state)
+    print(json.dumps({
+        "ok": True,
+        "round": new_round["round"],
+        "amendments_count": len(counter_amendments),
+        "accepted_clauses": accept_clauses,
+        "status": state["status"],
+        "state_file": str(out),
+    }, ensure_ascii=False))
+    _print_friendly(
+        title=f"Round {new_round['round']} signed (Party {party.upper()})",
+        lines=[
+            f"Amendments proposed: {len(counter_amendments)}",
+            f"Other-side clauses you accepted: {len(accept_clauses)}",
+            f"Negotiation status: {state['status']}",
+        ],
+        next_steps=(
+            ["Run `negotiate finalize` to emit the agreed .md/.docx and (optionally) hand off to docx2pdf + sign-CLI."]
+            if state["status"] == "converged" else
+            [f"Send {out.name} to the other party for round {new_round['round'] + 1}."]
+        ),
+    )
+
+
+def cmd_negotiate_accept(args):
+    base = Path(args.base)
+    state = _negotiate_load(Path(args.state))
+    org_policy = _negotiate_load_org_policy(base)
+    rules = org_policy.get("clause_rules", {}) or {}
+    party = _negotiate_resolve_party(state, args.as_party, base)
+    last = state["rounds"][-1]
+    if last["proposer"] == party:
+        raise SystemExit("You proposed the latest round; the other party must accept or counter, not you.")
+
+    # Accept the entire current text — every clause we know about gets agreed by us.
+    touched_clauses = sorted(rules.keys())
+    new_round = {
+        "round": last["round"] + 1,
+        "proposer": party,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "text": last["text"],
+        "text_hash": _negotiate_hash(last["text"], last["text_hash"]),
+        "amendments": [],
+        "accept_clauses": touched_clauses,
+        "summary": "Accept current text as final.",
+        "signature": {"signer": party, "signed_at": datetime.now(timezone.utc).isoformat(), "method": "json_flag"},
+        "amendment_source": "accept",
+    }
+    state["rounds"].append(new_round)
+    state["clause_status"] = _negotiate_recompute_clause_status(state, rules)
+    if _negotiate_is_converged(state):
+        state["status"] = "converged"
+    else:
+        state = _negotiate_check_blocked(state, rules)
+    out = Path(args.out or args.state)
+    _negotiate_save(out, state)
+    print(json.dumps({
+        "ok": True,
+        "round": new_round["round"],
+        "status": state["status"],
+        "accepted_clauses": touched_clauses,
+        "state_file": str(out),
+    }, ensure_ascii=False))
+
+
+def cmd_negotiate_status(args):
+    state = _negotiate_load(Path(args.state))
+    rounds = state.get("rounds", [])
+    summary = {
+        "negotiation_id": state["negotiation_id"],
+        "status": state.get("status"),
+        "round_count": len(rounds),
+        "parties": {k: v.get("name") for k, v in state["parties"].items()},
+        "latest_round_proposer": rounds[-1]["proposer"] if rounds else None,
+        "clause_status": state.get("clause_status", {}),
+        "rounds": [
+            {
+                "round": r["round"],
+                "proposer": r["proposer"],
+                "amendments_count": len(r.get("amendments", [])),
+                "accepted_clauses_count": len(r.get("accept_clauses", [])),
+                "amendment_source": r.get("amendment_source"),
+                "summary": r.get("summary", "")[:140],
+            }
+            for r in rounds
+        ],
+        "finalized": state.get("finalized"),
+    }
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+
+def _negotiate_run_hook(cmd_template: str, vars: dict) -> tuple:
+    """Run a configured external command. Returns (returncode, stdout, stderr)."""
+    cmd = cmd_template
+    for k, v in vars.items():
+        cmd = cmd.replace("{" + k + "}", str(v))
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "hook timed out after 300s"
+
+
+def _negotiate_simulate_one_round(state_path: Path, party_base: Path, party: str, mode: str, stance: Optional[str]) -> dict:
+    """Simulate-only helper: run a single counter round in-process."""
+    class _A: pass
+    a = _A()
+    a.base = str(party_base)
+    a.state = str(state_path)
+    a.out = None
+    a.as_party = party
+    a.amendments_file = None
+    a.auto = (mode == "auto")
+    a.agent = (mode == "agent")
+    a.stance = stance
+    a.llm = "auto"
+    a.llm_model = None
+    a.llm_base_url = None
+    a.yes_llm_send = True
+    a.force_unblock = False
+    # Capture stdout JSON of cmd_negotiate_counter via redirect.
+    import io as _io
+    saved_stdout = sys.stdout
+    sys.stdout = _io.StringIO()
+    try:
+        cmd_negotiate_counter(a)
+        return json.loads(sys.stdout.getvalue() or "{}")
+    finally:
+        sys.stdout = saved_stdout
+
+
+def _negotiate_simulate_init(state_path: Path, party_a_base: Path, party_b_name: str, party_b_address: str) -> None:
+    org_policy = _negotiate_load_org_policy(party_a_base)
+    party_a_name = org_policy.get("org_name", "Party A")
+    class _A: pass
+    a = _A()
+    a.base = str(party_a_base)
+    a.template = "mutual"
+    a.out = str(state_path)
+    a.purpose = "(simulation)"
+    a.effective_date = "2026-01-01"
+    a.governing_law = None
+    a.party_a_name = party_a_name
+    a.party_a_address = "(simulated)"
+    a.party_b_name = party_b_name
+    a.party_b_address = "(simulated)"
+    a.disclosing_party = None
+    a.disclosing_party_address = None
+    a.receiving_party = None
+    a.receiving_party_address = None
+    import io as _io
+    saved_stdout = sys.stdout
+    sys.stdout = _io.StringIO()
+    try:
+        cmd_negotiate_init(a)
+    finally:
+        sys.stdout = saved_stdout
+
+
+def cmd_negotiate_simulate(args):
+    """Run both sides of a negotiation on one machine and report the outcome.
+
+    Use case: empirical validation of stance × stance predictions, regression
+    testing of the convergence/blocking logic, and exploring the negotiation
+    dynamics before committing to a real exchange."""
+    party_a_base = Path(args.party_a_base)
+    party_b_base = Path(args.party_b_base)
+    org_a = _negotiate_load_org_policy(party_a_base)
+    org_b = _negotiate_load_org_policy(party_b_base)
+    rules = org_a.get("clause_rules", {}) or {}
+
+    state_path = Path(args.state) if args.state else party_a_base / "_simulate_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    if state_path.exists():
+        state_path.unlink()
+
+    _negotiate_simulate_init(
+        state_path,
+        party_a_base,
+        party_b_name=org_b.get("org_name", "Party B"),
+        party_b_address="(simulated)",
+    )
+
+    # Optionally override stance per side without mutating the user's policy.
+    # We do this by writing a temporary stance into the policy file just for
+    # the duration of each call; restore at the end.
+    def _maybe_apply_stance_override(base: Path, override: Optional[str]):
+        if not override:
+            return None
+        p = base / "config" / "org-policy.json"
+        original = p.read_text()
+        cfg = json.loads(original)
+        cfg.setdefault("defaults", {})["negotiation_stance"] = override
+        p.write_text(json.dumps(cfg))
+        return original
+
+    def _restore(base: Path, original: Optional[str]):
+        if original is None:
+            return
+        (base / "config" / "org-policy.json").write_text(original)
+
+    saved_a = _maybe_apply_stance_override(party_a_base, args.stance_a)
+    saved_b = _maybe_apply_stance_override(party_b_base, args.stance_b)
+
+    trajectory = []
+
+    def _record(round_idx: int):
+        s = _negotiate_load(state_path)
+        cs = s.get("clause_status", {})
+        agreed = sum(1 for v in cs.values() if v.get("status") == "agreed")
+        disputed = sum(1 for v in cs.values() if v.get("status") == "disputed")
+        proposed = sum(1 for v in cs.values() if v.get("status") == "proposed")
+        trajectory.append({
+            "round": round_idx,
+            "proposer": s["rounds"][round_idx - 1]["proposer"],
+            "agreed": agreed,
+            "disputed": disputed,
+            "proposed": proposed,
+            "status": s.get("status"),
+        })
+        return s
+
+    state = _record(1)  # initial round 1
+
+    outcome = "max_rounds_exceeded"
+    rounds_used = 1
+    error: Optional[str] = None
+
+    try:
+        for round_idx in range(2, args.max_rounds + 1):
+            current = _negotiate_load(state_path)
+            if current.get("status") in ("converged", "blocked"):
+                break
+            next_proposer = "b" if current["rounds"][-1]["proposer"] == "a" else "a"
+            base = party_b_base if next_proposer == "b" else party_a_base
+            stance = args.stance_b if next_proposer == "b" else args.stance_a
+            try:
+                _negotiate_simulate_one_round(state_path, base, next_proposer, args.mode, stance)
+            except SystemExit as e:
+                error = f"Round {round_idx} ({next_proposer}) raised: {e}"
+                break
+            state = _record(round_idx)
+            rounds_used = round_idx
+            if state.get("status") == "converged":
+                outcome = "converged"
+                break
+            if state.get("status") == "blocked":
+                outcome = "blocked"
+                break
+        else:
+            outcome = "max_rounds_exceeded"
+    finally:
+        _restore(party_a_base, saved_a)
+        _restore(party_b_base, saved_b)
+
+    # Build winner-per-clause for converged outcomes: who proposed the
+    # final-accepted text for each clause? (last_proposer wins.)
+    winner_per_clause = {}
+    final = _negotiate_load(state_path)
+    for clause, st in final.get("clause_status", {}).items():
+        if st.get("status") == "agreed":
+            winner_per_clause[clause] = st.get("last_proposer")
+
+    report = {
+        "outcome": outcome,
+        "rounds_used": rounds_used,
+        "max_rounds": args.max_rounds,
+        "stances": {
+            "a": args.stance_a or _negotiate_resolve_stance(org_a, None),
+            "b": args.stance_b or _negotiate_resolve_stance(org_b, None),
+        },
+        "mode": args.mode,
+        "final_status": final.get("status"),
+        "final_clause_status": {k: v.get("status") for k, v in final.get("clause_status", {}).items()},
+        "winner_per_clause": winner_per_clause,
+        "trajectory": trajectory,
+        "block_diagnosis": final.get("block_diagnosis"),
+        "error": error,
+        "state_file": str(state_path),
+    }
+    if args.out:
+        Path(args.out).write_text(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    _print_friendly(
+        title=f"Simulation: {report['stances']['a']} × {report['stances']['b']} ({args.mode})",
+        lines=[
+            f"Outcome: {outcome}  ({rounds_used}/{args.max_rounds} rounds)",
+            f"Final status: {final.get('status')}",
+            f"Agreed: {sum(1 for v in final.get('clause_status', {}).values() if v.get('status') == 'agreed')}",
+            f"Disputed: {sum(1 for v in final.get('clause_status', {}).values() if v.get('status') == 'disputed')}",
+        ],
+        next_steps=(
+            ["Stalemate diagnosed. Try the same simulation with one side compromising, or with --mode agent."]
+            if outcome == "blocked" else
+            (["Converged. Trajectory shows how concessions accumulated."] if outcome == "converged" else
+             ["Did not converge within max-rounds. Either bump --max-rounds or investigate the trajectory."])
+        ),
+    )
+
+
+def _negotiate_key_points(state: dict, org_policy: dict) -> list:
+    """Build the focused key-points list used by sign-off.
+
+    Includes:
+      - Clauses whose final text differs from round 1's text
+      - Clauses with active red-flag patterns in the final text
+      - Every amendment that was applied in the converged outcome
+        (especially `agent:` and `auto:` sourced ones)
+    """
+    rules = org_policy.get("clause_rules", {}) or {}
+    rounds = state["rounds"]
+    initial_text = rounds[0]["text"]
+    final_text = rounds[-1]["text"]
+    key_points = []
+
+    for clause in sorted(rules.keys()):
+        initial_block = _negotiate_extract_clause_text(initial_text, clause)
+        final_block = _negotiate_extract_clause_text(final_text, clause)
+        if not initial_block and not final_block:
+            continue
+        changed = (initial_block.strip() != final_block.strip()) and bool(initial_block) and bool(final_block)
+        red_flags = red_flag_hits(final_block.lower(), clause) if final_block else []
+        if changed or red_flags:
+            key_points.append({
+                "clause": clause,
+                "changed_from_initial": changed,
+                "red_flags_active": [r for r in red_flags] if red_flags else [],
+                "initial_text_excerpt": (initial_block[:200] + "...") if len(initial_block) > 200 else initial_block,
+                "final_text_excerpt": (final_block[:200] + "...") if len(final_block) > 200 else final_block,
+            })
+
+    applied_amendments = []
+    for r in rounds[1:]:
+        for am in r.get("amendments", []) or []:
+            applied_amendments.append({
+                "round": r["round"],
+                "proposed_by": r["proposer"],
+                "source": r.get("amendment_source", "?"),
+                "stance": r.get("stance"),
+                "clause": am.get("clause"),
+                "rationale": am.get("rationale", ""),
+                "new_text_excerpt": (am.get("new_text", "")[:200] + "...") if len(am.get("new_text", "")) > 200 else am.get("new_text", ""),
+            })
+
+    # Fatigue concessions deserve explicit human attention — these are
+    # clauses where one party gave ground after a long bounce streak rather
+    # than because of stance/priority logic. Reviewers should sanity-check
+    # them before signing off.
+    fatigue_concessions = []
+    for r in rounds[1:]:
+        for clause in r.get("fatigue_concessions") or []:
+            fatigue_concessions.append({
+                "round": r["round"],
+                "conceded_by": r["proposer"],
+                "clause": clause,
+                "note": "Force-conceded after the clause bounced past the max-bounces threshold.",
+            })
+
+    return [
+        {"kind": "clause_evolution", "items": key_points},
+        {"kind": "applied_amendments", "items": applied_amendments},
+        {"kind": "fatigue_concessions", "items": fatigue_concessions},
+    ]
+
+
+def cmd_negotiate_diff(args):
+    """Show clause-by-clause changes between two rounds. Defaults to comparing
+    the most recent two rounds; pass --from N --to M for a specific range.
+    Output mirrors review/draft style: JSON to stdout, optional --md for human-friendly markdown."""
+    state = _negotiate_load(Path(args.state))
+    rounds = state["rounds"]
+    if len(rounds) < 2:
+        raise SystemExit("Need at least 2 rounds for a diff.")
+
+    to_idx = (args.to_round - 1) if args.to_round is not None else len(rounds) - 1
+    from_idx = (args.from_round - 1) if args.from_round is not None else to_idx - 1
+    if from_idx < 0 or to_idx >= len(rounds) or from_idx >= to_idx:
+        raise SystemExit(f"Invalid round range: from={from_idx + 1} to={to_idx + 1}.")
+    from_r, to_r = rounds[from_idx], rounds[to_idx]
+
+    # Walk policy clauses (or any extracted clause) to find per-clause diffs.
+    repo_base = Path(args.base)
+    org_policy = _negotiate_load_org_policy(repo_base) if (repo_base / "config" / "org-policy.json").exists() else {}
+    rules = (org_policy.get("clause_rules") or {}) or {}
+    clauses = list(rules.keys()) if rules else sorted(set(
+        am.get("clause") for r in rounds for am in (r.get("amendments") or []) if am.get("clause")
+    ))
+
+    diff_items = []
+    for clause in clauses:
+        old_block = _negotiate_extract_clause_text(from_r["text"], clause)
+        new_block = _negotiate_extract_clause_text(to_r["text"], clause)
+        if old_block != new_block and (old_block or new_block):
+            # Locate the amendment that introduced this change, if any.
+            amendment = next(
+                (am for am in (to_r.get("amendments") or []) if am.get("clause") == clause),
+                None,
+            )
+            diff_items.append({
+                "clause": clause,
+                "old_text": old_block,
+                "new_text": new_block,
+                "proposed_by": to_r["proposer"] if amendment else None,
+                "rationale": (amendment or {}).get("rationale", "(text changed without explicit amendment record)"),
+            })
+
+    accepted_in_to = to_r.get("accept_clauses") or []
+
+    payload = {
+        "ok": True,
+        "from_round": from_r["round"],
+        "to_round": to_r["round"],
+        "to_round_proposer": to_r["proposer"],
+        "to_round_source": to_r.get("amendment_source"),
+        "to_round_stance": to_r.get("stance"),
+        "changes": diff_items,
+        "accepted_clauses_in_to_round": accepted_in_to,
+        "fatigue_concessions_in_to_round": to_r.get("fatigue_concessions") or [],
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    if args.out_md:
+        lines = [
+            f"# Negotiation diff — round {from_r['round']} → round {to_r['round']}",
+            "",
+            f"- Round {to_r['round']} proposer: **Party {to_r['proposer'].upper()}**",
+            f"- Source: `{to_r.get('amendment_source')}` (stance: {to_r.get('stance')})",
+            "",
+        ]
+        if diff_items:
+            lines.append(f"## Clause changes ({len(diff_items)})")
+            lines.append("")
+            for d in diff_items:
+                lines.append(f"### {d['clause']}")
+                lines.append(f"- _Proposed by_: Party {(d['proposed_by'] or '?').upper()}")
+                lines.append(f"- _Rationale_: {d['rationale']}")
+                lines.append("```diff")
+                for old_line in (d["old_text"] or "").splitlines():
+                    lines.append(f"- {old_line}")
+                for new_line in (d["new_text"] or "").splitlines():
+                    lines.append(f"+ {new_line}")
+                lines.append("```")
+                lines.append("")
+        else:
+            lines.append("_No clause-text changes detected between these rounds._")
+            lines.append("")
+        if accepted_in_to:
+            lines.append(f"## Clauses accepted in round {to_r['round']}")
+            lines.append("")
+            lines.extend(f"- {c}" for c in accepted_in_to)
+        if to_r.get("fatigue_concessions"):
+            lines.append("")
+            lines.append("## Fatigue concessions")
+            lines.append("")
+            lines.extend(f"- {c}" for c in to_r["fatigue_concessions"])
+        Path(args.out_md).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out_md).write_text("\n".join(lines))
+
+
+def cmd_negotiate_withdraw(args):
+    """Mark the negotiation as withdrawn by one party. Blocks further commands."""
+    base = Path(args.base)
+    state = _negotiate_load(Path(args.state))
+    if state.get("status") in ("withdrawn", "finalized"):
+        raise SystemExit(f"Negotiation already in terminal state: {state.get('status')!r}.")
+    party = _negotiate_resolve_party(state, args.as_party, base)
+    state["status"] = "withdrawn"
+    state["withdrawal"] = {
+        "withdrawn_by": party,
+        "withdrawn_at": datetime.now(timezone.utc).isoformat(),
+        "reason": args.reason or "(no reason given)",
+    }
+    _negotiate_save(Path(args.state), state)
+    print(json.dumps({"ok": True, "status": "withdrawn", "withdrawn_by": party, "reason": state["withdrawal"]["reason"]}, ensure_ascii=False))
+    _print_friendly(
+        title=f"Negotiation withdrawn (Party {party.upper()})",
+        lines=[
+            f"Reason: {state['withdrawal']['reason']}",
+            f"State file marked terminal — no further counter/sign-off/finalize allowed.",
+        ],
+        next_steps=["Notify the other party out-of-band that you've withdrawn."],
+    )
+
+
+def cmd_negotiate_analyze(args):
+    """Read-only post-hoc dashboard for any state file. Shows the negotiation's
+    trajectory, source breakdown (manual / auto / agent / fatigue), per-clause
+    winner, fatigue summary, and a lightweight game-theoretic interpretation
+    of the outcome."""
+    state = _negotiate_load(Path(args.state))
+    rounds = state.get("rounds", [])
+    if not rounds:
+        raise SystemExit("State file has no rounds — nothing to analyze.")
+
+    # Trajectory: per-round agreed/disputed/proposed counts. We recompute
+    # from policy if available, else from amendment history.
+    base = Path(args.base)
+    org_policy = _negotiate_load_org_policy(base) if (base / "config" / "org-policy.json").exists() else {}
+    rules = (org_policy.get("clause_rules") or {}) or {}
+
+    trajectory = []
+    for i in range(len(rounds)):
+        truncated = {**state, "rounds": rounds[: i + 1]}
+        cs = _negotiate_recompute_clause_status(truncated, rules)
+        trajectory.append({
+            "round": rounds[i]["round"],
+            "proposer": rounds[i]["proposer"],
+            "amendment_source": rounds[i].get("amendment_source", "?"),
+            "stance": rounds[i].get("stance"),
+            "agreed": sum(1 for v in cs.values() if v.get("status") == "agreed"),
+            "disputed": sum(1 for v in cs.values() if v.get("status") == "disputed"),
+            "proposed": sum(1 for v in cs.values() if v.get("status") == "proposed"),
+        })
+
+    # Source breakdown across all rounds
+    src_counter = Counter(r.get("amendment_source", "?") for r in rounds)
+
+    # Winner per agreed clause
+    final_status = state.get("clause_status") or _negotiate_recompute_clause_status(state, rules)
+    winners = {c: s.get("last_proposer") for c, s in final_status.items() if s.get("status") == "agreed"}
+    winner_count = Counter(winners.values())
+
+    # Fatigue / non-negotiable summary
+    fatigue_clauses = []
+    for r in rounds:
+        for c in r.get("fatigue_concessions") or []:
+            fatigue_clauses.append({"round": r["round"], "conceded_by": r["proposer"], "clause": c})
+
+    # Concession trajectory: per-round count of accept_clauses by proposer
+    concession_trajectory = [
+        {"round": r["round"], "proposer": r["proposer"], "accepted": len(r.get("accept_clauses") or [])}
+        for r in rounds
+    ]
+
+    # Game-theoretic interpretation
+    outcome_interpretation = _negotiate_interpret_outcome(state, trajectory, src_counter)
+
+    payload = {
+        "negotiation_id": state.get("negotiation_id"),
+        "status": state.get("status"),
+        "rounds_total": len(rounds),
+        "stances": {
+            "a_initial": rounds[0].get("stance"),  # round 1 is the initial draft (stance may be None)
+            "observed_per_round": [{"round": r["round"], "proposer": r["proposer"], "stance": r.get("stance")} for r in rounds],
+        },
+        "trajectory": trajectory,
+        "source_breakdown": dict(src_counter),
+        "winner_per_clause": winners,
+        "wins_by_party": {"a": winner_count.get("a", 0), "b": winner_count.get("b", 0)},
+        "fatigue_concessions": fatigue_clauses,
+        "concession_trajectory": concession_trajectory,
+        "outcome_interpretation": outcome_interpretation,
+        "block_diagnosis": state.get("block_diagnosis"),
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    if args.out_md:
+        lines = [
+            f"# Negotiation analysis — `{state.get('negotiation_id', '?')}`",
+            "",
+            f"- **Status**: `{state.get('status')}`",
+            f"- **Outcome**: {outcome_interpretation['label']}",
+            f"- **Rounds**: {len(rounds)}",
+            f"- **Parties**: A = {state['parties'].get('a', {}).get('name')}, B = {state['parties'].get('b', {}).get('name')}",
+            "",
+        ]
+        if outcome_interpretation.get("notes"):
+            lines.append("**Notes:**")
+            lines.append("")
+            for n in outcome_interpretation["notes"]:
+                lines.append(f"- {n}")
+            lines.append("")
+
+        lines.append("## Trajectory")
+        lines.append("")
+        lines.append("| Round | Proposer | Source | Stance | Agreed | Disputed | Proposed |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for t in trajectory:
+            lines.append(
+                f"| {t['round']} | {t['proposer'].upper()} | `{t['amendment_source']}` "
+                f"| {t.get('stance') or '—'} | {t['agreed']} | {t['disputed']} | {t['proposed']} |"
+            )
+        lines.append("")
+
+        lines.append("## Wins by party")
+        lines.append("")
+        lines.append(f"- **Party A** ({state['parties'].get('a', {}).get('name')}): {payload['wins_by_party']['a']} clauses")
+        lines.append(f"- **Party B** ({state['parties'].get('b', {}).get('name')}): {payload['wins_by_party']['b']} clauses")
+        lines.append("")
+
+        if winners:
+            lines.append("## Winner per agreed clause")
+            lines.append("")
+            for clause, who in sorted(winners.items()):
+                lines.append(f"- `{clause}` → Party {(who or '?').upper()}")
+            lines.append("")
+
+        lines.append("## Amendment-source breakdown")
+        lines.append("")
+        for src, n in sorted(src_counter.items()):
+            lines.append(f"- `{src}`: {n} round(s)")
+        lines.append("")
+
+        if fatigue_clauses:
+            lines.append("## Fatigue concessions (force-resolved)")
+            lines.append("")
+            lines.append("These clauses were force-conceded after bouncing past the threshold. **Review carefully** — they were not agreed organically.")
+            lines.append("")
+            for f in fatigue_clauses:
+                lines.append(f"- Round {f['round']}, conceded by Party {f['conceded_by'].upper()}: `{f['clause']}`")
+            lines.append("")
+
+        if state.get("block_diagnosis"):
+            diag = state["block_diagnosis"]
+            lines.append("## Block diagnosis")
+            lines.append("")
+            lines.append(f"- Rounds without progress: {diag.get('rounds_without_progress')}")
+            lines.append(f"- Threshold: {diag.get('threshold')}")
+            lines.append(f"- Stuck clauses: `{', '.join(diag.get('stuck_clauses', []))}`")
+            lines.append("")
+            lines.append(f"> {diag.get('note', '')}")
+            lines.append("")
+
+        Path(args.out_md).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out_md).write_text("\n".join(lines))
+
+
+def _negotiate_interpret_outcome(state: dict, trajectory: list, src_counter: Counter) -> dict:
+    """Lightweight game-theoretic interpretation of the negotiation."""
+    status = state.get("status", "unknown")
+    rounds = state.get("rounds", [])
+    if not rounds:
+        return {"label": "empty", "note": "No rounds."}
+
+    fatigue_used = any("+fatigue" in s for s in src_counter)
+    agent_used = any(s.startswith("agent") for s in src_counter)
+    auto_used = any(s.startswith("auto") for s in src_counter)
+    final_agreed = trajectory[-1]["agreed"] if trajectory else 0
+    final_disputed = trajectory[-1]["disputed"] if trajectory else 0
+
+    if status == "finalized":
+        label = "finalized"
+    elif status == "signed_off":
+        label = "signed-off, awaiting finalize"
+    elif status == "converged":
+        label = "converged via fatigue" if fatigue_used else "converged organically"
+    elif status == "blocked":
+        label = "blocked (deadlock detected)"
+    elif status == "withdrawn":
+        label = "withdrawn by one party"
+    else:
+        label = "in progress"
+
+    notes = []
+    if fatigue_used:
+        notes.append("Fatigue concession was triggered — at least one clause was force-resolved after bouncing past the threshold. Review carefully.")
+    if agent_used and auto_used:
+        notes.append("Mixed counter modes (LLM agent and deterministic auto). Source breakdown has details.")
+    elif agent_used:
+        notes.append("LLM agent drove the negotiation. Verify rationales in the round-by-round amendments.")
+    elif auto_used:
+        notes.append("Pure deterministic mode — no LLM was used.")
+    if final_disputed > 0:
+        notes.append(f"{final_disputed} clause(s) remain disputed in the final state.")
+    if final_agreed == 0 and rounds:
+        notes.append("No clauses ever reached `agreed` status — the negotiation never produced shared ground.")
+
+    return {"label": label, "notes": notes}
+
+
+def cmd_negotiate_validate(args):
+    """Standalone integrity check on a negotiation state file. Verifies the
+    schema version, the per-round SHA-256 hash chain end-to-end, and the
+    structural shape of every round. Exits 0 on success, 2 on any failure.
+
+    Useful when you receive a state file from another party and want to
+    confirm it hasn't been tampered with before processing it, or after
+    hand-editing the JSON to catch mistakes."""
+    state_path = Path(args.state)
+    try:
+        state = _negotiate_load(state_path)
+    except SystemExit as e:
+        print(json.dumps({
+            "ok": False,
+            "state_file": str(state_path),
+            "error": str(e),
+        }, indent=2, ensure_ascii=False))
+        raise SystemExit(2)
+
+    rounds = state.get("rounds", [])
+    issues = []
+    expected_alternation = None
+    for i, r in enumerate(rounds):
+        if not isinstance(r.get("round"), int) or r["round"] != i + 1:
+            issues.append(f"Round {i}: 'round' field {r.get('round')!r} doesn't match index {i + 1}")
+        if r.get("proposer") not in ("a", "b"):
+            issues.append(f"Round {r.get('round')}: proposer {r.get('proposer')!r} not in ('a', 'b')")
+        if expected_alternation is not None and r.get("proposer") == expected_alternation:
+            issues.append(f"Round {r.get('round')}: same proposer as previous round (no alternation)")
+        expected_alternation = r.get("proposer")
+        sig = r.get("signature") or {}
+        if sig.get("signer") != r.get("proposer"):
+            issues.append(f"Round {r.get('round')}: signature.signer {sig.get('signer')!r} != proposer {r.get('proposer')!r}")
+        if "text" not in r or "text_hash" not in r:
+            issues.append(f"Round {r.get('round')}: missing text or text_hash")
+
+    payload = {
+        "ok": not issues,
+        "state_file": str(state_path),
+        "schema_version": state.get("schema_version"),
+        "negotiation_id": state.get("negotiation_id"),
+        "status": state.get("status"),
+        "rounds_total": len(rounds),
+        "hash_chain_verified": True,  # _negotiate_load already verified or raised
+        "structural_issues": issues,
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    if issues:
+        raise SystemExit(2)
+
+
+def cmd_negotiate_signoff(args):
+    base = Path(args.base)
+    state = _negotiate_load(Path(args.state))
+    if state.get("status") not in ("converged", "signed_off"):
+        raise SystemExit(
+            f"Negotiation status is {state.get('status')!r}. "
+            "Sign-off requires the negotiation to be `converged` first."
+        )
+    org_policy = _negotiate_load_org_policy(base)
+    party = _negotiate_resolve_party(state, args.as_party, base)
+    key_points = _negotiate_key_points(state, org_policy)
+
+    print(json.dumps({
+        "ok": True,
+        "negotiation_id": state["negotiation_id"],
+        "you_are": party,
+        "key_points": key_points,
+    }, indent=2, ensure_ascii=False))
+
+    # Friendly summary to stderr.
+    clause_changes = key_points[0]["items"]
+    amendments = key_points[1]["items"]
+    fatigue = key_points[2]["items"] if len(key_points) > 2 else []
+    summary_lines = [
+        f"Clauses changed from initial draft: {sum(1 for c in clause_changes if c['changed_from_initial'])}",
+        f"Clauses with active red flags in final text: {sum(1 for c in clause_changes if c['red_flags_active'])}",
+        f"Total amendments applied across rounds: {len(amendments)}",
+        f"Fatigue-conceded clauses (force-resolved after bouncing): {len(fatigue)}",
+        "",
+        "Sources:",
+    ]
+    src_counts = Counter(a["source"] for a in amendments)
+    for src, n in sorted(src_counts.items()):
+        summary_lines.append(f"  - {src}: {n}")
+    if fatigue:
+        summary_lines.append("")
+        summary_lines.append("Fatigue concessions (review carefully):")
+        for f in fatigue:
+            summary_lines.append(f"  - round {f['round']}, conceded by Party {f['conceded_by'].upper()}: {f['clause']}")
+
+    interactive = sys.stdin.isatty() and not args.yes
+    if interactive:
+        print("", file=sys.stderr)
+        print("  ━━ Sign-off review ━━", file=sys.stderr)
+        for line in summary_lines:
+            print(f"  {line}", file=sys.stderr)
+        if clause_changes:
+            print("\n  Key clause changes:", file=sys.stderr)
+            for c in clause_changes:
+                marker = "[red flags]" if c["red_flags_active"] else "[changed]"
+                print(f"    {marker} {c['clause']}", file=sys.stderr)
+                if c['red_flags_active']:
+                    print(f"        → {', '.join(c['red_flags_active'][:3])}", file=sys.stderr)
+        try:
+            ok = input("\n  Sign off all key points and approve final text? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("Aborted.")
+        if ok not in ("", "y", "yes"):
+            raise SystemExit("Sign-off declined. State unchanged.")
+
+    # Record sign-off.
+    state.setdefault("signoffs", {})
+    state["signoffs"][party] = {
+        "signed_at": datetime.now(timezone.utc).isoformat(),
+        "key_points_count": len(clause_changes) + len(amendments),
+        "method": "json_flag",
+    }
+    if all(p in state["signoffs"] for p in ("a", "b")):
+        state["status"] = "signed_off"
+
+    _negotiate_save(Path(args.state), state)
+
+    next_step = (
+        "Run `negotiate finalize` to emit the agreed .md/.docx (and optionally hand off to docx2pdf + sign-CLI)."
+        if state["status"] == "signed_off"
+        else f"Other party still needs to run `negotiate sign-off`."
+    )
+    _print_friendly(
+        title=f"Sign-off recorded (Party {party.upper()})",
+        lines=summary_lines,
+        next_steps=[next_step],
+    )
+
+
+def cmd_negotiate_finalize(args):
+    base = Path(args.base)
+    state = _negotiate_load(Path(args.state))
+    if state.get("status") not in ("converged", "signed_off"):
+        raise SystemExit(
+            f"Negotiation status is {state.get('status')!r}, not 'converged' or 'signed_off'. "
+            "Both parties must alternate-sign to a state with no disputed clauses."
+        )
+    signoffs = state.get("signoffs") or {}
+    missing = [p for p in ("a", "b") if p not in signoffs]
+    if missing and not args.skip_signoff:
+        raise SystemExit(
+            f"Sign-off missing from party/parties: {missing}. "
+            "Each party must run `negotiate sign-off` before finalize. "
+            "Pass --skip-signoff only for testing or non-binding finalizations."
+        )
+
+    last = state["rounds"][-1]
+    final_text = last["text"]
+    out_md = Path(args.out_md)
+    out_docx = Path(args.out_docx)
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+    out_docx.parent.mkdir(parents=True, exist_ok=True)
+    out_md.write_text(final_text)
+    md_to_docx(final_text, out_docx)
+
+    pdf_path = None
+    signed_pdf_path = None
+    integrations = {}
+    integ_path = base / "config" / "integrations.json"
+    if integ_path.exists():
+        try:
+            integrations = json.loads(integ_path.read_text())
+        except Exception as e:
+            print(f"Warning: could not parse {integ_path}: {e}", file=sys.stderr)
+
+    hook_log = []
+    if args.to_pdf:
+        cmd_t = integrations.get("docx2pdf_cmd")
+        if not cmd_t:
+            raise SystemExit("--to-pdf requested but `docx2pdf_cmd` not configured in config/integrations.json.")
+        pdf_path = str(out_docx.with_suffix(".pdf"))
+        rc, so, se = _negotiate_run_hook(cmd_t, {
+            "input_docx": str(out_docx),
+            "output_pdf": pdf_path,
+        })
+        hook_log.append({"hook": "docx2pdf", "returncode": rc, "stdout": so[-500:], "stderr": se[-500:]})
+        if rc != 0:
+            raise SystemExit(f"docx2pdf hook failed (rc={rc}): {se[-300:]}")
+
+    if args.sign:
+        cmd_t = integrations.get("sign_cli_cmd")
+        if not cmd_t:
+            raise SystemExit("--sign requested but `sign_cli_cmd` not configured in config/integrations.json.")
+        if not pdf_path:
+            raise SystemExit("--sign requires --to-pdf (sign-CLI operates on the PDF).")
+        signed_pdf_path = str(Path(pdf_path).with_name(Path(pdf_path).stem + ".signed.pdf"))
+        rc, so, se = _negotiate_run_hook(cmd_t, {
+            "input_pdf": pdf_path,
+            "output_pdf": signed_pdf_path,
+            "party_a_name": state["parties"]["a"]["name"],
+            "party_b_name": state["parties"]["b"]["name"],
+            "negotiation_id": state["negotiation_id"],
+        })
+        hook_log.append({"hook": "sign_cli", "returncode": rc, "stdout": so[-500:], "stderr": se[-500:]})
+        if rc != 0:
+            raise SystemExit(f"sign-CLI hook failed (rc={rc}): {se[-300:]}")
+
+    state["finalized"] = {
+        "finalized_at": datetime.now(timezone.utc).isoformat(),
+        "final_text_hash": last["text_hash"],
+        "out_md": str(out_md),
+        "out_docx": str(out_docx),
+        "out_pdf": pdf_path,
+        "signed_pdf": signed_pdf_path,
+        "hooks": hook_log,
+    }
+    state["status"] = "finalized"
+    _negotiate_save(Path(args.state), state)
+    print(json.dumps({"ok": True, "finalized": state["finalized"], "state_file": args.state}, indent=2, ensure_ascii=False))
+    _print_friendly(
+        title="Negotiation finalized",
+        lines=[
+            f"Markdown: {out_md}",
+            f"Word doc: {out_docx}",
+            f"PDF:      {pdf_path or '(skipped)'}",
+            f"Signed:   {signed_pdf_path or '(skipped)'}",
+            f"Hash:     {last['text_hash'][:16]}...",
+        ],
+        next_steps=(
+            ["Distribute the signed PDF to both parties for archival."]
+            if signed_pdf_path else
+            ["Sign and distribute the .docx via your usual channel.",
+             "Or wire up `docx2pdf_cmd` and `sign_cli_cmd` in config/integrations.json and rerun with --to-pdf --sign."]
+        ),
+    )
+
+
+def cmd_tutorial(args):
+    repo = Path(__file__).resolve().parent
+    interactive = sys.stdin.isatty() and not args.no_prompt
+
+    def pause(prompt="Press Enter to continue, or Ctrl-C to quit. "):
+        if interactive:
+            try:
+                input(prompt)
+            except (EOFError, KeyboardInterrupt):
+                print("\nTutorial aborted.")
+                raise SystemExit(0)
+
+    for step in TUTORIAL_STEPS:
+        print()
+        print(f"  ━━ {step['title']} ━━")
+        for line in step["body"]:
+            print(f"  {line}")
+        pause()
+
+    if not args.run_sample and interactive:
+        try:
+            choice = input("\n  Run a sample setup + review now? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            choice = "n"
+        run_sample = choice in ("", "y", "yes")
+    else:
+        run_sample = args.run_sample
+
+    if not run_sample:
+        print("\n  Skipped sample run. When you're ready:")
+        print("    1. ./nda_review_cli.py setup --quick --yes")
+        print("    2. ./nda_review_cli.py review --file tests/fixtures/sample_nda.txt --why")
+        print("    3. ./nda_review_cli.py doctor")
+        return
+
+    import tempfile
+
+    workdir = Path(args.base) if args.base else Path(tempfile.mkdtemp(prefix="nda-tutorial-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    print(f"\n  Sandbox: {workdir}")
+    print("  Running: setup --quick --yes --no-prompt")
+
+    class Obj:
+        pass
+
+    setup_args = Obj()
+    setup_args.base = str(workdir)
+    setup_args.interactive = False
+    setup_args.org_name = "Tutorial Org"
+    setup_args.template = None
+    setup_args.risk_posture = "balanced"
+    setup_args.preferred_jurisdictions = "Austria"
+    setup_args.survival_years = 5
+    setup_args.ai_policy = "guardrailed"
+    setup_args.retention_carveout = "Allow limited backup/legal retention under continuing confidentiality obligations."
+    setup_args.default_policy = "config/default-policy.json"
+    setup_args.policy = None
+    setup_args.ingest_files = None
+    setup_args.contracts_dir = None
+    setup_args.drive_export_dir = None
+    setup_args.build = False
+    setup_args.no_build = True
+    setup_args.quick = True
+    setup_args.yes = True
+    setup_args.no_prompt = True
+    setup_args.scoring_profile = None
+    setup_args.scoring_profiles = None
+    cmd_setup(setup_args)
+
+    # Seed minimal corpus stubs so build-playbook produces a usable artifact.
+    raw = workdir / "data" / "raw_strict"
+    raw.mkdir(parents=True, exist_ok=True)
+    sample_gmail = [
+        {"id": "1", "subject": "NDA review (mutual)", "body": "Mutual NDA, return or destroy on termination, governing law Austria.", "from": "legal@example.com"},
+        {"id": "2", "subject": "Re: NDA accepted", "body": "Term 3 years, trade secret survival indefinite, looks good.", "from": "ops@example.com"},
+    ]
+    sample_drive = [{"id": "d1", "name": "NDA playbook notes", "body": "Use restrictions limited to evaluation purposes."}]
+    for name in ("gmail_primary.json", "gmail_secondary.json"):
+        (raw / name).write_text(json.dumps(sample_gmail))
+    for name in ("drive_primary.json", "drive_secondary.json"):
+        (raw / name).write_text(json.dumps(sample_drive))
+
+    print("\n  Building sample playbook from seeded corpus stubs...")
+    build_args = Obj()
+    build_args.base = str(workdir)
+    build_args.policy = None
+    build_args.gmail_paths = ["data/raw_strict/gmail_primary.json", "data/raw_strict/gmail_secondary.json"]
+    build_args.drive_paths = ["data/raw_strict/drive_primary.json", "data/raw_strict/drive_secondary.json"]
+    build_args.out_json = "output/nda_playbook.json"
+    build_args.out_md = "output/nda_playbook.md"
+    cmd_build(build_args)
+
+    sample = repo / "tests" / "fixtures" / "sample_nda.txt"
+    if not sample.exists():
+        print(f"\n  Sample fixture missing: {sample}")
+        return
+
+    print(f"\n  Reviewing: {sample}")
+    review_args = Obj()
+    review_args.base = str(workdir)
+    review_args.playbook = str(workdir / "output" / "nda_playbook.json")
+    review_args.counterparty = None
+    review_args.file = str(sample)
+    review_args.text = None
+    review_args.out_json = str(workdir / "output" / "reviews" / "tutorial-review.json")
+    review_args.out_md = str(workdir / "output" / "reviews" / "tutorial-review.md")
+    review_args.why = True
+    review_args.learn_profile = False
+    review_args.scoring_profile = None
+    review_args.scoring_profiles = None
+    Path(review_args.out_json).parent.mkdir(parents=True, exist_ok=True)
+    cmd_review(review_args)
+
+    print()
+    print("  ━━ Done ━━")
+    print(f"  Review JSON: {review_args.out_json}")
+    print(f"  Review MD:   {review_args.out_md}")
+    print()
+    print("  Next steps:")
+    print("    • Open the markdown summary in your editor.")
+    print("    • Run `./nda_review_cli.py doctor` against your real workspace.")
+    print("    • Read GETTING_STARTED.md for the full happy-path guide.")
+    print()
+
+
 def cmd_wizard(args):
     base = Path(args.base)
     interactive = not args.no_prompt and sys.stdin.isatty()
@@ -1921,8 +4943,31 @@ def cmd_wizard(args):
         cmd_review(review_args)
 
 
+FIRST_RUN_HINT = (
+    "\nNDA Review CLI — local-first NDA review and drafting.\n\n"
+    "First time? Try one of:\n"
+    "  ./nda_review_cli.py tutorial            # interactive primer + sample review\n"
+    "  ./nda_review_cli.py quickstart          # 14-question guided setup\n"
+    "  ./nda_review_cli.py setup --quick --yes # zero-friction defaults\n"
+    "\nCommon commands:\n"
+    "  review --file <nda>                     # score an NDA against your playbook\n"
+    "  draft --template mutual ...             # generate an outgoing NDA\n"
+    "  doctor                                  # diagnose first-run readiness\n"
+    "\nSee `--help` for the full list, or read GETTING_STARTED.md.\n"
+)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="NDA Review CLI")
+    parser = argparse.ArgumentParser(
+        prog="nda-review-cli",
+        description="Local-first NDA review and drafting CLI (deterministic + optional LLM augmentation).",
+    )
+    parser.add_argument("--version", action="version", version=f"nda-review-cli {__version__}")
+    # `cmd` is technically required, but we want a friendlier message than argparse's
+    # default when the user runs the tool with no args at all.
+    if len(sys.argv) == 1:
+        print(FIRST_RUN_HINT, file=sys.stderr)
+        raise SystemExit(0)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_build = sub.add_parser("build-playbook", help="Build NDA playbook from extracted Gmail/Drive corpus")
@@ -1946,6 +4991,16 @@ def main():
     p_review.add_argument("--learn-profile", action="store_true", help="Write deterministic counterparty profile updates from this review")
     p_review.add_argument("--scoring-profile", help="Scoring profile name")
     p_review.add_argument("--scoring-profiles", help="Path to scoring profiles JSON")
+    p_review.add_argument(
+        "--llm",
+        nargs="?",
+        const="auto",
+        choices=["auto", "anthropic", "openai", "ollama", "openai-compatible"],
+        help="Opt-in: also run a second-pass LLM review (votes + new findings + clause suggestions). 'auto' uses provider from config/llm.json or NDA_LLM_PROVIDER.",
+    )
+    p_review.add_argument("--llm-model", help="Override the LLM model id (e.g. claude-sonnet-4-6, gpt-4o-mini, qwen2.5:14b)")
+    p_review.add_argument("--llm-base-url", help="Override the LLM base URL (useful for openai-compatible / Ollama / local servers)")
+    p_review.add_argument("--yes-llm-send", action="store_true", help="Skip the per-call confirmation that NDA text is being sent to the LLM provider")
     p_review.set_defaults(func=cmd_review)
 
     p_snap = sub.add_parser("playbook-snapshot", help="Snapshot current playbook version")
@@ -2072,6 +5127,153 @@ def main():
     p_release.add_argument("--version", required=True)
     p_release.add_argument("--out")
     p_release.set_defaults(func=cmd_release_helper)
+
+    p_quick = sub.add_parser("quickstart", help="Guided 14-question setup: collects org/risk/clause preferences, writes config + profile, optionally ingests + samples a review")
+    p_quick.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_quick.add_argument("--no-prompt", action="store_true", help="Skip prompts; use defaults (CI-friendly)")
+    p_quick.add_argument("--yes", action="store_true", help="Skip the final apply confirmation")
+    p_quick.add_argument("--answers-file", help="Replay from a previously-saved quickstart-answers.json")
+    p_quick.add_argument("--default-policy", default="config/default-policy.json", help="Seed policy used as the clause-rules base")
+    p_quick.set_defaults(func=cmd_quickstart)
+
+    p_draft = sub.add_parser("draft", help="Draft an NDA to send out, using a built-in template (mutual / one-way-out) or your own --template-file")
+    p_draft.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_draft.add_argument("--template", choices=sorted(DRAFT_TEMPLATES.keys()), help="Built-in template; defaults to one suggested by your profile.nda_direction")
+    p_draft.add_argument("--template-file", help="Path to a custom .md template with {{placeholders}}")
+    p_draft.add_argument("--out", required=True, help="Output markdown path (canonical source)")
+    p_draft.add_argument("--out-docx", help="Optional Word .docx output path")
+    p_draft.add_argument("--purpose", required=True, help="Purpose / deal description (free text)")
+    p_draft.add_argument("--effective-date", help="Effective date (YYYY-MM-DD); defaults to today UTC")
+    p_draft.add_argument("--governing-law", help="Override governing law/jurisdiction; defaults to first preferred_jurisdictions entry")
+    # Mutual party fields
+    p_draft.add_argument("--party-a", help="Mutual: Party A name")
+    p_draft.add_argument("--party-a-address", help="Mutual: Party A address")
+    p_draft.add_argument("--party-b", help="Mutual: Party B name")
+    p_draft.add_argument("--party-b-address", help="Mutual: Party B address")
+    # One-way fields
+    p_draft.add_argument("--disclosing-party", help="One-way: disclosing party name (defaults to org_name)")
+    p_draft.add_argument("--disclosing-party-address", help="One-way: disclosing party address")
+    p_draft.add_argument("--receiving-party", help="One-way: receiving party name")
+    p_draft.add_argument("--receiving-party-address", help="One-way: receiving party address")
+    p_draft.add_argument("--counterparty", help="Optional counterparty profile name to load tone from profiles/<name>.json")
+    p_draft.add_argument("--review-after", action="store_true", help="Run the generated draft through `review --why` as a sanity check")
+    p_draft.add_argument("--no-disclaimer", action="store_true", help="Omit the 'this is a starting point' header")
+    p_draft.set_defaults(func=cmd_draft)
+
+    p_neg = sub.add_parser("negotiate", help="Two-party turn-taking NDA negotiation with optional LLM agent assistance (file-based protocol)")
+    neg_sub = p_neg.add_subparsers(dest="neg_cmd", required=True)
+
+    p_ni = neg_sub.add_parser("init", help="Start a negotiation: draft NDA from template + parties, sign as Party A, emit state file")
+    p_ni.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_ni.add_argument("--template", choices=sorted(DRAFT_TEMPLATES.keys()), default="mutual")
+    p_ni.add_argument("--out", required=True, help="Output negotiation state JSON file")
+    p_ni.add_argument("--purpose", required=True)
+    p_ni.add_argument("--effective-date")
+    p_ni.add_argument("--governing-law")
+    # Mutual party fields
+    p_ni.add_argument("--party-a-name")
+    p_ni.add_argument("--party-a-address")
+    p_ni.add_argument("--party-b-name")
+    p_ni.add_argument("--party-b-address")
+    # One-way fields
+    p_ni.add_argument("--disclosing-party")
+    p_ni.add_argument("--disclosing-party-address")
+    p_ni.add_argument("--receiving-party")
+    p_ni.add_argument("--receiving-party-address")
+    p_ni.set_defaults(func=cmd_negotiate_init)
+
+    p_nr = neg_sub.add_parser("review", help="Read-only: review the latest round vs your policy")
+    p_nr.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_nr.add_argument("--state", required=True, help="Negotiation state JSON file")
+    p_nr.add_argument("--as", dest="as_party", choices=["a", "b"], help="Which party you are; auto-detected from org_name if omitted")
+    p_nr.set_defaults(func=cmd_negotiate_review)
+
+    p_nc = neg_sub.add_parser("counter", help="Sign a counter-round with amendments (manual or LLM-drafted)")
+    p_nc.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_nc.add_argument("--state", required=True)
+    p_nc.add_argument("--out", help="Where to write the updated state file (defaults to overwriting --state)")
+    p_nc.add_argument("--as", dest="as_party", choices=["a", "b"])
+    p_nc.add_argument("--amendments-file", help="Manual amendments JSON file: {accept_clauses, counter_amendments, summary}")
+    p_nc.add_argument("--auto", action="store_true", help="Deterministic stance-driven amendment generator (no LLM). Uses your policy + negotiation_stance.")
+    p_nc.add_argument("--dry-run", action="store_true", help="Generate the proposal and print it as JSON, but do NOT write to the state file. Useful for previewing what --agent or --auto will do before committing.")
+    p_nc.add_argument("--force-unblock", action="store_true", help="Continue countering even if status is `blocked` (rarely useful)")
+    p_nc.add_argument("--stance", choices=sorted(NEGOTIATE_STANCE_DESCRIPTORS.keys()), help="Override negotiation_stance from policy for this round only")
+    p_nc.add_argument("--agent", action="store_true", help="Use the configured LLM as a negotiation agent to draft amendments")
+    p_nc.add_argument("--llm", choices=["auto", "anthropic", "openai", "ollama", "openai-compatible"], default="auto")
+    p_nc.add_argument("--llm-model")
+    p_nc.add_argument("--llm-base-url")
+    p_nc.add_argument("--yes-llm-send", action="store_true")
+    p_nc.set_defaults(func=cmd_negotiate_counter)
+
+    p_na = neg_sub.add_parser("accept", help="Accept the current text, signing convergence on your side")
+    p_na.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_na.add_argument("--state", required=True)
+    p_na.add_argument("--out")
+    p_na.add_argument("--as", dest="as_party", choices=["a", "b"])
+    p_na.set_defaults(func=cmd_negotiate_accept)
+
+    p_ns = neg_sub.add_parser("status", help="Show negotiation rounds, per-clause status, signatures")
+    p_ns.add_argument("--state", required=True)
+    p_ns.set_defaults(func=cmd_negotiate_status)
+
+    p_sim = neg_sub.add_parser("simulate", help="Run both sides on one machine with configurable stances; report converged/blocked/max-rounds outcome (game-theoretic validation)")
+    p_sim.add_argument("--party-a-base", required=True, help="Workspace for Party A (must have config/org-policy.json)")
+    p_sim.add_argument("--party-b-base", required=True, help="Workspace for Party B (must have config/org-policy.json)")
+    p_sim.add_argument("--stance-a", choices=sorted(NEGOTIATE_STANCE_DESCRIPTORS.keys()), help="Override Party A's stance for this simulation")
+    p_sim.add_argument("--stance-b", choices=sorted(NEGOTIATE_STANCE_DESCRIPTORS.keys()), help="Override Party B's stance for this simulation")
+    p_sim.add_argument("--mode", choices=["auto", "agent"], default="auto", help="Counter mode: auto (deterministic) or agent (LLM)")
+    p_sim.add_argument("--max-rounds", type=int, default=20)
+    p_sim.add_argument("--state", help="Where to write the simulation state file (default: <party_a_base>/_simulate_state.json)")
+    p_sim.add_argument("--out", help="Where to write the simulation report JSON")
+    p_sim.set_defaults(func=cmd_negotiate_simulate)
+
+    p_ndiff = neg_sub.add_parser("diff", help="Show clause-by-clause changes between two rounds (defaults to last two)")
+    p_ndiff.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_ndiff.add_argument("--state", required=True)
+    p_ndiff.add_argument("--from-round", dest="from_round", type=int, help="Round number to diff from (default: round before --to-round)")
+    p_ndiff.add_argument("--to-round", dest="to_round", type=int, help="Round number to diff to (default: most recent)")
+    p_ndiff.add_argument("--out-md", help="Optional markdown output with redline-style code blocks")
+    p_ndiff.set_defaults(func=cmd_negotiate_diff)
+
+    p_nw = neg_sub.add_parser("withdraw", help="Withdraw from a negotiation; flips status to `withdrawn` and blocks further commands")
+    p_nw.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_nw.add_argument("--state", required=True)
+    p_nw.add_argument("--as", dest="as_party", choices=["a", "b"])
+    p_nw.add_argument("--reason", help="Free-text reason for the withdrawal (recorded in state.withdrawal.reason)")
+    p_nw.set_defaults(func=cmd_negotiate_withdraw)
+
+    p_na = neg_sub.add_parser("analyze", help="Read-only post-hoc dashboard for any state file (trajectory, winners, source breakdown, fatigue summary, outcome interpretation)")
+    p_na.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_na.add_argument("--state", required=True)
+    p_na.add_argument("--out-md", help="Optional markdown output for sharing with humans (the JSON dashboard is hard to read in a meeting)")
+    p_na.set_defaults(func=cmd_negotiate_analyze)
+
+    p_nv = neg_sub.add_parser("validate", help="Standalone integrity check: schema version + hash-chain verification + per-round structural shape (exits 2 on any failure)")
+    p_nv.add_argument("--state", required=True)
+    p_nv.set_defaults(func=cmd_negotiate_validate)
+
+    p_nso = neg_sub.add_parser("sign-off", help="Review key points (changed clauses, applied amendments, red flags) and approve before finalize")
+    p_nso.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_nso.add_argument("--state", required=True)
+    p_nso.add_argument("--as", dest="as_party", choices=["a", "b"])
+    p_nso.add_argument("--yes", action="store_true", help="Skip the interactive batch confirmation prompt")
+    p_nso.set_defaults(func=cmd_negotiate_signoff)
+
+    p_nf = neg_sub.add_parser("finalize", help="Emit final .md + .docx; optionally hand off to docx2pdf + sign-CLI hooks. Requires both parties' sign-off.")
+    p_nf.add_argument("--base", default=str(Path(__file__).resolve().parent))
+    p_nf.add_argument("--state", required=True)
+    p_nf.add_argument("--out-md", required=True)
+    p_nf.add_argument("--out-docx", required=True)
+    p_nf.add_argument("--to-pdf", action="store_true", help="Run config/integrations.json `docx2pdf_cmd` to convert docx → pdf")
+    p_nf.add_argument("--sign", action="store_true", help="Run config/integrations.json `sign_cli_cmd` to sign the pdf (implies --to-pdf)")
+    p_nf.add_argument("--skip-signoff", action="store_true", help="Bypass the both-parties-signed-off requirement (testing/non-binding only)")
+    p_nf.set_defaults(func=cmd_negotiate_finalize)
+
+    p_tutorial = sub.add_parser("tutorial", help="Interactive primer that explains policy/profile/playbook and runs a sample review")
+    p_tutorial.add_argument("--base", help="Sandbox directory for the sample run (defaults to a fresh temp dir)")
+    p_tutorial.add_argument("--no-prompt", action="store_true", help="Skip pauses; useful for CI smoke tests")
+    p_tutorial.add_argument("--run-sample", action="store_true", help="Skip the run-sample question and run it automatically")
+    p_tutorial.set_defaults(func=cmd_tutorial)
 
     p_wizard = sub.add_parser("wizard", help="Guided setup -> ingest -> build -> review flow")
     p_wizard.add_argument("--base", default=str(Path(__file__).resolve().parent))

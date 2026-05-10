@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nda-review-cli"
+version = "0.5.0"
+description = "Local-first NDA review and drafting CLI: deterministic rules + optional second-pass LLM adjudication via Anthropic, OpenAI, Ollama, or any OpenAI-compatible endpoint."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Baher Al Hakim", email = "drbaher@gmail.com" },
+]
+keywords = ["nda", "contract-review", "legal-tech", "cli", "local-first", "deterministic", "llm", "ollama", "anthropic"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Legal Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business",
+    "Topic :: Text Processing :: Markup",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = []
+
+[project.urls]
+Homepage = "https://github.com/DrBaher/nda-review-cli"
+Issues = "https://github.com/DrBaher/nda-review-cli/issues"
+Changelog = "https://github.com/DrBaher/nda-review-cli/blob/main/CHANGELOG.md"
+
+[project.scripts]
+nda-review-cli = "nda_review_cli:main"
+
+[tool.hatch.build.targets.wheel]
+include = [
+    "nda_review_cli.py",
+    "rule_engine.py",
+    "config/default-policy.json",
+    "config/scoring-profiles.json",
+    "config/llm.json.example",
+    "templates/mutual_nda.md",
+    "templates/one_way_out_nda.md",
+    "tests/fixtures/sample_nda.txt",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"nda_review_cli.py" = "nda_review_cli.py"
+"rule_engine.py" = "rule_engine.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "nda_review_cli.py",
+    "rule_engine.py",
+    "step2_pass2_review.py",
+    "generate_redline_instructions.py",
+    "*.sh",
+    "config/",
+    "templates/",
+    "tests/",
+    "README.md",
+    "GETTING_STARTED.md",
+    "ARCHITECTURE.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
+]

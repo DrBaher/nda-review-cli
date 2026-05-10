@@ -9,9 +9,21 @@ output/*.md
 # Local organization-specific policy; commit default-policy.json only
 config/org-policy.json
 
+# Local LLM provider config (API keys, base URLs); commit llm.json.example only
+config/llm.json
+config/quickstart-answers.json
+
+# Local integration hooks (paths to docx2pdf, sign-CLI, etc.)
+config/integrations.json
+
 # env/OS
 .DS_Store
 *.log
 
 __pycache__/
 *.pyc
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
