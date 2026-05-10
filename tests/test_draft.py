@@ -5,13 +5,14 @@ import unittest
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 
 REPO = Path(__file__).resolve().parents[1]
 CLI = REPO / "nda_review_cli.py"
 
 
-def quickstart(td: Path, answers: dict | None = None) -> None:
+def quickstart(td: Path, answers: Optional[dict] = None) -> None:
     cmd = ["python3", str(CLI), "quickstart", "--base", str(td), "--no-prompt", "--yes"]
     if answers is not None:
         ans_path = td / "_answers.json"

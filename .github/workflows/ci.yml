@@ -22,7 +22,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
       - name: Compile
         run: python3 -m py_compile nda_review_cli.py step2_pass2_review.py generate_redline_instructions.py rule_engine.py
       - name: Run tests
@@ -36,7 +35,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
       - name: Tutorial end-to-end smoke
         run: |
           ./nda_review_cli.py tutorial --base "${RUNNER_TEMP}/nda-tutorial" --no-prompt --run-sample
@@ -53,7 +51,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
       - name: Build wheel and sdist
         run: |
           python3 -m pip install --upgrade pip build
@@ -83,7 +80,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
       - name: Quickstart non-interactive
         run: |
           ./nda_review_cli.py quickstart --base "${RUNNER_TEMP}/nda-quick" --no-prompt --yes
@@ -129,7 +125,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
       - name: Set up two distinct workspaces
         run: |
           mkdir -p "${RUNNER_TEMP}/neg"
