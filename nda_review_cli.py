@@ -1675,6 +1675,68 @@ def cmd_doctor(args):
         fixes.append("Add documents under `knowledge/inbox`, `knowledge/contracts`, `knowledge/redlines`, `inbox`, or `input` if you want onboarding ingestion.")
     checks.append({"name": "ingest_candidates", "status": "ok" if ingest_checks and not [x for x in ingest_checks if x.get("extraction_status") == "failed" or not x["readable"]] else ("warn" if not ingest_checks else "fail"), "details": ingest_checks})
 
+    # LLM config + optional reachability probe. The config check is free (no
+    # network); --check-llm adds a minimal round-trip to confirm auth and
+    # reachability against the configured provider.
+    llm_cfg_path = base / "config" / "llm.json"
+    has_env_llm = any(os.environ.get(k) for k in ("NDA_LLM_PROVIDER", "NDA_LLM_MODEL", "NDA_LLM_API_KEY", "NDA_LLM_BASE_URL"))
+    if not llm_cfg_path.exists() and not has_env_llm:
+        checks.append({
+            "name": "llm_config",
+            "status": "skip",
+            "note": "LLM is opt-in. Drop `config/llm.json` (see `config/llm.json.example`) or set NDA_LLM_* env vars to enable `review --llm`.",
+        })
+    else:
+        class _A:
+            pass
+        a = _A()
+        a.llm = None
+        a.llm_model = None
+        a.llm_base_url = None
+        try:
+            cfg = load_llm_config(base, a)
+            cfg_status = "ok"
+            cfg_problems = []
+            if not cfg.get("provider"):
+                cfg_problems.append("provider not set (config/llm.json `provider` or NDA_LLM_PROVIDER)")
+            if not cfg.get("model"):
+                cfg_problems.append("model not set (config/llm.json `model` or NDA_LLM_MODEL)")
+            if cfg.get("provider") == "anthropic" and not cfg.get("api_key"):
+                cfg_problems.append("anthropic provider requires api_key (config/llm.json `api_key` or NDA_LLM_API_KEY)")
+            if cfg.get("provider") and cfg.get("provider") not in ("anthropic", "openai", "ollama", "openai-compatible"):
+                cfg_problems.append(f"unknown provider `{cfg.get('provider')}` — expected anthropic/openai/ollama/openai-compatible")
+            if cfg_problems:
+                cfg_status = "warn"
+                warnings.append("LLM config incomplete: " + "; ".join(cfg_problems))
+                fixes.append("See `config/llm.json.example` for the schema, or run `./nda_review_cli.py review --llm <provider> --llm-model <model>` once with full flags.")
+            llm_check = {
+                "name": "llm_config",
+                "status": cfg_status,
+                "provider": cfg.get("provider"),
+                "model": cfg.get("model"),
+                "base_url": cfg.get("base_url"),
+                "api_key_present": bool(cfg.get("api_key")),
+                "problems": cfg_problems,
+            }
+            if getattr(args, "check_llm", False) and not cfg_problems:
+                probe = _llm_round_trip_probe(cfg)
+                llm_check["round_trip"] = probe
+                if not probe["ok"]:
+                    llm_check["status"] = "fail"
+                    hard_failures.append(f"LLM round-trip failed: {probe.get('error')}")
+                    fixes.append("Verify api_key, base_url, and model name. For local Ollama, confirm `ollama serve` is running on the configured base_url.")
+            elif getattr(args, "check_llm", False) and cfg_problems:
+                llm_check["round_trip"] = {"ok": False, "error": "skipped — fix config issues above first"}
+            checks.append(llm_check)
+        except SystemExit as e:
+            checks.append({
+                "name": "llm_config",
+                "status": "fail",
+                "error": str(e),
+            })
+            hard_failures.append(f"LLM config error: {e}")
+            fixes.append(f"Fix `{llm_cfg_path}` (must be valid JSON with `provider` and `model` at minimum).")
+
     payload = {
         "ok": not hard_failures,
         "base": str(base),
@@ -1792,6 +1854,36 @@ LLM_PROVIDER_PRESETS = {
         "default_model": None,
     },
 }
+
+
+def _llm_round_trip_probe(cfg: dict) -> dict:
+    """Send a minimal LLM request to confirm reachability + auth. Returns
+    {"ok": bool, "error": str|None, "model": str|None, "input_tokens": int|None,
+    "output_tokens": int|None}. Catches the SystemExit-on-error pattern used by
+    the LLM call helpers."""
+    provider = cfg.get("provider")
+    if provider == "anthropic":
+        caller = llm_call_anthropic
+    elif provider in ("openai", "ollama", "openai-compatible"):
+        caller = llm_call_openai_compatible
+    else:
+        return {"ok": False, "error": f"unknown provider `{provider}`"}
+    try:
+        res = caller(cfg, system="You verify reachability.", user="Reply with the single word: pong", max_tokens=5)
+    except SystemExit as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    text = (res.get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "empty response"}
+    return {
+        "ok": True,
+        "error": None,
+        "model": res.get("model") or cfg.get("model"),
+        "input_tokens": (res.get("usage") or {}).get("input_tokens"),
+        "output_tokens": (res.get("usage") or {}).get("output_tokens"),
+    }
 
 
 def load_llm_config(base: Path, args) -> dict:
@@ -2738,17 +2830,38 @@ TUTORIAL_STEPS = [
         ],
     },
     {
+        "title": "Concept 5 — House language vs. industry standard",
+        "body": [
+            "When you `draft`, you pick which template to render:",
+            "",
+            "  • mutual / one-way-out      — your house language. Clause text",
+            "    comes from config/org-policy.json `clause_rules.preferred`,",
+            "    so anything you tuned via quickstart (term length, residuals,",
+            "    survival, affiliates) flows through automatically.",
+            "",
+            "  • common-paper-mutual       — Common Paper Mutual NDA Version 1.0",
+            "    (CC BY 4.0). Standard Terms reproduced verbatim from the",
+            "    canonical source; only the Cover Page is parameterised. Use",
+            "    when your counterparty wants a recognisable industry standard.",
+            "",
+            "Counterparty expecting the trade-association standard? → common-paper-mutual.",
+            "Want clauses that reflect *your* policy? → mutual / one-way-out.",
+        ],
+    },
+    {
         "title": "What's next",
         "body": [
             "After this primer, the commands you'll use most:",
             "  • quickstart  — 16-question guided setup (stance, priorities, etc.).",
             "  • review      — score an NDA; --why for evidence, --llm for LLM pass.",
             "  • draft       — generate outgoing NDAs in .md + .docx.",
+            "                    --template mutual / one-way-out / common-paper-mutual",
             "  • negotiate   — two-party turn-taking flow:",
             "                    init → counter [--auto/--agent/--dry-run] → accept",
             "                    → diff → sign-off → finalize  (or  withdraw)",
             "                    + simulate / analyze for game-theoretic dashboards.",
-            "  • doctor      — sanity-check first-run readiness.",
+            "  • doctor      — sanity-check first-run readiness; --check-llm probes the",
+            "                    configured provider with a 1-token round-trip.",
             "",
             "Read GETTING_STARTED.md (Scenarios A-H) for the path that matches you.",
             "Read examples/negotiate-cheatsheet.md for a one-page negotiate reference.",
@@ -4947,14 +5060,16 @@ def cmd_wizard(args):
 
 FIRST_RUN_HINT = (
     "\nNDA Review CLI — local-first NDA review and drafting.\n\n"
-    "First time? Try one of:\n"
-    "  ./nda_review_cli.py tutorial            # interactive primer + sample review\n"
-    "  ./nda_review_cli.py quickstart          # 14-question guided setup\n"
-    "  ./nda_review_cli.py setup --quick --yes # zero-friction defaults\n"
+    "First time? Pick the path that fits:\n"
+    "  ./nda_review_cli.py tutorial            # never reviewed contracts before — guided primer + sandboxed sample review\n"
+    "  ./nda_review_cli.py quickstart          # know what you want — 14 questions, writes a real house policy\n"
+    "  ./nda_review_cli.py setup --quick --yes # just kicking the tyres — generic defaults, zero questions\n"
     "\nCommon commands:\n"
-    "  review --file <nda>                     # score an NDA against your playbook\n"
-    "  draft --template mutual ...             # generate an outgoing NDA\n"
-    "  doctor                                  # diagnose first-run readiness\n"
+    "  review --file <nda>                     # score an NDA against your playbook (add --why for evidence)\n"
+    "  draft --template mutual ...             # generate an outgoing NDA in your house language\n"
+    "  draft --template common-paper-mutual    # generate an industry-standard Common Paper Mutual NDA\n"
+    "  negotiate init ...                      # start a two-party file-based negotiation\n"
+    "  doctor                                  # diagnose readiness (add --check-llm to round-trip your LLM)\n"
     "\nSee `--help` for the full list, or read GETTING_STARTED.md.\n"
 )
 
@@ -5058,6 +5173,7 @@ def main():
     p_doctor.add_argument("--policy", help="Optional explicit policy file to validate first")
     p_doctor.add_argument("--gmail-paths", nargs="+", default=["data/raw_strict/gmail_primary.json", "data/raw_strict/gmail_secondary.json"])
     p_doctor.add_argument("--drive-paths", nargs="+", default=["data/raw_strict/drive_primary.json", "data/raw_strict/drive_secondary.json"])
+    p_doctor.add_argument("--check-llm", action="store_true", help="Send a minimal 1-token LLM ping (uses config/llm.json or NDA_LLM_* env vars). Confirms reachability + auth without doing a real review.")
     p_doctor.set_defaults(func=cmd_doctor)
 
     p_init = sub.add_parser("init", help="Onboarding wizard/questionnaire to generate org config + default profile")
