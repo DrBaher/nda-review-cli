@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nda-review-cli — live demo</title>
+<meta name="description" content="Live sandboxed demo of nda-review-cli: draft an NDA, review against your policy, or run the game-theoretic two-party negotiation simulator.">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1><a href="/">nda-review-cli</a></h1>
+    <nav>
+      <a href="https://github.com/DrBaher/nda-review-cli" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/DrBaher/nda-review-cli/blob/main/README.md" target="_blank" rel="noopener">README</a>
+      <a href="https://github.com/DrBaher/nda-review-cli/blob/main/GETTING_STARTED.md" target="_blank" rel="noopener">Getting Started</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <h2>Local-first NDA review, drafting, and two-party negotiation.</h2>
+    <p>Try the three headline flows below in a sandboxed session. Nothing you enter is logged; sandboxes auto-expire after 30 minutes.
+      For real use, install locally: <code>pipx install nda-review-cli</code>.</p>
+    <p class="banner">
+      Demo runs the deterministic rules engine only — no LLM provider is wired up here.
+      The <code>--llm</code>, <code>--agent</code>, and counterparty-profile features work the same way locally; install the CLI to use them.
+    </p>
+  </div>
+</section>
+
+<main class="wrap">
+
+<!-- ============================================================ -->
+<article class="card" id="card-draft">
+  <header><h3>1. Draft an NDA</h3>
+    <p>Fill the parties + purpose, pick a template, and render a complete NDA in markdown plus a Word <code>.docx</code> download.</p>
+  </header>
+
+  <form id="form-draft" class="form">
+    <label>Template
+      <select name="template">
+        <option value="mutual">Mutual NDA — house language</option>
+        <option value="one-way-out">One-way disclosing — house language</option>
+        <option value="common-paper-mutual">Common Paper Mutual NDA (CC BY 4.0)</option>
+      </select>
+    </label>
+    <div class="party-fields">
+      <label>Party A name <input name="party_a" value="Acme Inc." required></label>
+      <label>Party A address <input name="party_a_address" value="123 Main St, Vienna, AT" required></label>
+      <label>Party B name <input name="party_b" value="Beta LLC" required></label>
+      <label>Party B address <input name="party_b_address" value="10 Market Way, Berlin, DE" required></label>
+    </div>
+    <div class="party-fields oneway-fields" hidden>
+      <label>Disclosing party <input name="disclosing_party" value="Acme Inc."></label>
+      <label>Disclosing party address <input name="disclosing_party_address" value="123 Main St, Vienna, AT"></label>
+      <label>Receiving party <input name="receiving_party" value="Vendor Co"></label>
+      <label>Receiving party address <input name="receiving_party_address" value="100 Lake Rd, Zürich, CH"></label>
+    </div>
+    <label>Purpose
+      <input name="purpose" value="evaluating a strategic partnership" required>
+    </label>
+    <label class="cp-only" hidden>Governing law (Common Paper template)
+      <input name="governing_law" value="California">
+    </label>
+    <button type="submit">Render draft</button>
+  </form>
+
+  <div class="result" hidden>
+    <div class="result-actions">
+      <a class="download" target="_blank" rel="noopener">Download .docx</a>
+    </div>
+    <pre class="output" aria-label="rendered NDA"></pre>
+  </div>
+</article>
+
+<!-- ============================================================ -->
+<article class="card" id="card-review">
+  <header><h3>2. Review the bundled sample NDA</h3>
+    <p>Score the bundled sample NDA against quickstart-default house policy. Each finding shows the matched clause, severity, and concern.</p>
+  </header>
+
+  <form id="form-review" class="form">
+    <label class="checkbox">
+      <input type="checkbox" name="why" checked>
+      Include explainability evidence (<code>--why</code>)
+    </label>
+    <button type="submit">Run review</button>
+  </form>
+
+  <div class="result" hidden>
+    <div class="summary">
+      <span class="decision"></span>
+      <span class="risk-score"></span>
+    </div>
+    <ul class="findings"></ul>
+  </div>
+</article>
+
+<!-- ============================================================ -->
+<article class="card" id="card-simulate">
+  <header><h3>3. Game-theoretic negotiation simulator</h3>
+    <p>Run both sides of a turn-taking negotiation on this server, with configurable stances. See the per-round trajectory and which party's preferred text won each clause.</p>
+  </header>
+
+  <form id="form-simulate" class="form">
+    <div class="stance-pair">
+      <label>Party A stance
+        <select name="stance_a">
+          <option value="conservative">conservative</option>
+          <option value="middleground" selected>middleground</option>
+          <option value="compromising">compromising</option>
+        </select>
+      </label>
+      <label>Party B stance
+        <select name="stance_b">
+          <option value="conservative">conservative</option>
+          <option value="middleground" selected>middleground</option>
+          <option value="compromising">compromising</option>
+        </select>
+      </label>
+    </div>
+    <label class="checkbox">
+      <input type="checkbox" name="diverge_b" checked>
+      Use divergent policies (B has different preferred clause text — without this, every pairing trivially converges)
+    </label>
+    <button type="submit">Run simulation</button>
+    <p class="hint">Pro tip: pick conservative × conservative + check diverge to see fatigue concession kick in. Pick compromising × compromising for the fastest convergence.</p>
+  </form>
+
+  <div class="result" hidden>
+    <div class="summary"></div>
+    <table class="trajectory">
+      <thead><tr><th>Round</th><th>Proposer</th><th>Source</th><th>Stance</th><th>Agreed</th><th>Disputed</th><th>Proposed</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="winners"></div>
+    <div class="block-diagnosis" hidden></div>
+  </div>
+</article>
+
+</main>
+
+<footer class="wrap">
+  <p>nda-review-cli is open source under the
+    <a href="https://github.com/DrBaher/nda-review-cli/blob/main/LICENSE" target="_blank" rel="noopener">MIT license</a>.
+    Demo source: <a href="https://github.com/DrBaher/nda-review-cli/tree/main/web" target="_blank" rel="noopener">/web</a>.
+    Sandboxes are wiped automatically; nothing you enter is persisted or logged beyond standard request logs.</p>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
