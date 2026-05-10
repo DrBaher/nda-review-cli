@@ -1,0 +1,23 @@
+# Render.com deployment config for the nda-review-cli demo.
+# Deploy with: render deploy --service nda-review-cli-demo
+# Or import this repo via the Render dashboard with this file at the path
+# `deploy/render.yaml`.
+
+services:
+  - type: web
+    name: nda-review-cli-demo
+    runtime: docker
+    dockerfilePath: deploy/Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: NDA_DEMO_SESSION_TTL
+        value: 1800
+      - key: NDA_DEMO_MAX_SESSIONS
+        value: 200
+      - key: NDA_DEMO_RATE_LIMIT
+        value: 30

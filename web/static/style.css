@@ -1,0 +1,289 @@
+/* nda-review-cli demo — minimal, single-stylesheet */
+
+:root {
+  --bg: #fafaf9;
+  --fg: #1c1917;
+  --muted: #57534e;
+  --border: #e7e5e4;
+  --card-bg: #ffffff;
+  --accent: #0f766e;
+  --accent-hover: #115e59;
+  --warn-bg: #fef3c7;
+  --warn-fg: #78350f;
+  --high: #b91c1c;
+  --low: #ca8a04;
+  --code-bg: #f5f5f4;
+  --max-width: 980px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code { background: var(--code-bg); padding: 1px 6px; border-radius: 3px; font-size: 14px; }
+
+.wrap {
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+header {
+  border-bottom: 1px solid var(--border);
+  background: white;
+}
+header .wrap {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 16px 24px;
+}
+header h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+header h1 a { color: var(--fg); }
+header nav a {
+  margin-left: 20px;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.hero {
+  padding: 48px 0 32px;
+  background: white;
+  border-bottom: 1px solid var(--border);
+}
+.hero h2 {
+  margin: 0 0 12px;
+  font-size: 28px;
+  letter-spacing: -0.02em;
+  font-weight: 600;
+}
+.hero p {
+  margin: 0 0 8px;
+  color: var(--muted);
+  max-width: 720px;
+}
+.hero .banner {
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  padding: 10px 16px;
+  border-radius: 6px;
+  margin-top: 16px;
+  font-size: 14px;
+  max-width: 720px;
+}
+
+main {
+  padding: 32px 24px 48px;
+  display: grid;
+  gap: 24px;
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+}
+.card header h3 {
+  margin: 0 0 6px;
+  font-size: 18px;
+  font-weight: 600;
+}
+.card header p {
+  margin: 0 0 20px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.form { display: grid; gap: 12px; }
+.form label {
+  display: block;
+  font-size: 14px;
+  color: var(--muted);
+}
+.form label.checkbox { display: flex; gap: 8px; align-items: center; }
+.form input[type="text"],
+.form input:not([type]),
+.form select {
+  margin-top: 4px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+  background: white;
+}
+.form input:focus, .form select:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.party-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.stance-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.form button {
+  justify-self: start;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  padding: 10px 18px;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+.form button:hover { background: var(--accent-hover); }
+.form button:disabled { opacity: 0.6; cursor: progress; }
+
+.form .hint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.result {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+.result-actions { margin-bottom: 12px; }
+.result-actions a.download {
+  display: inline-block;
+  background: var(--code-bg);
+  color: var(--fg);
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-size: 14px;
+  border: 1px solid var(--border);
+}
+
+.output {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 16px;
+  font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 480px;
+  overflow-y: auto;
+}
+
+.summary {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 16px;
+  font-size: 15px;
+}
+.summary .decision { font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+.summary .decision.approve { color: #15803d; }
+.summary .decision.escalate { color: var(--low); }
+.summary .decision.block { color: var(--high); }
+
+.findings { list-style: none; padding: 0; margin: 0; }
+.findings li {
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+.findings li:first-child { border-top: none; padding-top: 0; }
+.findings .clause-name { font-weight: 600; }
+.findings .severity {
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.findings .severity.high { background: #fee2e2; color: var(--high); }
+.findings .severity.low { background: #fef9c3; color: var(--low); }
+.findings .concern { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
+.findings .snippet {
+  margin-top: 8px;
+  background: var(--code-bg);
+  padding: 6px 10px;
+  border-radius: 3px;
+  font: 13px ui-monospace, "SF Mono", Menlo, monospace;
+  display: block;
+}
+
+.trajectory {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  margin-bottom: 16px;
+}
+.trajectory th, .trajectory td {
+  padding: 6px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.trajectory th {
+  background: var(--code-bg);
+  font-weight: 600;
+}
+
+.winners {
+  background: var(--code-bg);
+  padding: 12px 16px;
+  border-radius: 4px;
+  font-size: 14px;
+}
+.winners h4 { margin: 0 0 6px; font-size: 14px; }
+.winners .winner-line { display: block; font-family: ui-monospace, "SF Mono", monospace; font-size: 13px; }
+
+.block-diagnosis {
+  margin-top: 16px;
+  padding: 12px 16px;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  border-radius: 4px;
+  font-size: 14px;
+}
+.block-diagnosis h4 { margin: 0 0 6px; font-size: 14px; }
+
+.error {
+  margin-top: 12px;
+  padding: 10px 14px;
+  background: #fee2e2;
+  color: var(--high);
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+footer {
+  border-top: 1px solid var(--border);
+  background: white;
+  padding: 24px 24px 32px;
+  font-size: 13px;
+  color: var(--muted);
+}
+footer p { margin: 0; }
+
+@media (max-width: 640px) {
+  .party-fields, .stance-pair { grid-template-columns: 1fr; }
+  .hero h2 { font-size: 22px; }
+}

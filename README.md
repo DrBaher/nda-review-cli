@@ -9,7 +9,9 @@
 
 The CLI ingests your past contracts, extracts your negotiation style into a versioned playbook, and applies it as a deterministic, explainable policy to every new NDA — with clause-by-clause findings, severity scoring, and Word-ready redlines.
 
-📚 **[Quick start](#quick-start-3-commands)** · **[60-second demo](examples/demo.md)** · **[Getting Started guide](GETTING_STARTED.md)** · **[Architecture](ARCHITECTURE.md)** · **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)**
+📚 **[Quick start](#quick-start-3-commands)** · **[Live web demo](web/README.md)** · **[60-second demo](examples/demo.md)** · **[Getting Started guide](GETTING_STARTED.md)** · **[Architecture](ARCHITECTURE.md)** · **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)**
+
+> **Try it in the browser:** `python3 web/server.py` from a fresh clone, or deploy the bundled `deploy/Dockerfile` to Railway / Fly / Render. The demo wraps the CLI behind a sandboxed HTTP service with three flows (draft, review, game-theoretic simulator) and zero added dependencies. See [web/README.md](web/README.md).
 
 [![asciicast](https://asciinema.org/a/NhznjQC4UXP0et7d.svg)](https://asciinema.org/a/NhznjQC4UXP0et7d)
 
