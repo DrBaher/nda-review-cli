@@ -2846,6 +2846,7 @@ def md_to_docx(md_text: str, out_path: Path) -> None:
 DRAFT_TEMPLATES = {
     "mutual": "templates/mutual_nda.md",
     "one-way-out": "templates/one_way_out_nda.md",
+    "common-paper-mutual": "templates/common_paper_mutual_nda.md",
 }
 
 DRAFT_DISCLAIMER_MD = (
@@ -2892,7 +2893,7 @@ def _build_draft_substitutions(args, org_policy: dict, profile: dict) -> dict:
         "clause_non_solicit_non_compete": _draft_clause_text(rules, "non_solicit_non_compete"),
     }
 
-    if args.template == "mutual":
+    if args.template in ("mutual", "common-paper-mutual"):
         subs.update({
             "party_a": args.party_a or "",
             "party_a_address": args.party_a_address or "",
@@ -2910,6 +2911,7 @@ def _build_draft_substitutions(args, org_policy: dict, profile: dict) -> dict:
 
 
 def _fill_template(template_text: str, subs: dict):
+    template_text = re.sub(r"<!--.*?-->\s*", "", template_text, flags=re.DOTALL)
     placeholders = sorted(set(re.findall(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", template_text)))
     missing = [p for p in placeholders if not str(subs.get(p, "")).strip()]
     def repl(m):
