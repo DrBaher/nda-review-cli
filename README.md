@@ -285,6 +285,15 @@ See [`examples/negotiate-cheatsheet.md`](examples/negotiate-cheatsheet.md) for a
 
 Draft a fresh NDA in your house language. Clause text is pulled directly from `config/org-policy.json` `clause_rules.preferred`, so anything you tuned via `quickstart` (term length, return-vs-destroy, residual-knowledge stance, trade-secret carve-out, affiliate disclosure) flows through automatically.
 
+**Which template?**
+
+| Situation | Template | Why |
+|---|---|---|
+| Counterparty wants a recognisable industry standard | `common-paper-mutual` | [Common Paper Mutual NDA Version 1.0](https://commonpaper.com/standards/mutual-nda/1.0), CC BY 4.0. Standard Terms verbatim; only Cover Page is parameterised. Lowest friction with sophisticated counterparties. |
+| Bilateral evaluation in your house language | `mutual` | Pulls clause text from your `org-policy.json`, so it reflects your own stance on residuals / survival / affiliates / etc. Customisable by editing the policy. |
+| You're disclosing one-way (vendor diligence, advisor briefing) | `one-way-out` | Same house-language design as `mutual`, but only you bear obligations going the other way. |
+| You have a custom template | `--template-file path.md` | Bring your own `.md` with `{{placeholders}}`. Missing placeholders fail loudly with exit 2. |
+
 ```bash
 # Mutual NDA — both parties may disclose
 ./nda_review_cli.py draft \
