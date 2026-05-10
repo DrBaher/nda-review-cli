@@ -11,6 +11,8 @@ The CLI ingests your past contracts, extracts your negotiation style into a vers
 
 📚 **[Quick start](#quick-start-3-commands)** · **[60-second demo](examples/demo.md)** · **[Getting Started guide](GETTING_STARTED.md)** · **[Architecture](ARCHITECTURE.md)** · **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)**
 
+[![asciicast](https://asciinema.org/a/70MKFruwB0iKKI8Q.svg)](https://asciinema.org/a/70MKFruwB0iKKI8Q)
+
 <!--
   To regenerate the asciinema cast:
     asciinema rec --command "./scripts/record-demo.sh" demo.cast
