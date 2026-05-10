@@ -62,15 +62,31 @@ jobs:
           /tmp/nda-runtime/bin/pip install --quiet dist/nda_review_cli-*.whl
           /tmp/nda-runtime/bin/nda-review-cli --version
           /tmp/nda-runtime/bin/nda-review-cli quickstart --base "${RUNNER_TEMP}/nda-installed" --no-prompt --yes
+          # All three bundled templates must work from the installed wheel
+          # (regression test: common-paper was previously missing from the
+          # wheel include list). Smoke-render each.
+          for tpl in mutual common-paper-mutual; do
+            /tmp/nda-runtime/bin/nda-review-cli draft \
+              --base "${RUNNER_TEMP}/nda-installed" \
+              --template "$tpl" \
+              --party-a "Acme" --party-a-address "1 Way" \
+              --party-b "Beta" --party-b-address "2 Way" \
+              --purpose "test" \
+              --governing-law "California" \
+              --out "${RUNNER_TEMP}/nda-installed/draft-$tpl.md" \
+              --out-docx "${RUNNER_TEMP}/nda-installed/draft-$tpl.docx"
+            test -s "${RUNNER_TEMP}/nda-installed/draft-$tpl.docx"
+          done
           /tmp/nda-runtime/bin/nda-review-cli draft \
             --base "${RUNNER_TEMP}/nda-installed" \
-            --template mutual \
-            --party-a "Acme" --party-a-address "1 Way" \
-            --party-b "Beta" --party-b-address "2 Way" \
+            --template one-way-out \
+            --disclosing-party "Acme" --disclosing-party-address "1 Way" \
+            --receiving-party "Vendor" --receiving-party-address "2 Way" \
             --purpose "test" \
-            --out "${RUNNER_TEMP}/nda-installed/draft.md" \
-            --out-docx "${RUNNER_TEMP}/nda-installed/draft.docx"
-          test -s "${RUNNER_TEMP}/nda-installed/draft.docx"
+            --out "${RUNNER_TEMP}/nda-installed/draft-oneway.md"
+          # sample-nda subcommand also depends on a bundled fixture being in the wheel
+          /tmp/nda-runtime/bin/nda-review-cli sample-nda --out "${RUNNER_TEMP}/nda-installed/sample.txt"
+          test -s "${RUNNER_TEMP}/nda-installed/sample.txt"
 
   quickstart-and-draft-smoke:
     runs-on: ubuntu-latest
