@@ -1,15 +1,15 @@
 # NDA Review CLI
 
-> Review and draft NDAs against your own house policy — deterministic by default, with optional second-pass LLM adjudication via the model of your choice (Anthropic, OpenAI, Ollama, or any OpenAI-compatible endpoint). Local-first, no telemetry, single-file Python.
+> **Built for an agent-driven contract workflow.** An LLM agent does the operational work — drafting, reviewing, proposing amendments, sending — and a human approves the gates that need a deliberate gesture. Deterministic by default, with optional second-pass LLM adjudication via the model of your choice (Anthropic, OpenAI, Ollama, or any OpenAI-compatible endpoint). Local-first, no telemetry, single-file Python.
 
 [![CI](https://github.com/DrBaher/nda-review-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/DrBaher/nda-review-cli/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![Local-first](https://img.shields.io/badge/local--first-yes-brightgreen.svg)](#why-it-exists)
 
-The CLI ingests your past contracts, extracts your negotiation style into a versioned playbook, and applies it as a deterministic, explainable policy to every new NDA — with clause-by-clause findings, severity scoring, and Word-ready redlines.
+The CLI ingests your past contracts, extracts your negotiation style into a versioned playbook, and applies it as a deterministic, explainable policy to every new NDA — with clause-by-clause findings, severity scoring, and Word-ready redlines. Part of a [three-CLI suite](https://drbaher-cli.vercel.app/) (nda-review-cli + [docx2pdf-cli](https://github.com/DrBaher/docx2pdf-cli) + [sign-cli](https://github.com/DrBaher/sign-cli)) for end-to-end, agent-driven contract operations.
 
-📚 **[Quick start](#quick-start-3-commands)** · **[Live web demo](web/README.md)** · **[60-second demo](examples/demo.md)** · **[Getting Started guide](GETTING_STARTED.md)** · **[Architecture](ARCHITECTURE.md)** · **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)**
+📚 **[Quick start](#quick-start-3-commands)** · **[Showcase site](https://drbaher-cli.vercel.app/)** · **[Live web demo](web/README.md)** · **[60-second demo](examples/demo.md)** · **[Getting Started guide](GETTING_STARTED.md)** · **[Architecture](ARCHITECTURE.md)** · **[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)**
 
 > **Try it in the browser:** `python3 web/server.py` from a fresh clone, or deploy the bundled `deploy/Dockerfile` to Railway / Fly / Render. The demo wraps the CLI behind a sandboxed HTTP service with three flows (draft, review, game-theoretic simulator) and zero added dependencies. See [web/README.md](web/README.md).
 
@@ -23,9 +23,22 @@ The CLI ingests your past contracts, extracts your negotiation style into a vers
 -->
 
 
+## Built for an agent-driven workflow
+
+These tools were designed for a world where an LLM agent does most of the operational work and a human is in the loop only for the gates that legitimately need a human gesture. Concretely, that shows up across the suite as:
+
+| Agent does                                                | Human approves                                                  |
+|-----------------------------------------------------------|-----------------------------------------------------------------|
+| Drafts NDAs from your house templates                     | Final accepted position before `negotiate finalize`             |
+| Reviews counterparty docs, scores findings, picks severity | Escalations on non-negotiable redlines (severity-driven gates) |
+| Proposes amendments using your stance + clause priorities  | Sign-off on the agreed text (`negotiate sign-off --as a/b`)    |
+| Maintains the hash-chained negotiation state file          | Anything outside deterministic policy guardrails                |
+
+The negotiation flow is file-based and hash-chained on purpose: a human can audit between sessions exactly what an agent did, line by line. Findings carry severity scores so the agent automatically escalates only the things humans actually need to see. See the [showcase site's MCP guide](https://drbaher-cli.vercel.app/mcp/) for how the suite plugs into Claude Code, Cursor, or any MCP-aware client.
+
 ## Why it exists
 
-Sending NDAs to a SaaS reviewer means leaking your counterparty list, your fallback positions, and the wording of every contract you touch. This tool runs entirely on your machine, has no telemetry, and is auditable in a single Python file.
+Sending NDAs to a SaaS reviewer means leaking your counterparty list, your fallback positions, and the wording of every contract you touch. This tool runs entirely on your machine, has no telemetry, and is auditable in a single Python file. Equally importantly: SaaS contract products assume a human at a browser. These CLIs assume the opposite — an agent doing the operational work and a human only at the explicit approval gates — which is increasingly the shape of how legal ops actually wants to operate.
 
 ## What it does
 
