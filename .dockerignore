@@ -1,0 +1,29 @@
+# Keep the build context tight — only what the Dockerfile copies.
+.git
+.github
+output/
+data/
+config/org-policy.json
+config/llm.json
+config/quickstart-answers.json
+config/integrations.json
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Local dev
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# Docs not needed at runtime
+*.md
+!web/README.md
+!deploy/README.md

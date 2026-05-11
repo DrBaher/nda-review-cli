@@ -48,8 +48,7 @@ include = [
     "config/default-policy.json",
     "config/scoring-profiles.json",
     "config/llm.json.example",
-    "templates/mutual_nda.md",
-    "templates/one_way_out_nda.md",
+    "templates/*.md",
     "tests/fixtures/sample_nda.txt",
 ]
 

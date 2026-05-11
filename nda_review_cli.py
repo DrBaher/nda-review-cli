@@ -1675,6 +1675,68 @@ def cmd_doctor(args):
         fixes.append("Add documents under `knowledge/inbox`, `knowledge/contracts`, `knowledge/redlines`, `inbox`, or `input` if you want onboarding ingestion.")
     checks.append({"name": "ingest_candidates", "status": "ok" if ingest_checks and not [x for x in ingest_checks if x.get("extraction_status") == "failed" or not x["readable"]] else ("warn" if not ingest_checks else "fail"), "details": ingest_checks})
 
+    # LLM config + optional reachability probe. The config check is free (no
+    # network); --check-llm adds a minimal round-trip to confirm auth and
+    # reachability against the configured provider.
+    llm_cfg_path = base / "config" / "llm.json"
+    has_env_llm = any(os.environ.get(k) for k in ("NDA_LLM_PROVIDER", "NDA_LLM_MODEL", "NDA_LLM_API_KEY", "NDA_LLM_BASE_URL"))
+    if not llm_cfg_path.exists() and not has_env_llm:
+        checks.append({
+            "name": "llm_config",
+            "status": "skip",
+            "note": "LLM is opt-in. Drop `config/llm.json` (see `config/llm.json.example`) or set NDA_LLM_* env vars to enable `review --llm`.",
+        })
+    else:
+        class _A:
+            pass
+        a = _A()
+        a.llm = None
+        a.llm_model = None
+        a.llm_base_url = None
+        try:
+            cfg = load_llm_config(base, a)
+            cfg_status = "ok"
+            cfg_problems = []
+            if not cfg.get("provider"):
+                cfg_problems.append("provider not set (config/llm.json `provider` or NDA_LLM_PROVIDER)")
+            if not cfg.get("model"):
+                cfg_problems.append("model not set (config/llm.json `model` or NDA_LLM_MODEL)")
+            if cfg.get("provider") == "anthropic" and not cfg.get("api_key"):
+                cfg_problems.append("anthropic provider requires api_key (config/llm.json `api_key` or NDA_LLM_API_KEY)")
+            if cfg.get("provider") and cfg.get("provider") not in ("anthropic", "openai", "ollama", "openai-compatible"):
+                cfg_problems.append(f"unknown provider `{cfg.get('provider')}` — expected anthropic/openai/ollama/openai-compatible")
+            if cfg_problems:
+                cfg_status = "warn"
+                warnings.append("LLM config incomplete: " + "; ".join(cfg_problems))
+                fixes.append("See `config/llm.json.example` for the schema, or run `./nda_review_cli.py review --llm <provider> --llm-model <model>` once with full flags.")
+            llm_check = {
+                "name": "llm_config",
+                "status": cfg_status,
+                "provider": cfg.get("provider"),
+                "model": cfg.get("model"),
+                "base_url": cfg.get("base_url"),
+                "api_key_present": bool(cfg.get("api_key")),
+                "problems": cfg_problems,
+            }
+            if getattr(args, "check_llm", False) and not cfg_problems:
+                probe = _llm_round_trip_probe(cfg)
+                llm_check["round_trip"] = probe
+                if not probe["ok"]:
+                    llm_check["status"] = "fail"
+                    hard_failures.append(f"LLM round-trip failed: {probe.get('error')}")
+                    fixes.append("Verify api_key, base_url, and model name. For local Ollama, confirm `ollama serve` is running on the configured base_url.")
+            elif getattr(args, "check_llm", False) and cfg_problems:
+                llm_check["round_trip"] = {"ok": False, "error": "skipped — fix config issues above first"}
+            checks.append(llm_check)
+        except SystemExit as e:
+            checks.append({
+                "name": "llm_config",
+                "status": "fail",
+                "error": str(e),
+            })
+            hard_failures.append(f"LLM config error: {e}")
+            fixes.append(f"Fix `{llm_cfg_path}` (must be valid JSON with `provider` and `model` at minimum).")
+
     payload = {
         "ok": not hard_failures,
         "base": str(base),
@@ -1792,6 +1854,36 @@ LLM_PROVIDER_PRESETS = {
         "default_model": None,
     },
 }
+
+
+def _llm_round_trip_probe(cfg: dict) -> dict:
+    """Send a minimal LLM request to confirm reachability + auth. Returns
+    {"ok": bool, "error": str|None, "model": str|None, "input_tokens": int|None,
+    "output_tokens": int|None}. Catches the SystemExit-on-error pattern used by
+    the LLM call helpers."""
+    provider = cfg.get("provider")
+    if provider == "anthropic":
+        caller = llm_call_anthropic
+    elif provider in ("openai", "ollama", "openai-compatible"):
+        caller = llm_call_openai_compatible
+    else:
+        return {"ok": False, "error": f"unknown provider `{provider}`"}
+    try:
+        res = caller(cfg, system="You verify reachability.", user="Reply with the single word: pong", max_tokens=5)
+    except SystemExit as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    text = (res.get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "empty response"}
+    return {
+        "ok": True,
+        "error": None,
+        "model": res.get("model") or cfg.get("model"),
+        "input_tokens": (res.get("usage") or {}).get("input_tokens"),
+        "output_tokens": (res.get("usage") or {}).get("output_tokens"),
+    }
 
 
 def load_llm_config(base: Path, args) -> dict:
@@ -2738,17 +2830,38 @@ TUTORIAL_STEPS = [
         ],
     },
     {
+        "title": "Concept 5 — House language vs. industry standard",
+        "body": [
+            "When you `draft`, you pick which template to render:",
+            "",
+            "  • mutual / one-way-out      — your house language. Clause text",
+            "    comes from config/org-policy.json `clause_rules.preferred`,",
+            "    so anything you tuned via quickstart (term length, residuals,",
+            "    survival, affiliates) flows through automatically.",
+            "",
+            "  • common-paper-mutual       — Common Paper Mutual NDA Version 1.0",
+            "    (CC BY 4.0). Standard Terms reproduced verbatim from the",
+            "    canonical source; only the Cover Page is parameterised. Use",
+            "    when your counterparty wants a recognisable industry standard.",
+            "",
+            "Counterparty expecting the trade-association standard? → common-paper-mutual.",
+            "Want clauses that reflect *your* policy? → mutual / one-way-out.",
+        ],
+    },
+    {
         "title": "What's next",
         "body": [
             "After this primer, the commands you'll use most:",
             "  • quickstart  — 16-question guided setup (stance, priorities, etc.).",
             "  • review      — score an NDA; --why for evidence, --llm for LLM pass.",
             "  • draft       — generate outgoing NDAs in .md + .docx.",
+            "                    --template mutual / one-way-out / common-paper-mutual",
             "  • negotiate   — two-party turn-taking flow:",
             "                    init → counter [--auto/--agent/--dry-run] → accept",
             "                    → diff → sign-off → finalize  (or  withdraw)",
             "                    + simulate / analyze for game-theoretic dashboards.",
-            "  • doctor      — sanity-check first-run readiness.",
+            "  • doctor      — sanity-check first-run readiness; --check-llm probes the",
+            "                    configured provider with a 1-token round-trip.",
             "",
             "Read GETTING_STARTED.md (Scenarios A-H) for the path that matches you.",
             "Read examples/negotiate-cheatsheet.md for a one-page negotiate reference.",
@@ -2846,6 +2959,7 @@ def md_to_docx(md_text: str, out_path: Path) -> None:
 DRAFT_TEMPLATES = {
     "mutual": "templates/mutual_nda.md",
     "one-way-out": "templates/one_way_out_nda.md",
+    "common-paper-mutual": "templates/common_paper_mutual_nda.md",
 }
 
 DRAFT_DISCLAIMER_MD = (
@@ -2892,7 +3006,7 @@ def _build_draft_substitutions(args, org_policy: dict, profile: dict) -> dict:
         "clause_non_solicit_non_compete": _draft_clause_text(rules, "non_solicit_non_compete"),
     }
 
-    if args.template == "mutual":
+    if args.template in ("mutual", "common-paper-mutual"):
         subs.update({
             "party_a": args.party_a or "",
             "party_a_address": args.party_a_address or "",
@@ -2910,6 +3024,7 @@ def _build_draft_substitutions(args, org_policy: dict, profile: dict) -> dict:
 
 
 def _fill_template(template_text: str, subs: dict):
+    template_text = re.sub(r"<!--.*?-->\s*", "", template_text, flags=re.DOTALL)
     placeholders = sorted(set(re.findall(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", template_text)))
     missing = [p for p in placeholders if not str(subs.get(p, "")).strip()]
     def repl(m):
@@ -4741,6 +4856,47 @@ def cmd_negotiate_finalize(args):
     )
 
 
+def cmd_sample_nda(args):
+    """Drop the bundled sample NDA into a user-chosen path so first-run users
+    have something substantial to point `review` at. The fixture is the same
+    one the tutorial's --run-sample step uses; it's representative SaaS-style
+    mutual NDA content with a few clauses that reliably trip rule-engine
+    findings (jurisdiction mismatch, indefinite-survival carve-out, term
+    length), giving new users a meaningful first review."""
+    repo = Path(__file__).resolve().parent
+    src = repo / "tests" / "fixtures" / "sample_nda.txt"
+    if not src.exists():
+        print(json.dumps({
+            "ok": False,
+            "error": f"Bundled sample NDA not found at {src}. Reinstall the package or clone the repo.",
+        }, ensure_ascii=False))
+        raise SystemExit(2)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    text = src.read_text()
+    out.write_text(text)
+    cmd = _invocation_form()
+    payload = {
+        "ok": True,
+        "out": str(out),
+        "bytes": out.stat().st_size,
+        "lines": len(text.splitlines()),
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    _print_friendly(
+        title="Sample NDA written",
+        lines=[
+            f"Path: {out}",
+            f"Bytes: {payload['bytes']}, lines: {payload['lines']}",
+        ],
+        next_steps=[
+            f"Score it against your policy: {cmd} review --file {out} --why",
+            "This is a generic SaaS-style mutual NDA. Expect findings for clauses that diverge from your house policy (jurisdiction, term, residuals, etc.).",
+            f"Replace with your own NDA when ready: {cmd} review --file path/to/your.txt --why",
+        ],
+    )
+
+
 def cmd_tutorial(args):
     repo = Path(__file__).resolve().parent
     interactive = sys.stdin.isatty() and not args.no_prompt
@@ -4943,18 +5099,33 @@ def cmd_wizard(args):
         cmd_review(review_args)
 
 
-FIRST_RUN_HINT = (
-    "\nNDA Review CLI — local-first NDA review and drafting.\n\n"
-    "First time? Try one of:\n"
-    "  ./nda_review_cli.py tutorial            # interactive primer + sample review\n"
-    "  ./nda_review_cli.py quickstart          # 14-question guided setup\n"
-    "  ./nda_review_cli.py setup --quick --yes # zero-friction defaults\n"
-    "\nCommon commands:\n"
-    "  review --file <nda>                     # score an NDA against your playbook\n"
-    "  draft --template mutual ...             # generate an outgoing NDA\n"
-    "  doctor                                  # diagnose first-run readiness\n"
-    "\nSee `--help` for the full list, or read GETTING_STARTED.md.\n"
-)
+def _invocation_form() -> str:
+    """Return the prefix users should type to invoke this CLI, matching how
+    they actually started it. Direct script run -> `./nda_review_cli.py`;
+    pipx / pip install -> `nda-review-cli`."""
+    argv0 = os.path.basename(sys.argv[0] or "")
+    if argv0.endswith(".py"):
+        return "./nda_review_cli.py"
+    return "nda-review-cli"
+
+
+def _first_run_hint() -> str:
+    cmd = _invocation_form()
+    return (
+        "\nNDA Review CLI — local-first NDA review and drafting.\n\n"
+        "First time? Pick the path that fits:\n"
+        f"  {cmd} tutorial            # never reviewed contracts before — guided primer + sandboxed sample review\n"
+        f"  {cmd} quickstart          # know what you want — 14 questions, writes a real house policy\n"
+        f"  {cmd} setup --quick --yes # just kicking the tyres — generic defaults, zero questions\n"
+        f"  {cmd} sample-nda --out my-first.txt # write a representative NDA to disk for your first review\n"
+        "\nCommon commands:\n"
+        f"  {cmd} review --file <nda>                   # score an NDA against your playbook (add --why for evidence)\n"
+        f"  {cmd} draft --template mutual ...           # generate an outgoing NDA in your house language\n"
+        f"  {cmd} draft --template common-paper-mutual  # generate an industry-standard Common Paper Mutual NDA\n"
+        f"  {cmd} negotiate init ...                    # start a two-party file-based negotiation\n"
+        f"  {cmd} doctor                                # diagnose readiness (add --check-llm to round-trip your LLM)\n"
+        "\nSee `--help` for the full list, or read GETTING_STARTED.md.\n"
+    )
 
 
 def main():
@@ -4966,7 +5137,7 @@ def main():
     # `cmd` is technically required, but we want a friendlier message than argparse's
     # default when the user runs the tool with no args at all.
     if len(sys.argv) == 1:
-        print(FIRST_RUN_HINT, file=sys.stderr)
+        print(_first_run_hint(), file=sys.stderr)
         raise SystemExit(0)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -4979,7 +5150,20 @@ def main():
     p_build.add_argument("--out-md", default="output/nda_playbook.md")
     p_build.set_defaults(func=cmd_build)
 
-    p_review = sub.add_parser("review", help="Review NDA text against generated playbook")
+    p_review = sub.add_parser(
+        "review",
+        help="Review NDA text against generated playbook",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  # Score an NDA with explainability (triggered phrases + rule patterns):\n"
+            "  ./nda_review_cli.py review --file path/to/nda.txt --why\n\n"
+            "  # Review with a counterparty-specific tone profile:\n"
+            "  ./nda_review_cli.py review --file nda.txt --counterparty acme-corp\n\n"
+            "  # Add a second-pass LLM review (Anthropic / OpenAI / Ollama / OpenAI-compatible):\n"
+            "  ./nda_review_cli.py review --file nda.txt --llm anthropic --yes-llm-send\n"
+        ),
+    )
     p_review.add_argument("--base", default=str(Path(__file__).resolve().parent))
     p_review.add_argument("--playbook", default=str(Path(__file__).resolve().parent / "output/nda_playbook.json"))
     p_review.add_argument("--counterparty", help="Counterparty profile name (loads profiles/<name>.json)")
@@ -5051,11 +5235,25 @@ def main():
     p_policy.add_argument("--file", required=True)
     p_policy.set_defaults(func=cmd_policy_validate)
 
-    p_doctor = sub.add_parser("doctor", help="Validate first-run onboarding readiness and data discoverability")
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="Validate first-run onboarding readiness and data discoverability",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  # Sanity check policy + ingest paths + LLM config (free, no network):\n"
+            "  ./nda_review_cli.py doctor\n\n"
+            "  # Also send a 1-token round-trip to confirm the configured LLM is reachable:\n"
+            "  ./nda_review_cli.py doctor --check-llm\n\n"
+            "  # Doctor a sandbox base directory (e.g. tutorial output):\n"
+            "  ./nda_review_cli.py doctor --base /tmp/my-sandbox\n"
+        ),
+    )
     p_doctor.add_argument("--base", default=str(Path(__file__).resolve().parent))
     p_doctor.add_argument("--policy", help="Optional explicit policy file to validate first")
     p_doctor.add_argument("--gmail-paths", nargs="+", default=["data/raw_strict/gmail_primary.json", "data/raw_strict/gmail_secondary.json"])
     p_doctor.add_argument("--drive-paths", nargs="+", default=["data/raw_strict/drive_primary.json", "data/raw_strict/drive_secondary.json"])
+    p_doctor.add_argument("--check-llm", action="store_true", help="Send a minimal 1-token LLM ping (uses config/llm.json or NDA_LLM_* env vars). Confirms reachability + auth without doing a real review.")
     p_doctor.set_defaults(func=cmd_doctor)
 
     p_init = sub.add_parser("init", help="Onboarding wizard/questionnaire to generate org config + default profile")
@@ -5136,7 +5334,30 @@ def main():
     p_quick.add_argument("--default-policy", default="config/default-policy.json", help="Seed policy used as the clause-rules base")
     p_quick.set_defaults(func=cmd_quickstart)
 
-    p_draft = sub.add_parser("draft", help="Draft an NDA to send out, using a built-in template (mutual / one-way-out) or your own --template-file")
+    p_draft = sub.add_parser(
+        "draft",
+        help="Draft an NDA to send out, using a built-in template (mutual / one-way-out / common-paper-mutual) or your own --template-file",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  # Mutual NDA in your house language:\n"
+            "  ./nda_review_cli.py draft --template mutual \\\n"
+            "      --party-a 'Acme' --party-a-address '123 Main' \\\n"
+            "      --party-b 'Beta' --party-b-address '10 Market' \\\n"
+            "      --purpose 'evaluating a partnership' \\\n"
+            "      --out out/mutual.md --out-docx out/mutual.docx\n\n"
+            "  # Common Paper Mutual NDA Version 1.0 (CC BY 4.0, industry standard):\n"
+            "  ./nda_review_cli.py draft --template common-paper-mutual \\\n"
+            "      --party-a 'Acme' --party-b 'Beta' --party-a-address '...' --party-b-address '...' \\\n"
+            "      --purpose 'evaluating a partnership' --governing-law California \\\n"
+            "      --out out/cp.md --out-docx out/cp.docx\n\n"
+            "  # One-way disclosing (you share, they don't), then run review --why on the result:\n"
+            "  ./nda_review_cli.py draft --template one-way-out \\\n"
+            "      --disclosing-party 'Acme' --disclosing-party-address '...' \\\n"
+            "      --receiving-party 'Vendor' --receiving-party-address '...' \\\n"
+            "      --purpose 'vendor diligence' --out out/oneway.md --review-after\n"
+        ),
+    )
     p_draft.add_argument("--base", default=str(Path(__file__).resolve().parent))
     p_draft.add_argument("--template", choices=sorted(DRAFT_TEMPLATES.keys()), help="Built-in template; defaults to one suggested by your profile.nda_direction")
     p_draft.add_argument("--template-file", help="Path to a custom .md template with {{placeholders}}")
@@ -5163,7 +5384,22 @@ def main():
     p_neg = sub.add_parser("negotiate", help="Two-party turn-taking NDA negotiation with optional LLM agent assistance (file-based protocol)")
     neg_sub = p_neg.add_subparsers(dest="neg_cmd", required=True)
 
-    p_ni = neg_sub.add_parser("init", help="Start a negotiation: draft NDA from template + parties, sign as Party A, emit state file")
+    p_ni = neg_sub.add_parser(
+        "init",
+        help="Start a negotiation: draft NDA from template + parties, sign as Party A, emit state file",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example: open Round 1 (Party A signs the initial draft).\n"
+            "  ./nda_review_cli.py negotiate init --template mutual \\\n"
+            "      --party-a-name 'Acme' --party-a-address '1 Main' \\\n"
+            "      --party-b-name 'Beta' --party-b-address '2 Side' \\\n"
+            "      --purpose 'evaluating a partnership' \\\n"
+            "      --effective-date 2026-01-01 \\\n"
+            "      --out neg-state.json\n\n"
+            "Send neg-state.json to Party B; they run `negotiate counter --auto`\n"
+            "(or --agent --llm <provider>) to draft the next round.\n"
+        ),
+    )
     p_ni.add_argument("--base", default=str(Path(__file__).resolve().parent))
     p_ni.add_argument("--template", choices=sorted(DRAFT_TEMPLATES.keys()), default="mutual")
     p_ni.add_argument("--out", required=True, help="Output negotiation state JSON file")
@@ -5274,6 +5510,10 @@ def main():
     p_tutorial.add_argument("--no-prompt", action="store_true", help="Skip pauses; useful for CI smoke tests")
     p_tutorial.add_argument("--run-sample", action="store_true", help="Skip the run-sample question and run it automatically")
     p_tutorial.set_defaults(func=cmd_tutorial)
+
+    p_sample = sub.add_parser("sample-nda", help="Write the bundled sample NDA to a path so you have something to point `review` at on first run")
+    p_sample.add_argument("--out", required=True, help="Output path for the sample NDA (e.g. my-first.txt)")
+    p_sample.set_defaults(func=cmd_sample_nda)
 
     p_wizard = sub.add_parser("wizard", help="Guided setup -> ingest -> build -> review flow")
     p_wizard.add_argument("--base", default=str(Path(__file__).resolve().parent))

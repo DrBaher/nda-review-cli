@@ -27,3 +27,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Web demo runtime artifacts (sandboxed per-session dirs; not for commit)
+/tmp/nda-demo-sandbox/
