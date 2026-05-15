@@ -5128,18 +5128,92 @@ def _first_run_hint() -> str:
     )
 
 
+def _catalog_flags(subparser):
+    """Walk a subparser and return a list of its --flag entries."""
+    out = []
+    for action in subparser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            continue
+        if not action.option_strings:
+            continue
+        if action.help == argparse.SUPPRESS:
+            continue
+        default = action.default
+        if default is argparse.SUPPRESS:
+            default = None
+        out.append({
+            "name": action.option_strings[-1],
+            "aliases": action.option_strings[:-1] if len(action.option_strings) > 1 else [],
+            "help": action.help or "",
+            "required": bool(getattr(action, "required", False)),
+            "default": default,
+            "choices": list(action.choices) if action.choices else None,
+        })
+    return out
+
+
+def _catalog_subcommand(name, subparser):
+    """Walk a subparser, recursing into nested subparsers (e.g. `negotiate <sub>`)."""
+    entry = {
+        "name": name,
+        "help": subparser.description or "",
+        "flags": _catalog_flags(subparser),
+    }
+    nested = next(
+        (a for a in subparser._actions if isinstance(a, argparse._SubParsersAction)),
+        None,
+    )
+    if nested is not None:
+        entry["subcommands"] = [
+            _catalog_subcommand(sub_name, sub_parser)
+            for sub_name, sub_parser in nested.choices.items()
+        ]
+    return entry
+
+
+def _catalog_for(parser):
+    """Walk the top-level parser and emit a stable machine-readable catalog."""
+    sub_action = next(
+        (a for a in parser._actions if isinstance(a, argparse._SubParsersAction)),
+        None,
+    )
+    commands = []
+    if sub_action is not None:
+        commands = [
+            _catalog_subcommand(cmd_name, sub_parser)
+            for cmd_name, sub_parser in sub_action.choices.items()
+        ]
+    return {
+        "name": "nda-review-cli",
+        "version": __version__,
+        "description": parser.description or "",
+        "commands": commands,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="nda-review-cli",
         description="Local-first NDA review and drafting CLI (deterministic + optional LLM augmentation).",
     )
     parser.add_argument("--version", action="version", version=f"nda-review-cli {__version__}")
+    parser.add_argument(
+        "--catalog",
+        choices=["json"],
+        default=None,
+        help="Print a machine-readable catalog of every subcommand and flag, then exit. "
+             "Stable across minor versions — agents call this at startup.",
+    )
     # `cmd` is technically required, but we want a friendlier message than argparse's
     # default when the user runs the tool with no args at all.
     if len(sys.argv) == 1:
         print(_first_run_hint(), file=sys.stderr)
         raise SystemExit(0)
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    # If the user just wants the catalog, we still need every subparser registered
+    # so the walker sees them. Mark `cmd` as not-required here; we'll re-check
+    # after parse_args.
+    require_cmd = "--catalog" not in sys.argv
+    sub = parser.add_subparsers(dest="cmd", required=require_cmd)
 
     p_build = sub.add_parser("build-playbook", help="Build NDA playbook from extracted Gmail/Drive corpus")
     p_build.add_argument("--base", default=str(Path(__file__).resolve().parent))
@@ -5547,6 +5621,11 @@ def main():
     p_wizard.set_defaults(func=cmd_wizard)
 
     args = parser.parse_args()
+    if args.catalog == "json":
+        print(json.dumps(_catalog_for(parser), indent=2, default=str))
+        raise SystemExit(0)
+    if not getattr(args, "cmd", None):
+        parser.error("a subcommand is required")
     args.func(args)
 
 
