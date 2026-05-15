@@ -5,12 +5,12 @@ on:
     tags:
       - 'v*.*.*'
 
-permissions:
-  contents: write
-
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write           # for GitHub release creation
+      id-token: write           # for PyPI trusted publishing (OIDC)
     steps:
       - uses: actions/checkout@v6
         with:
@@ -29,8 +29,31 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Verify pyproject.toml version matches the tag
+        run: |
+          PY_VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          TAG_VERSION="${{ steps.version.outputs.version }}"
+          if [ "$PY_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag v$TAG_VERSION does not match pyproject.toml version $PY_VERSION. Bump pyproject.toml before tagging."
+            exit 1
+          fi
+
       - name: Generate release notes from CHANGELOG
         run: ./nda_review_cli.py release-helper --version ${{ steps.version.outputs.version }} --out release-notes.md
+
+      - name: Build wheel + sdist
+        run: |
+          python3 -m pip install --upgrade build
+          python3 -m build
+
+      - name: Publish to PyPI (trusted publishing)
+        # Trusted publishing must be configured on PyPI: https://pypi.org/manage/account/publishing/
+        # — set project name `nda-review-cli`, owner `DrBaher`, repo `nda-review-cli`,
+        # workflow `release.yml`, environment (leave blank). Skips automatically on first run if
+        # the project doesn't exist on PyPI yet (you'll need an initial manual upload — see
+        # docs/setup/publish-to-pypi.md).
+        if: ${{ vars.PYPI_PUBLISHING_ENABLED == 'true' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
@@ -38,5 +61,8 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           body_path: release-notes.md
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
           draft: false
           prerelease: false
