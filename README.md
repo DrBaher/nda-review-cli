@@ -7,7 +7,7 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![Local-first](https://img.shields.io/badge/local--first-yes-brightgreen.svg)](#why-it-exists)
 
-Built for an agent-driven contract workflow — an LLM agent does the operational work (drafting, reviewing, proposing amendments, sending), a human approves the gates that need a deliberate gesture. Deterministic by default, optional second-pass LLM adjudication via the model of your choice (Anthropic / OpenAI / Ollama / any OpenAI-compatible endpoint). Local-first, no telemetry, single-file Python.
+Built for an agent-first contract workflow — an LLM agent does the operational work (drafting, reviewing, proposing amendments, sending), a human approves the gates that need a deliberate gesture. Deterministic by default, optional second-pass LLM adjudication via the model of your choice (Anthropic / OpenAI / Ollama / any OpenAI-compatible endpoint). Local-first, no telemetry, single-file Python.
 
 The CLI ingests your past contracts, extracts your negotiation style into a versioned playbook, and applies it as a deterministic, explainable policy to every new NDA — with clause-by-clause findings, severity scoring, and Word-ready redlines.
 

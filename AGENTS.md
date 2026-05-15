@@ -63,7 +63,7 @@ nda-review-cli review --file contract.docx --why --llm --yes-llm-send \
   --out-json ./review.json
 ```
 
-For agent-driven negotiation:
+For agent-first negotiation:
 
 ```bash
 nda-review-cli negotiate counter --state negotiation.json \
