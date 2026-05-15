@@ -17,7 +17,7 @@ from typing import Optional
 from xml.etree import ElementTree as ET
 from rule_engine import clause_hit, red_flag_hits
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 NDA_PAT = re.compile(r"\b(nda|non[-\s]?disclosure|confidentiality agreement|confidential disclosure agreement|cda|mutual nda|geheimhaltungsvereinbarung|vertraulich|vertrauliche informationen)\b", re.I)
 

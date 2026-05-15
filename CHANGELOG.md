@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-15
+
+Headline: **`--catalog json`** for cross-suite agent discovery, **`sample-nda`** to drop the bundled NDA fixture into any path, **`doctor --check-llm`** for a 1-token LLM reachability probe, and `--help` epilogs on the four user-facing subcommands. Plus the doc reorg (`AGENTS.md` + `docs/setup/` + `docs/reference/`) that adopts the shared three-CLI-suite shape. Wheel manifest fix so `templates/*.md` are bundled correctly.
+
+- Added **`nda-review-cli --catalog json`** — machine-readable inventory of every subcommand and flag, including the nested `negotiate <sub>` tree (23 top-level commands, 12 nested negotiate subcommands). Stable across minor versions. Matches the cross-suite contract used by `sign --catalog json` and `docx2pdf --catalog json`. Agents call this at startup rather than parsing `--help`.
+- Added **`AGENTS.md`** — agent quickstart with output contract, exit-code map (`0/2/3/4`), discovery commands, recommended defaults, failure → recovery table, and the LLM-safety / consent-prompt contract.
+- Added **`docs/setup/`** — per-provider LLM setup (Anthropic, OpenAI, Ollama, OpenAI-compatible) plus the `config/integrations.json` hooks for handing off to `docx2pdf-cli` and `sign-cli`.
+- Added **`docs/reference/`** — canonical homes for policy, stance, fatigue concession, scoring profiles, the hash-chained negotiation state file, exit codes, and the `--llm` data-flow disclosure.
+- README trimmed from 619 to 280 lines: lede + "you are here" suite banner + "Run this" (`tutorial`) + decision-tree pointing into the new doc structure.
 - Added a **sandboxed web demo** under `web/` with one-click deployment to Railway / Fly.io / Render via `deploy/Dockerfile`. Stdlib-only Python service (no Flask, no FastAPI) wraps the CLI behind three browser flows: draft an NDA (mutual / one-way-out / Common Paper Mutual), review the bundled sample NDA, and run the game-theoretic negotiation simulator with configurable stances. Per-session UUID sandboxes auto-expire after 30 minutes; per-IP rate limit; subprocess timeouts; no LLM/network features wired to keep the demo cost- and abuse-bounded. Frontend is vanilla HTML + CSS + JS (no framework). See [`web/README.md`](web/README.md) for architecture and [`deploy/README.md`](deploy/README.md) for deployment.
 - Added **`sample-nda --out PATH`** — drops the bundled sample NDA into a user-chosen path so first-run users have something substantial to point `review` at without knowing the fixture's filesystem location. The fixture is the same one `tutorial --run-sample` uses; it's a representative SaaS-style mutual NDA with clauses that reliably trip rule-engine findings (jurisdiction mismatch, indefinite-survival carve-out, term length).
 - **First-run hint adapts to invocation form.** The bare-invocation help now detects whether the user invoked the CLI as a script (`./nda_review_cli.py`) or via the `pipx`-installed entry point (`nda-review-cli`) and prints the matching prefix in every example. Eliminates a small but persistent confusion for users who installed via `pipx install nda-review-cli`.
