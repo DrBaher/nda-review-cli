@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#fdfcf9"/>
+  <!-- document/contract behind -->
+  <path d="M 130 100 L 320 100 L 380 160 L 380 410 L 130 410 Z"
+        fill="#fdfcf9" stroke="#1f7d5d" stroke-width="16" stroke-linejoin="round"/>
+  <!-- folded corner -->
+  <path d="M 320 100 L 380 160 L 320 160 Z"
+        fill="#1f7d5d" stroke="#1f7d5d" stroke-width="16" stroke-linejoin="round"/>
+  <!-- text lines suggesting clauses -->
+  <line x1="170" y1="200" x2="320" y2="200" stroke="#1f7d5d" stroke-width="12" stroke-linecap="round"/>
+  <line x1="170" y1="240" x2="340" y2="240" stroke="#1f7d5d" stroke-width="12" stroke-linecap="round"/>
+  <line x1="170" y1="280" x2="280" y2="280" stroke="#1f7d5d" stroke-width="12" stroke-linecap="round"/>
+  <!-- magnifying glass (review angle) -->
+  <circle cx="345" cy="345" r="55" fill="#fdfcf9" stroke="#0e4a37" stroke-width="20"/>
+  <line x1="385" y1="385" x2="430" y2="430" stroke="#0e4a37" stroke-width="22" stroke-linecap="round"/>
+</svg>
