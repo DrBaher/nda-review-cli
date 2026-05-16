@@ -8,9 +8,13 @@
             fill="#fdfcf9" stroke="#1f7d5d" stroke-width="16" stroke-linejoin="round"/>
       <path d="M 320 100 L 380 160 L 320 160 Z"
             fill="#1f7d5d" stroke="#1f7d5d" stroke-width="16" stroke-linejoin="round"/>
-      <line x1="170" y1="200" x2="320" y2="200" stroke="#1f7d5d" stroke-width="12" stroke-linecap="round"/>
-      <line x1="170" y1="240" x2="340" y2="240" stroke="#1f7d5d" stroke-width="12" stroke-linecap="round"/>
-      <line x1="170" y1="280" x2="280" y2="280" stroke="#1f7d5d" stroke-width="12" stroke-linecap="round"/>
+      <text x="255" y="285"
+            font-family="Helvetica, Arial, sans-serif"
+            font-size="92"
+            font-weight="700"
+            fill="#1f7d5d"
+            text-anchor="middle"
+            letter-spacing="-2">NDA</text>
       <circle cx="345" cy="345" r="55" fill="#fdfcf9" stroke="#0e4a37" stroke-width="20"/>
       <line x1="385" y1="385" x2="430" y2="430" stroke="#0e4a37" stroke-width="22" stroke-linecap="round"/>
     </g>
