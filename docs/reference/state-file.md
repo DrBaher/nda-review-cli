@@ -79,6 +79,27 @@ This is the gate that lets you trust agent-assisted rounds without losing human 
 
 `negotiate finalize --to-pdf --sign` invokes user-configured commands from `config/integrations.json` (see [docs/setup/integrations.md](../setup/integrations.md)). The CLI passes placeholders like `{input_docx}`, `{output_pdf}`, `{negotiation_id}` to the configured shell command. The state file records the hand-off in the finalize block.
 
+## Downstream consumers
+
+[compare-cli](https://github.com/DrBaher/compare-cli) (v0.1.1+) reads
+this state file via its `--from-negotiation NEG.json CANDIDATE` flag to
+pull the agreed text as the BASE for clause-aware drift detection
+against a candidate document (e.g. the ready-to-sign PDF the
+counterparty sent back). The reader is permissive: it accepts the
+top-level `status` field as the authoritative convergence signal
+(matching `"converged"`, `"signed_off"`, or `"finalized"`), with
+per-round `agreed: true` and per-round `clause_status` all-`"agreed"`
+fallbacks for back-compat with earlier `negotiation.json` shapes.
+
+compare-cli v0.2.0+ additionally supports `--require-signoffs`, which
+errors if both `signoffs.a` and `signoffs.b` aren't populated — useful
+when an unattended pipeline shouldn't proceed against a converged-but-
+not-yet-signed-off state file. compare-cli does **not** verify the hash
+chain; if integrity matters, pipe through `negotiate validate` first.
+
+See compare-cli's [`COMPARE_SCHEMA.md` §9.2](https://github.com/DrBaher/compare-cli/blob/main/COMPARE_SCHEMA.md)
+for the exact three-tier resolution order.
+
 ## See also
 
 - [policy.md](policy.md) — policies drive what gets flagged in each round.
