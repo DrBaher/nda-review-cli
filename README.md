@@ -4,7 +4,7 @@
 
 # nda-review-cli
 
-> Part of the contract-operations CLI suite. [**draft-cli**](https://github.com/DrBaher/Draft-CLI) (fill placeholders) → **nda-review-cli** (draft, review, negotiate) → [**docx2pdf-cli**](https://github.com/DrBaher/docx2pdf-cli) (DOCX → PDF) → [**sign-cli**](https://github.com/DrBaher/sign-cli) (signing + audit). [Showcase site](https://cli.drbaher.com/).
+> Part of the contract-operations CLI suite. [**draft-cli**](https://github.com/DrBaher/draft-cli) (draft) → **nda-review-cli** (review, redline, negotiate) → [**docx2pdf-cli**](https://github.com/DrBaher/docx2pdf-cli) (DOCX → PDF) → [**sign-cli**](https://github.com/DrBaher/sign-cli) (signing + audit). Storage layer: [**template-vault-cli**](https://github.com/DrBaher/template-vault-cli). Drift detection: [**compare-cli**](https://github.com/DrBaher/compare-cli). [Showcase site](https://cli.drbaher.com/).
 
 [![CI](https://github.com/DrBaher/nda-review-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/DrBaher/nda-review-cli/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
