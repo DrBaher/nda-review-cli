@@ -1887,10 +1887,22 @@ def _llm_round_trip_probe(cfg: dict) -> dict:
 
 
 def load_llm_config(base: Path, args) -> dict:
-    """Resolution order: CLI args > env vars > config/llm.json > preset defaults."""
+    """Resolution order: CLI args > env vars > config file > preset defaults.
+
+    Config file lookup, first found wins:
+      1. ~/.config/contract-ops/llm.json    (suite-wide, shared across contract-ops CLIs)
+      2. ~/.config/nda-review-cli/llm.json  (per-CLI XDG location)
+      3. {base}/config/llm.json             (repo-local)
+    """
     cfg = {"provider": None, "model": None, "base_url": None, "api_key": None}
-    cfg_path = base / "config" / "llm.json"
-    if cfg_path.exists():
+    home = Path.home()
+    cfg_path_candidates = [
+        home / ".config" / "contract-ops" / "llm.json",
+        home / ".config" / "nda-review-cli" / "llm.json",
+        base / "config" / "llm.json",
+    ]
+    cfg_path = next((p for p in cfg_path_candidates if p.exists()), None)
+    if cfg_path is not None:
         try:
             file_cfg = json.loads(cfg_path.read_text())
             for k in ("provider", "model", "base_url", "api_key"):
